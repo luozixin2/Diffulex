@@ -40,6 +40,14 @@ class BDDiffusionBlock:
     def __len__(self) -> int:
         return self.size
     
+    def to_cache(self) -> None:
+        if self.available_to_cache and not self.is_in_cache:
+            self.status = BDDiffusionBlockStatus.TO_CACHE
+    
+    def in_cache(self) -> None:
+        if self.is_to_cache:
+            self.status = BDDiffusionBlockStatus.IN_CACHE
+    
     @property
     def token_ids(self) -> list[int]:
         return self.seq.token_ids[self.global_start_id: self.global_end_id]
@@ -71,6 +79,23 @@ class BDDiffusionBlock:
     @property
     def available_to_add_new_block(self) -> bool:
         return self.is_in_cache
+    
+    @property
+    def local_mask_tokens(self) -> list[bool]:
+        return [token_id == self.mask_token_id for token_id in self.token_ids]
+    
+    @property
+    def local_mask_token_ids(self) -> list[int]:
+        return [idx for idx, is_mask in enumerate(self.local_mask_tokens) if is_mask]
+    
+    @property
+    def global_mask_token_ids(self) -> list[int]:
+        if self.seq is None:
+            return []
+        offset = self.global_start_id
+        in_cache_blocks = list(range(sum(self.seq.in_cache_blocks)))
+        offset -= sum(self.seq.diffusion_blocks[block_id].size for block_id in in_cache_blocks)
+        return [mask_id + offset for mask_id in self.local_mask_token_ids]
     
 
 @AutoSequence.register("block_diffusion", is_default=True)
@@ -191,3 +216,16 @@ class BDSequence(SequenceBase):
                     seq=self,
                 )
             )
+            
+    def post_process(self) -> None:
+        for block in self.diffusion_blocks:
+            block.cursor = 0
+            if block.is_in_cache:
+                continue
+            if block.is_to_cache:
+                block.in_cache()
+            elif block.is_active:
+                if block.available_to_cache:
+                    block.to_cache()
+                else:
+                    break

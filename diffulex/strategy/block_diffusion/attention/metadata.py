@@ -9,6 +9,7 @@ from diffulex.strategy.block_diffusion.engine.sequence import BDSequence
 
 @dataclass
 class BDAttnMetaData(AttnMetaDataBase):
+    seqs: List[BDSequence] = None
     kv_cache_layout: str = "unified"
     need_kv_cache_store: bool = True
     

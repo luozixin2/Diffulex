@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from diffulex.sampler.auto_sampler import AutoSampler
 from diffulex.sampler.base import SamplerBase, SampleOutputBase
+from diffulex.engine.sequence import SequenceBase
 
 
 @dataclass
@@ -26,11 +27,13 @@ class FastdLLMV2SamplerForDiffusionLM(SamplerBase):
         shifted_logits[0, ...] = 1.0
         return shifted_logits
     
-    def forward(self, logits: torch.Tensor, temperatures: torch.Tensor,
+    def forward(self, seqs: list[SequenceBase], logits: torch.Tensor, temperatures: torch.Tensor,
                 top_p=None, top_k=None, margin_confidence=False, neg_entropy=False):
-        context = self.fetch_attn_metadata()
-        seqs = context.seqs
-        split_logits = torch.split(logits, [len(seq) for seq in seqs] if context.is_prefill else context.seq_lens, dim=0)
+        attn_metadata = self.fetch_attn_metadata()
+        split_logits = torch.split(
+            logits, [len(seq) for seq in seqs] if attn_metadata.is_prefill 
+            else [attn_metadata.diffusion_block_size] * len(seqs), dim=0
+        )
         accepted_ids_map = {}
         sampled_tokens_map = {}
         true_local_ids_map = {}
@@ -38,7 +41,7 @@ class FastdLLMV2SamplerForDiffusionLM(SamplerBase):
             true_local_ids_sub_map = {}
             accepted_ids_sub_map = {}
             sampled_tokens_sub_map = {}
-            shifted_logits = self._shift_logits(seq_logits, seq.cached_or_caching_last_token_id)
+            shifted_logits = self._shift_logits(seq_logits, seq.cached_or_caching_num_tokens - 1)
             for block_id, block in enumerate(seq.diffusion_blocks):
                 if not block.is_active or sum(block.local_mask_tokens) == 0:
                     continue

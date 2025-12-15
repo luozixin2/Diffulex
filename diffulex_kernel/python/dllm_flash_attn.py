@@ -2,13 +2,26 @@ import torch
 import tilelang
 import tilelang.language as T
 
+from tilelang.autotuner import set_autotune_inputs
 from flash_attn import flash_attn_varlen_func
 
+from diffulex_kernel.python.auto_tuner import build_configs
 from diffulex_kernel.python.kv_cache_kernels import load_kvcache
 from diffulex.attention.metadata import AttnMetaDataBase
 
 
-@tilelang.jit(out_idx=[6], pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,})
+# Kernel缓存，避免重复autotune和编译
+_prefill_kernel_cache = {}
+_decode_kernel_cache = {}
+
+
+@tilelang.autotune(
+    configs=build_configs()
+)
+@tilelang.jit(
+    out_idx=[6], 
+    pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,},
+)
 def dllm_flash_attn_prefill_kernel(
     NUM_SEQS: int,
     NUM_GROUPS: int,
@@ -50,7 +63,7 @@ def dllm_flash_attn_prefill_kernel(
             
             acc_score = T.alloc_fragment([BLOCK_M, BLOCK_N], ACCUM_DTYPE)
             acc_score_cast = T.alloc_fragment([BLOCK_M, BLOCK_N], DTYPE)
-            acc_output = T.alloc_fragment([BLOCK_M, HEAD_DIM], DTYPE)
+            acc_output = T.alloc_fragment([BLOCK_M, HEAD_DIM], ACCUM_DTYPE)
             scores_max = T.alloc_fragment([BLOCK_M], ACCUM_DTYPE)
             scores_max_prev = T.alloc_fragment([BLOCK_M], ACCUM_DTYPE)
             scores_scale = T.alloc_fragment([BLOCK_M], ACCUM_DTYPE)
@@ -144,8 +157,11 @@ def dllm_flash_attn_prefill_kernel(
             
     return kernel
 
-
-@tilelang.jit(out_idx=[10], pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,})
+@tilelang.autotune(configs=build_configs())
+@tilelang.jit(
+    out_idx=[10], 
+    pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,},
+)
 def dllm_flash_attn_decode_kernel(
     NUM_SEQS: int,
     NUM_GROUPS: int,
@@ -201,7 +217,7 @@ def dllm_flash_attn_decode_kernel(
             acc_score_kvcache = T.alloc_fragment([BLOCK_M, PAGE_BLOCK_SIZE], ACCUM_DTYPE)
             acc_score_kvcache_cast = T.alloc_fragment([BLOCK_M, PAGE_BLOCK_SIZE], DTYPE)
             
-            acc_output = T.alloc_fragment([BLOCK_M, HEAD_DIM], DTYPE)
+            acc_output = T.alloc_fragment([BLOCK_M, HEAD_DIM], ACCUM_DTYPE)
             scores_max = T.alloc_fragment([BLOCK_M], ACCUM_DTYPE)
             scores_max_prev = T.alloc_fragment([BLOCK_M], ACCUM_DTYPE)
             scores_scale = T.alloc_fragment([BLOCK_M], ACCUM_DTYPE)
@@ -309,8 +325,8 @@ def dllm_flash_attn_decode_kernel(
                     acc_output[i, j] *= scores_scale[i]
                 
                 # Compute attention output
-                T.copy(V_Cache[page_block_idx_global, :, kv_head_idx, :], V_shared)
-                T.gemm(acc_score_kvcache_cast, V_shared, acc_output, policy=T.GemmWarpPolicy.FullRow)
+                T.copy(V_Cache[page_block_idx_global, :, kv_head_idx, :], V_Cache_shared)
+                T.gemm(acc_score_kvcache_cast, V_Cache_shared, acc_output, policy=T.GemmWarpPolicy.FullRow)
             
             for i, j in T.Parallel(BLOCK_M, HEAD_DIM):
                 acc_output[i, j] /= log_sum[i]
@@ -338,20 +354,41 @@ def dllm_flash_attn_prefill(
             softmax_scale=scale, block_table=None
         )
     elif attn_metadata.attn_type == "block_attention":
-        attn_kernel = dllm_flash_attn_prefill_kernel(
+        # 创建缓存键，基于kernel的参数
+        cache_key = (
             attn_metadata.num_seqs,
-            q.shape[1] // k.shape[1],
-            q.shape[0],
-            k.shape[0],
-            q.shape[1],
-            q.shape[2],
-            True,
-            DIFFUSION_BLOCK_SIZE=attn_metadata.diffusion_block_size,
-            BLOCK_M=128,
-            BLOCK_N=128,
-            NUM_STAGES=2,
-            NUM_THREADS=256
+            q.shape[1] // k.shape[1],  # NUM_GROUPS
+            q.shape[0],  # Q_LEN
+            k.shape[0],  # KV_LEN
+            q.shape[1],  # NUM_HEADS
+            q.shape[2],  # HEAD_DIM
+            attn_metadata.diffusion_block_size,  # DIFFUSION_BLOCK_SIZE
         )
+        
+        # 检查缓存
+        if cache_key not in _prefill_kernel_cache:
+            # 使用set_autotune_inputs来触发autotune
+            # 这会在第一次调用时为所有配置测试性能并选择最佳配置
+            with set_autotune_inputs([
+                q, k, v, 
+                attn_metadata.cu_seqlens_q, 
+                attn_metadata.cu_seqlens_k, 
+                attn_metadata.max_seqlen_q, 
+            ]):
+                attn_kernel = dllm_flash_attn_prefill_kernel(
+                    attn_metadata.num_seqs,
+                    q.shape[1] // k.shape[1],
+                    q.shape[0],
+                    k.shape[0],
+                    q.shape[1],
+                    q.shape[2],
+                    True,
+                    attn_metadata.diffusion_block_size,
+                )
+            _prefill_kernel_cache[cache_key] = attn_kernel
+        else:
+            attn_kernel = _prefill_kernel_cache[cache_key]
+            
         return attn_kernel(
             q, k, v, 
             attn_metadata.cu_seqlens_q, 
@@ -370,23 +407,50 @@ def dllm_flash_attn_decode(
     attn_metadata: AttnMetaDataBase
 ) -> torch.Tensor:
     if attn_metadata.decode_mode == "static":
-        attn_kernel = dllm_flash_attn_decode_kernel(
+        # 创建缓存键，基于kernel的参数
+        cache_key = (
             attn_metadata.num_seqs,
-            q.shape[1] // k.shape[1],
-            k_cache.shape[0],
-            q.shape[0],
-            k.shape[0],
-            q.shape[1],
-            q.shape[2],
-            attn_metadata.attn_type == "block_attention",
-            DIFFUSION_BLOCK_SIZE=attn_metadata.diffusion_block_size,
-            MAX_SEQ_NUM_BLOCKS=attn_metadata.block_tables.shape[1],
-            PAGE_BLOCK_SIZE=attn_metadata.page_block_size,
-            BLOCK_M=128,
-            BLOCK_N=128,
-            NUM_STAGES=2,
-            NUM_THREADS=256
+            q.shape[1] // k.shape[1],  # NUM_GROUPS
+            k_cache.shape[0],  # NUM_PAGE_BLOCKS
+            q.shape[0],  # Q_LEN
+            k.shape[0],  # KV_LEN
+            q.shape[1],  # NUM_HEADS
+            q.shape[2],  # HEAD_DIM
+            attn_metadata.attn_type == "block_attention",  # IS_BLOCK_ATTN
+            attn_metadata.diffusion_block_size,  # DIFFUSION_BLOCK_SIZE
+            attn_metadata.block_tables.shape[1],  # MAX_SEQ_NUM_BLOCKS
+            attn_metadata.page_block_size,  # PAGE_BLOCK_SIZE
         )
+        
+        # 检查缓存
+        if cache_key not in _decode_kernel_cache:
+            # 使用set_autotune_inputs来触发autotune
+            # 这会在第一次调用时为所有配置测试性能并选择最佳配置
+            with set_autotune_inputs([
+                q, k, v, k_cache, v_cache,
+                attn_metadata.block_tables,
+                attn_metadata.context_lens,
+                attn_metadata.cu_seqlens_q,
+                attn_metadata.cu_seqlens_k,
+                attn_metadata.max_seqlen_q,
+            ]):
+                attn_kernel = dllm_flash_attn_decode_kernel(
+                    attn_metadata.num_seqs,
+                    q.shape[1] // k.shape[1],
+                    k_cache.shape[0],
+                    q.shape[0],
+                    k.shape[0],
+                    q.shape[1],
+                    q.shape[2],
+                    attn_metadata.attn_type == "block_attention",
+                    attn_metadata.diffusion_block_size,
+                    attn_metadata.block_tables.shape[1],
+                    attn_metadata.page_block_size,
+                )
+            _decode_kernel_cache[cache_key] = attn_kernel
+        else:
+            attn_kernel = _decode_kernel_cache[cache_key]
+            
         return attn_kernel(
             q, k, v, k_cache, v_cache,
             attn_metadata.block_tables,
