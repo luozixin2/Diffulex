@@ -106,11 +106,11 @@ def dllm_flash_attn_prefill_kernel(
                 T.copy(K[kv_start_idx + kv_block_idx * BLOCK_N : kv_start_idx + (kv_block_idx + 1) * BLOCK_N, kv_head_idx, :], K_shared)
                 
                 # Initialize acc_score with mask
-                if IS_BLOCK_ATTN and kv_block_idx == loop_range - 1:
+                if IS_BLOCK_ATTN:
                     for i, j in T.Parallel(BLOCK_M, BLOCK_N):
-                        num_diffusion_blocks = T.min(i // DIFFUSION_BLOCK_SIZE + 1, BLOCK_M // DIFFUSION_BLOCK_SIZE)
+                        num_diffusion_blocks = (q_block_idx * BLOCK_M + i) // DIFFUSION_BLOCK_SIZE + 1
                         acc_score[i, j] = T.if_then_else(
-                            (kv_block_idx * BLOCK_N + j >= kv_block_idx * BLOCK_N + num_diffusion_blocks * DIFFUSION_BLOCK_SIZE) or
+                            (num_diffusion_blocks * DIFFUSION_BLOCK_SIZE <= kv_block_idx * BLOCK_N + j) or
                             (q_block_idx * BLOCK_M + i >= cur_q_seqlen or 
                             kv_block_idx * BLOCK_N + j >= cur_kv_seqlen), -1e9, 0
                         )

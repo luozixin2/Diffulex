@@ -59,7 +59,7 @@ def naive_sdpa_prefill(
             for block_idx in range(num_diffusion_blocks):
                 block_start = block_idx * diffusion_block_size
                 block_end = min(block_start + diffusion_block_size, kv_len)
-                block_mask[..., block_start:block_end, block_start:block_end] = True
+                block_mask[..., block_start:block_end, :block_end] = True
 
             attn_out = F.scaled_dot_product_attention(
                 q_sdpa,
