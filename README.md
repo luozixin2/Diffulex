@@ -1,4 +1,4 @@
-<img src=./assets/imgs/diffulex.png />
+<img src=./assets/imgs/diffulex_logo.png />
 
 <div align="center">
 
