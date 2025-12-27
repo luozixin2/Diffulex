@@ -10,7 +10,8 @@ from multiprocessing.shared_memory import SharedMemory
 
 from diffulex.config import Config
 from diffulex.sampler import AutoSampler
-from diffulex.engine.sequence import SequenceBase
+from diffulex.engine.sequence import AutoSequence, SequenceBase
+from diffulex.attention.metadata import set_warming_up, reset_warming_up
 from diffulex.model import AutoModelForDiffusionLM
 from diffulex.engine.strategy_registry import DiffulexStrategyRegistry
 
@@ -117,11 +118,28 @@ class ModelRunnerBase(ABC):
     def load_sampler(self, config: Config):
         """Instantiate the sampler implementation; override to customize."""
         return AutoSampler.from_config(config)
+    
+    def _prefill_warmup(self):
+        print("Warming up prefill...")
+        max_num_batched_tokens, max_model_len = (
+            self.config.max_num_batched_tokens,
+            self.config.max_model_len,
+        )
+        num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
+        test_input_ids = [0] * max_model_len
+        seqs = [AutoSequence.create(config=self.config, token_ids=test_input_ids) for _ in range(num_seqs)]
+        self.run(seqs, True)
+        for seq in seqs:
+            seq.post_process()
+        torch.cuda.empty_cache()
 
-    @abstractmethod
     def warmup_model(self):
-        """Model-specific warmup logic."""
-        pass
+        print("Warming up model...")
+        set_warming_up(True)
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        self._prefill_warmup()
+        reset_warming_up()
 
     def allocate_kv_cache(self):
         config = self.config

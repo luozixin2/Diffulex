@@ -40,13 +40,14 @@ FEW_SHOTS = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_st
 
 if __name__ == "__main__":
     PROFILE = False
-    model = "/root/data/ckpts/JetLM/SDAR-1.7B-Chat-b32"
+    # model = "/root/data/ckpts/JetLM/SDAR-1.7B-Chat-b32"
+    model = "/data1/ckpts/JetLM/SDAR-1.7B-Chat-b32"
     dataset = load_dataset("gsm8k", "main", split="test")["question"][:10]
     LLM = Diffulex(
         model,
         use_lora=False,
         model_name="sdar", 
-        enforce_eager=True, 
+        enforce_eager=False, 
         data_parallel_size=1,
         tensor_parallel_size=1,
         gpu_memory_utilization=0.3,

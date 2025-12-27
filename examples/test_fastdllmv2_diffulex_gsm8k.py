@@ -45,7 +45,7 @@ if __name__ == "__main__":
         model,
         use_lora=False,
         model_name="fast_dllm_v2", 
-        enforce_eager=True, 
+        enforce_eager=False, 
         data_parallel_size=1,
         tensor_parallel_size=1,
         gpu_memory_utilization=0.25,

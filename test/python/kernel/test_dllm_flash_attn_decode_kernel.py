@@ -253,6 +253,23 @@ def test_decode_bf16_multi_seq():
     )
 
 
+def test_decode_bf16_multi_seq_long_context():
+    """Test with multiple sequences, bfloat16."""
+    run_dllm_flash_attn_decode(
+        num_seqs=4,
+        num_heads=32,
+        num_kv_heads=8,
+        head_dim=128,
+        max_q_len=64,
+        max_kv_len=64,
+        context_len=1024,
+        page_block_size=32,
+        diffusion_block_size=32,
+        is_block_attn=False,
+        dtype="bfloat16",
+    )
+
+
 def test_decode_bf16_block_attn():
     """Test with block attention enabled."""
     run_dllm_flash_attn_decode(

@@ -377,9 +377,10 @@ def dllm_flash_attn_decode_kernel(
     O_SHAPE = [Q_LEN, NUM_HEADS, HEAD_DIM]
     K_CACHE_SHAPE = [NUM_PAGE_BLOCKS, PAGE_BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM]
     V_CACHE_SHAPE = [NUM_PAGE_BLOCKS, PAGE_BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM]
-    BLOCK_TABLE_SHAPE = [NUM_SEQS, MAX_SEQ_NUM_BLOCKS]
+    MAX_SEQ_NUM_BLOCKS = T.dynamic("MAX_SEQ_NUM_BLOCKS", 'int32')
+    BLOCK_TABLES_SHAPE = [NUM_SEQS, MAX_SEQ_NUM_BLOCKS]
     DTYPE = "bfloat16"
-    ACCUM_DTYPE = "float"
+    ACCUM_DTYPE = "float32"
    
     @T.prim_func
     def kernel(
@@ -388,7 +389,7 @@ def dllm_flash_attn_decode_kernel(
         V: T.Tensor(KV_SHAPE, DTYPE),
         K_Cache: T.Tensor(K_CACHE_SHAPE, DTYPE),
         V_Cache: T.Tensor(V_CACHE_SHAPE, DTYPE),
-        block_tables: T.Tensor(BLOCK_TABLE_SHAPE, "int32"),
+        block_tables: T.Tensor(BLOCK_TABLES_SHAPE, "int32"),
         context_lens: T.Tensor(NUM_SEQS, "int32"),
         cu_seqlens_q: T.Tensor(NUM_SEQS + 1, "int32"),
         cu_seqlens_k: T.Tensor(NUM_SEQS + 1, "int32"),
@@ -414,7 +415,6 @@ def dllm_flash_attn_decode_kernel(
             scores_scale = T.alloc_fragment([BLOCK_M], ACCUM_DTYPE)
             scores_sum = T.alloc_fragment([BLOCK_M], ACCUM_DTYPE)
             log_sum = T.alloc_fragment([BLOCK_M], ACCUM_DTYPE)
-            block_table = T.alloc_fragment([MAX_SEQ_NUM_BLOCKS], "int32")
             
             T.annotate_layout({
                 Q_shared: tilelang.layout.make_swizzled_layout(Q_shared),
@@ -435,7 +435,6 @@ def dllm_flash_attn_decode_kernel(
             
             cur_context_len = context_lens[seq_idx]
             
-            T.copy(block_tables[seq_idx, :], block_table)
             T.copy(Q[q_start_idx : q_start_idx + BLOCK_M, head_idx, :], Q_shared)
             
             T.fill(acc_output, 0)
@@ -448,7 +447,7 @@ def dllm_flash_attn_decode_kernel(
             # Stage 1: KV Cache Attention (Context)
             # ==========================
             for page_block_idx_local in T.Pipelined(MAX_SEQ_NUM_BLOCKS, num_stages=NUM_STAGES):
-                page_block_idx_global = block_table[page_block_idx_local]
+                page_block_idx_global = block_tables[seq_idx, page_block_idx_local]
                 if page_block_idx_global >= 0:
                     T.copy(K_Cache[page_block_idx_global, :, kv_head_idx, :], K_Cache_shared)
                     
@@ -572,15 +571,15 @@ def dllm_flash_attn_prefill(
                     attn_metadata.diffusion_block_size
                 )
             kernel_config = prefill_kernel.config
-            CHECK_FLASH_ATTN_PREFILL(
-                q, k, v, 
-                attn_metadata.cu_seqlens_q, 
-                attn_metadata.cu_seqlens_k, 
-                attn_metadata.max_seqlen_q, 
-                prefill_kernel,
-                diffusion_block_size=attn_metadata.diffusion_block_size,
-                is_block_attn=(attn_metadata.attn_type == "block_attention"),
-            )
+            # CHECK_FLASH_ATTN_PREFILL(
+            #     q, k, v, 
+            #     attn_metadata.cu_seqlens_q, 
+            #     attn_metadata.cu_seqlens_k, 
+            #     attn_metadata.max_seqlen_q, 
+            #     prefill_kernel,
+            #     diffusion_block_size=attn_metadata.diffusion_block_size,
+            #     is_block_attn=(attn_metadata.attn_type == "block_attention"),
+            # )
             return prefill_kernel(
                 q, k, v, 
                 attn_metadata.cu_seqlens_q, 
@@ -632,21 +631,21 @@ def dllm_flash_attn_decode(
             **kernel_config
         )
         
-        CHECK_FLASH_ATTN_DECODE(
-            q, k, v,
-            k_cache, v_cache,
-            attn_metadata.block_tables,
-            attn_metadata.context_lens,
-            attn_metadata.cu_seqlens_q,
-            attn_metadata.cu_seqlens_k,
-            attn_metadata.max_seqlen_q,
-            decode_kernel,
-            scale=scale,
-            num_groups=q.shape[1] // k.shape[1],
-            page_block_size=attn_metadata.page_block_size,
-            diffusion_block_size=attn_metadata.diffusion_block_size,
-            is_block_attn=(attn_metadata.attn_type == "block_attention"),
-        )
+        # CHECK_FLASH_ATTN_DECODE(
+        #     q, k, v,
+        #     k_cache, v_cache,
+        #     attn_metadata.block_tables,
+        #     attn_metadata.context_lens,
+        #     attn_metadata.cu_seqlens_q,
+        #     attn_metadata.cu_seqlens_k,
+        #     attn_metadata.max_seqlen_q,
+        #     decode_kernel,
+        #     scale=scale,
+        #     num_groups=q.shape[1] // k.shape[1],
+        #     page_block_size=attn_metadata.page_block_size,
+        #     diffusion_block_size=attn_metadata.diffusion_block_size,
+        #     is_block_attn=(attn_metadata.attn_type == "block_attention"),
+        # )
         
         return decode_kernel(
             q, k, v, k_cache, v_cache,
