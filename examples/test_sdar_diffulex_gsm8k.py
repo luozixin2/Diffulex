@@ -42,12 +42,12 @@ if __name__ == "__main__":
     PROFILE = False
     # model = "/root/data/ckpts/JetLM/SDAR-1.7B-Chat-b32"
     model = "/data1/ckpts/JetLM/SDAR-1.7B-Chat-b32"
-    dataset = load_dataset("gsm8k", "main", split="test")["question"][:10]
+    dataset = load_dataset("gsm8k", "main", split="test")["question"][:1]
     LLM = Diffulex(
         model,
         use_lora=False,
         model_name="sdar", 
-        enforce_eager=False, 
+        enforce_eager=True, 
         data_parallel_size=1,
         tensor_parallel_size=1,
         gpu_memory_utilization=0.3,

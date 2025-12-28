@@ -24,8 +24,13 @@ kernel_config = None
 
 @tilelang.autotune(configs=build_configs())
 @tilelang.jit(
-    out_idx=[-1],
-    pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,},
+    # NOTE: Disable TMA and warp specialized for now to avoid compile error on Hopper
+    out_idx=[-1], 
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    }
 )
 def dllm_flash_attn_prefill_kernel(
     NUM_SEQS: int,
@@ -350,8 +355,13 @@ def dllm_flash_attn_decode_kernel_legacy(
 
 
 @tilelang.jit(
+    # NOTE: Disable TMA and warp specialized for now to avoid compile error on Hopper
     out_idx=[-1], 
-    pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,},
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    }
 )
 def dllm_flash_attn_decode_kernel(
     NUM_SEQS: int,
@@ -571,15 +581,15 @@ def dllm_flash_attn_prefill(
                     attn_metadata.diffusion_block_size
                 )
             kernel_config = prefill_kernel.config
-            # CHECK_FLASH_ATTN_PREFILL(
-            #     q, k, v, 
-            #     attn_metadata.cu_seqlens_q, 
-            #     attn_metadata.cu_seqlens_k, 
-            #     attn_metadata.max_seqlen_q, 
-            #     prefill_kernel,
-            #     diffusion_block_size=attn_metadata.diffusion_block_size,
-            #     is_block_attn=(attn_metadata.attn_type == "block_attention"),
-            # )
+            CHECK_FLASH_ATTN_PREFILL(
+                q, k, v, 
+                attn_metadata.cu_seqlens_q, 
+                attn_metadata.cu_seqlens_k, 
+                attn_metadata.max_seqlen_q, 
+                prefill_kernel,
+                diffusion_block_size=attn_metadata.diffusion_block_size,
+                is_block_attn=(attn_metadata.attn_type == "block_attention"),
+            )
             return prefill_kernel(
                 q, k, v, 
                 attn_metadata.cu_seqlens_q, 
@@ -630,22 +640,22 @@ def dllm_flash_attn_decode(
             attn_metadata.page_block_size,
             **kernel_config
         )
-        # if not is_warming_up():
-        #     CHECK_FLASH_ATTN_DECODE(
-        #         q, k, v,
-        #         k_cache, v_cache,
-        #         attn_metadata.block_tables,
-        #         attn_metadata.context_lens,
-        #         attn_metadata.cu_seqlens_q,
-        #         attn_metadata.cu_seqlens_k,
-        #         attn_metadata.max_seqlen_q,
-        #         decode_kernel,
-        #         scale=scale,
-        #         num_groups=q.shape[1] // k.shape[1],
-        #         page_block_size=attn_metadata.page_block_size,
-        #         diffusion_block_size=attn_metadata.diffusion_block_size,
-        #         is_block_attn=(attn_metadata.attn_type == "block_attention"),
-        #     )
+        if not is_warming_up():
+            CHECK_FLASH_ATTN_DECODE(
+                q, k, v,
+                k_cache, v_cache,
+                attn_metadata.block_tables,
+                attn_metadata.context_lens,
+                attn_metadata.cu_seqlens_q,
+                attn_metadata.cu_seqlens_k,
+                attn_metadata.max_seqlen_q,
+                decode_kernel,
+                scale=scale,
+                num_groups=q.shape[1] // k.shape[1],
+                page_block_size=attn_metadata.page_block_size,
+                diffusion_block_size=attn_metadata.diffusion_block_size,
+                is_block_attn=(attn_metadata.attn_type == "block_attention"),
+            )
         
         return decode_kernel(
             q, k, v, k_cache, v_cache,
