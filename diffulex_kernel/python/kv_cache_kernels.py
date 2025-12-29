@@ -9,7 +9,7 @@ from diffulex.attention.metadata import AttnMetaDataBase
     
 
 @triton.jit
-def dllm_store_kvcache_kernel_unified(
+def dllm_store_kvcache_kernel_unified_bf16(
     key_ptr,
     key_stride,
     value_ptr,
@@ -19,6 +19,7 @@ def dllm_store_kvcache_kernel_unified(
     slot_mapping_ptr,
     D: tl.constexpr
 ):
+    """BF16 unified layout store kernel - no quantization, direct storage."""
     token_idx = tl.program_id(0)
     slot = tl.load(slot_mapping_ptr + token_idx)
     if slot < 0:
@@ -33,7 +34,7 @@ def dllm_store_kvcache_kernel_unified(
 
 
 @triton.jit
-def dllm_store_kvcache_kernel_distinct(
+def dllm_store_kvcache_kernel_distinct_bf16(
     k_ptr, v_ptr, k_cache_ptr, v_cache_ptr, slot_mapping_ptr,
     k_stride, v_stride,  
     k_cache_stride_nblks, k_cache_stride_h, k_cache_stride_dx, k_cache_stride_blk_sz, k_cache_stride_x,
@@ -41,6 +42,7 @@ def dllm_store_kvcache_kernel_distinct(
     nheads, hdim, blk_sz,
     x: tl.constexpr, D: tl.constexpr
 ):  
+    """BF16 distinct layout store kernel - no quantization, direct storage."""
     # SPDX-License-Identifier: Apache-2.0
     # SPDX-FileCopyrightText: D2F
 
@@ -83,10 +85,10 @@ def dllm_store_kvcache_kernel_distinct(
     tl.store(v_cache_ptr + v_cache_offs, v)
     
 
-def store_kvcache_distinct_layout(key: torch.Tensor, value: torch.Tensor, 
+def _store_kvcache_distinct_bf16(key: torch.Tensor, value: torch.Tensor, 
                                   k_cache: torch.Tensor, v_cache: torch.Tensor, 
-                                  slot_mapping: torch.Tensor, attn_metadata: AttnMetaDataBase) -> None:
-    # TODO: implement diffusion lm kv cache store
+                                  slot_mapping: torch.Tensor) -> None:
+    """Helper function for BF16 distinct layout store."""
     # k_cache: [num_blks, h, hdim // x, blk_sz, x]
     # v_cache: [num_blks, h, hdim, blk_sz]
     NBlks, NHeads, HDim_x, Blk_sz, x = k_cache.shape
@@ -96,7 +98,7 @@ def store_kvcache_distinct_layout(key: torch.Tensor, value: torch.Tensor,
     assert N == slot_mapping.numel()
     
     GRID = (N, )
-    dllm_store_kvcache_kernel_distinct[GRID](
+    dllm_store_kvcache_kernel_distinct_bf16[GRID](
         key, value,
         k_cache, v_cache,
         slot_mapping,
@@ -107,9 +109,104 @@ def store_kvcache_distinct_layout(key: torch.Tensor, value: torch.Tensor,
     )
 
 
-def store_kvcache_unified_layout(key: torch.Tensor, value: torch.Tensor, 
+@triton.jit
+def dllm_store_kvcache_kernel_unified_fp8(
+    key_quantized_ptr,
+    key_quantized_stride,
+    value_quantized_ptr,
+    value_quantized_stride,
+    k_cache_ptr,
+    v_cache_ptr,
+    slot_mapping_ptr,
+    D: tl.constexpr
+):
+    """FP8 unified layout store kernel - stores already quantized uint8 key/value to cache.
+    
+    For unified layout cache shape [num_blocks, block_size, num_kv_heads, head_dim],
+    we assume stride(1) == D (where D = num_kv_heads * head_dim), so offset is slot * D.
+    This matches the BF16 kernel's behavior.
+    """
+    token_idx = tl.program_id(0)
+    slot = tl.load(slot_mapping_ptr + token_idx)
+    if slot < 0:
+        return
+    key_offsets = token_idx * key_quantized_stride + tl.arange(0, D)
+    value_offsets = token_idx * value_quantized_stride + tl.arange(0, D)
+    key_uint8 = tl.load(key_quantized_ptr + key_offsets)
+    value_uint8 = tl.load(value_quantized_ptr + value_offsets)
+    # For unified layout with stride(1) == D, offset is slot * D
+    cache_offsets = slot * D + tl.arange(0, D)
+    tl.store(k_cache_ptr + cache_offsets, key_uint8)
+    tl.store(v_cache_ptr + cache_offsets, value_uint8)
+
+
+def _store_kvcache_unified_fp8(key: torch.Tensor, value: torch.Tensor,
+                                k_cache: torch.Tensor, v_cache: torch.Tensor,
+                                slot_mapping: torch.Tensor,
+                                k_scale: torch.Tensor, v_scale: torch.Tensor) -> None:
+    """Helper function for FP8 unified layout store.
+    
+    Quantizes BF16 key/value to FP8 (uint8 storage) using strategy, then stores to cache.
+    """
+    from diffulex.utils.quantization.context import get_kv_cache_strategy
+    from diffulex.utils.quantization.strategies import KVCacheFP8RunningMaxStrategy
+    
+    strategy = get_kv_cache_strategy()
+    if not isinstance(strategy, KVCacheFP8RunningMaxStrategy):
+        raise ValueError(f"Expected KVCacheFP8RunningMaxStrategy, got {type(strategy)}")
+    
+    N, num_kv_heads, head_dim = key.shape
+    D = num_kv_heads * head_dim
+    
+    # Quantize key and value using strategy
+    # strategy.quantize expects [seq_len, num_heads, head_dim] and [num_heads] scale
+    key_quantized_list = []
+    value_quantized_list = []
+    for head_idx in range(num_kv_heads):
+        key_head = key[:, head_idx, :]  # [N, head_dim]
+        value_head = value[:, head_idx, :]  # [N, head_dim]
+        k_scale_head = k_scale[head_idx:head_idx+1]  # [1]
+        v_scale_head = v_scale[head_idx:head_idx+1]  # [1]
+        
+        key_quant_head, _ = strategy.quantize(key_head, k_scale_head)  # [N, head_dim], uint8
+        value_quant_head, _ = strategy.quantize(value_head, v_scale_head)  # [N, head_dim], uint8
+        
+        key_quantized_list.append(key_quant_head)
+        value_quantized_list.append(value_quant_head)
+    
+    # Concatenate heads: [N, head_dim] * num_kv_heads -> [N, D]
+    key_quantized = torch.cat(key_quantized_list, dim=1)  # [N, D]
+    value_quantized = torch.cat(value_quantized_list, dim=1)  # [N, D]
+    
+    # Ensure contiguous and correct dtype (uint8)
+    key_quantized = key_quantized.contiguous()
+    value_quantized = value_quantized.contiguous()
+    
+    assert key_quantized.dtype == torch.uint8, f"Expected uint8, got {key_quantized.dtype}"
+    assert value_quantized.dtype == torch.uint8, f"Expected uint8, got {value_quantized.dtype}"
+    assert N == slot_mapping.numel(), f"`N`: {N}, `slot_mapping.numel()`: {slot_mapping.numel()}"
+    
+    # For unified layout, cache shape is [num_blocks, block_size, num_kv_heads, head_dim]
+    # BF16 kernel uses cache directly (no view) and assumes stride(1) == D
+    # For FP8, we should do the same to match BF16 behavior
+    assert k_cache.stride(1) == D and v_cache.stride(1) == D, \
+        f"Expected stride(1) == D ({D}), got k_cache.stride(1)={k_cache.stride(1)}, v_cache.stride(1)={v_cache.stride(1)}"
+    
+    # Use cache directly, matching BF16 kernel behavior
+    # Kernel uses slot * D as offset, which works with stride(1) == D
+    # Pass cache directly to kernel, matching BF16 kernel behavior
+    # The kernel expects cache to have stride(1) == D, which we've already verified
+    dllm_store_kvcache_kernel_unified_fp8[(N,)](
+        key_quantized, key_quantized.stride(0),
+        value_quantized, value_quantized.stride(0),
+        k_cache, v_cache, slot_mapping, D
+    )
+
+
+def _store_kvcache_unified_bf16(key: torch.Tensor, value: torch.Tensor, 
                                  k_cache: torch.Tensor, v_cache: torch.Tensor, 
-                                 slot_mapping: torch.Tensor, attn_metadata: AttnMetaDataBase) -> None:
+                                 slot_mapping: torch.Tensor) -> None:
+    """Helper function for BF16 unified layout store."""
     N, num_heads, head_dim = key.shape
     D = num_heads * head_dim
     assert key.stride(-1) == 1 and value.stride(-1) == 1
@@ -117,7 +214,7 @@ def store_kvcache_unified_layout(key: torch.Tensor, value: torch.Tensor,
     assert k_cache.stride(1) == D and v_cache.stride(1) == D
     assert N == slot_mapping.numel(), f"`N`: {N}, `slot_mapping.numel()`: {slot_mapping.numel()}"
     
-    dllm_store_kvcache_kernel_unified[(N,)](
+    dllm_store_kvcache_kernel_unified_bf16[(N,)](
         key, key.stride(0),
         value, value.stride(0),
         k_cache, v_cache, slot_mapping, D
@@ -125,7 +222,7 @@ def store_kvcache_unified_layout(key: torch.Tensor, value: torch.Tensor,
         
 
 @triton.jit
-def load_kvcache_kernel(k_cache_ptr, v_cache_ptr,
+def load_kvcache_kernel_bf16(k_cache_ptr, v_cache_ptr,
                         k_new_ptr, v_new_ptr,
                         block_table_ptr,
                         k_out_ptr, v_out_ptr, 
@@ -227,9 +324,10 @@ def load_kvcache_kernel(k_cache_ptr, v_cache_ptr,
             tl.store(v_out_ptr + offs_cur_kv_new_to_out, v_new)
 
 
-def load_kvcache(k_cache: torch.Tensor, v_cache: torch.Tensor,
-                 attn_metadata: AttnMetaDataBase,
-                 k_new: torch.Tensor, v_new: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def _load_kvcache_bf16(k_cache: torch.Tensor, v_cache: torch.Tensor,
+                       attn_metadata: AttnMetaDataBase,
+                       k_new: torch.Tensor, v_new: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Helper function for BF16 load."""
     assert k_cache.shape == v_cache.shape
     assert k_new.shape == v_new.shape
     N_BLOCKS, PAGE_SIZE, H_KV, HEAD_DIM = k_cache.shape
@@ -254,7 +352,7 @@ def load_kvcache(k_cache: torch.Tensor, v_cache: torch.Tensor,
     v_output = torch.empty_like(k_output)
     
     GRID = (NUM_SEQS, MAX_SEQ_BLOCKS, H_KV)
-    load_kvcache_kernel[GRID](
+    load_kvcache_kernel_bf16[GRID](
         k_cache, v_cache,
         k_new, v_new,
         attn_metadata.block_tables,
@@ -277,3 +375,134 @@ def load_kvcache(k_cache: torch.Tensor, v_cache: torch.Tensor,
     )
     
     return k_output, v_output
+
+
+def store_kvcache_unified_layout(key: torch.Tensor, value: torch.Tensor, 
+                                 k_cache: torch.Tensor, v_cache: torch.Tensor, 
+                                 slot_mapping: torch.Tensor, attn_metadata: AttnMetaDataBase) -> None:
+    """
+    Store KV cache (unified layout).
+    Dynamically selects the appropriate kernel based on quantization strategy from context.
+    """
+    from diffulex.utils.quantization.context import get_kv_cache_strategy
+    from diffulex.utils.quantization.strategies import (
+        NoQuantizationStrategy,
+        KVCacheBF16Strategy,
+        KVCacheFP8RunningMaxStrategy,
+    )
+    
+    strategy = get_kv_cache_strategy()
+    if strategy is None:
+        strategy = NoQuantizationStrategy()
+    
+    # 根据策略类型选择kernel
+    if isinstance(strategy, (KVCacheBF16Strategy, NoQuantizationStrategy)):
+        # BF16路径：无量化，直接存储
+        _store_kvcache_unified_bf16(key, value, k_cache, v_cache, slot_mapping)
+    elif isinstance(strategy, KVCacheFP8RunningMaxStrategy):
+        # FP8路径：量化后存储
+        if attn_metadata.k_scale is None or attn_metadata.v_scale is None:
+            raise ValueError("FP8 quantization requires k_scale and v_scale in metadata")
+        _store_kvcache_unified_fp8(key, value, k_cache, v_cache, slot_mapping,
+                                   attn_metadata.k_scale, attn_metadata.v_scale)
+    else:
+        raise ValueError(f"Unsupported quantization strategy for unified layout: {type(strategy)}")
+
+
+def store_kvcache_distinct_layout(key: torch.Tensor, value: torch.Tensor, 
+                                  k_cache: torch.Tensor, v_cache: torch.Tensor, 
+                                  slot_mapping: torch.Tensor, attn_metadata: AttnMetaDataBase) -> None:
+    """
+    Store KV cache (distinct layout).
+    Dynamically selects the appropriate kernel based on quantization strategy from context.
+    """
+    from diffulex.utils.quantization.context import get_kv_cache_strategy
+    from diffulex.utils.quantization.strategies import (
+        NoQuantizationStrategy,
+        KVCacheBF16Strategy,
+    )
+    
+    strategy = get_kv_cache_strategy()
+    if strategy is None:
+        strategy = NoQuantizationStrategy()
+    
+    # 根据策略类型选择kernel
+    if isinstance(strategy, (KVCacheBF16Strategy, NoQuantizationStrategy)):
+        # BF16路径：无量化，直接存储
+        _store_kvcache_distinct_bf16(key, value, k_cache, v_cache, slot_mapping)
+    else:
+        raise ValueError(f"Unsupported quantization strategy for distinct layout: {type(strategy)}")
+
+
+def _load_kvcache_fp8(k_cache: torch.Tensor, v_cache: torch.Tensor,
+                      attn_metadata: AttnMetaDataBase,
+                      k_new: torch.Tensor, v_new: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Helper function for FP8 load - dequantizes in Python and returns BF16.
+    
+    Supports unified layout cache shape: [num_blocks, page_size, num_kv_heads, head_dim]
+    """
+    from diffulex.utils.quantization.context import get_kv_cache_strategy
+    from diffulex.utils.quantization.strategies import KVCacheFP8RunningMaxStrategy
+    
+    strategy = get_kv_cache_strategy()
+    if not isinstance(strategy, KVCacheFP8RunningMaxStrategy):
+        raise ValueError(f"Expected KVCacheFP8RunningMaxStrategy, got {type(strategy)}")
+    
+    # Get scales from metadata
+    if attn_metadata.k_scale is None or attn_metadata.v_scale is None:
+        raise ValueError("FP8 dequantization requires k_scale and v_scale in metadata")
+    
+    k_scale = attn_metadata.k_scale  # [num_kv_heads]
+    v_scale = attn_metadata.v_scale  # [num_kv_heads]
+    
+    # Cache shape for unified layout: [num_blocks, page_size, num_kv_heads, head_dim]
+    assert k_cache.shape == v_cache.shape
+    N_BLOCKS, PAGE_SIZE, H_KV, HEAD_DIM = k_cache.shape
+    
+    # Dequantize cache: view uint8 as FP8 dtype, then dequantize
+    k_cache_fp8 = k_cache.view(strategy.spec.fp8_view_dtype)  # View as FP8
+    v_cache_fp8 = v_cache.view(strategy.spec.fp8_view_dtype)  # View as FP8
+    
+    # Convert to float32 for dequantization
+    k_cache_fp32 = k_cache_fp8.float()  # [num_blocks, page_size, num_kv_heads, head_dim]
+    v_cache_fp32 = v_cache_fp8.float()  # [num_blocks, page_size, num_kv_heads, head_dim]
+    
+    # Apply scale: k_cache_fp32 * k_scale (broadcast over head_dim)
+    # k_scale shape: [num_kv_heads] -> [1, 1, num_kv_heads, 1]
+    k_scale_broadcast = k_scale.view(1, 1, -1, 1)  # [1, 1, num_kv_heads, 1]
+    v_scale_broadcast = v_scale.view(1, 1, -1, 1)  # [1, 1, num_kv_heads, 1]
+    
+    k_cache_bf16 = (k_cache_fp32 * k_scale_broadcast).to(torch.bfloat16)
+    v_cache_bf16 = (v_cache_fp32 * v_scale_broadcast).to(torch.bfloat16)
+    
+    # Now use the BF16 load logic with the dequantized cache
+    return _load_kvcache_bf16(k_cache_bf16, v_cache_bf16, attn_metadata, k_new, v_new)
+
+
+def load_kvcache(k_cache: torch.Tensor, v_cache: torch.Tensor,
+                 attn_metadata: AttnMetaDataBase,
+                 k_new: torch.Tensor, v_new: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Load KV cache.
+    Dynamically selects the appropriate kernel based on quantization strategy from context.
+    """
+    from diffulex.utils.quantization.context import get_kv_cache_strategy
+    from diffulex.utils.quantization.strategies import (
+        NoQuantizationStrategy,
+        KVCacheBF16Strategy,
+        KVCacheFP8RunningMaxStrategy,
+    )
+    
+    strategy = get_kv_cache_strategy()
+    if strategy is None:
+        strategy = NoQuantizationStrategy()
+    
+    # 根据策略类型选择kernel
+    if isinstance(strategy, (KVCacheBF16Strategy, NoQuantizationStrategy)):
+        # BF16路径：直接加载
+        return _load_kvcache_bf16(k_cache, v_cache, attn_metadata, k_new, v_new)
+    elif isinstance(strategy, KVCacheFP8RunningMaxStrategy):
+        # FP8路径：反量化后加载（Python层显式反量化）
+        return _load_kvcache_fp8(k_cache, v_cache, attn_metadata, k_new, v_new)
+    else:
+        raise ValueError(f"Unsupported quantization strategy for load: {type(strategy)}")
