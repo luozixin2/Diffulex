@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Optional, Protocol
 
 import torch
+import torch.nn.functional as F
 
 
 class _AttnMetaDataLike(Protocol):
@@ -288,4 +289,75 @@ class AttnQQuantizationStrategy(QuantizationStrategy):
         Default behavior: no-op (returns BF16/FP16/FP32 Q as-is).
         """
         return q
+
+
+class LinearQuantizationStrategy(QuantizationStrategy):
+    """Linear layer quantization strategy interface (weights + activations).
+
+    This is an architecture hook: kernels/packed weights can be implemented later.
+    The runtime (Linear layers) should dispatch by `quant_kind` ("attn"/"mlp"/"other")
+    and use this strategy to compute the Linear output.
+    """
+
+    @property
+    def linear_weight_format(self) -> str:
+        """Small tag used for kernel dispatch for weights.
+
+        Known values (initial set):
+        - "bf16": no weight quantization
+        - "int8"/"int4"/"fp8_e4m3"/"fp8_e5m2"/"gptq"/"awq": placeholders
+        """
+        return "bf16"
+
+    @property
+    def linear_act_format(self) -> str:
+        """Small tag used for kernel dispatch for activations."""
+        return "bf16"
+
+    def quantize_weight_for_kernel(
+        self,
+        weight: torch.Tensor,
+        *,
+        device: torch.device | None = None,
+        **_: Any,
+    ) -> tuple[torch.Tensor, Any]:
+        """Optionally quantize/pack weight for kernel consumption.
+
+        Default behavior: no-op, returns (weight, None).
+        """
+        if device is not None:
+            weight = weight.to(device=device)
+        return weight, None
+
+    def quantize_act_for_kernel(
+        self,
+        x: torch.Tensor,
+        *,
+        device: torch.device | None = None,
+        **_: Any,
+    ) -> tuple[torch.Tensor, Any]:
+        """Optionally quantize activations for kernel consumption.
+
+        Default behavior: no-op, returns (x, None).
+        """
+        if device is not None:
+            x = x.to(device=device)
+        return x, None
+
+    def linear_forward(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        *,
+        quant_kind: str,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Compute Linear output for a given kind.
+
+        Default behavior: `F.linear(x, weight, bias)` (no quantization).
+        Quantized strategies may override this to call custom kernels.
+        """
+        _ = quant_kind, kwargs
+        return F.linear(x, weight, bias)
 

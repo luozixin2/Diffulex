@@ -497,7 +497,7 @@ def store_kvcache_unified_layout(key: torch.Tensor, value: torch.Tensor,
     if strategy is None:
         _store_kvcache_unified_bf16(key, value, k_cache, v_cache, slot_mapping)
         return
-
+    
     fmt = getattr(strategy, "kv_cache_format", "bf16")
     if fmt == "bf16":
         _store_kvcache_unified_bf16(key, value, k_cache, v_cache, slot_mapping)
@@ -526,7 +526,7 @@ def store_kvcache_distinct_layout(key: torch.Tensor, value: torch.Tensor,
     if strategy is None:
         _store_kvcache_distinct_bf16(key, value, k_cache, v_cache, slot_mapping)
         return
-
+    
     fmt = getattr(strategy, "kv_cache_format", "bf16")
     if fmt == "bf16":
         _store_kvcache_distinct_bf16(key, value, k_cache, v_cache, slot_mapping)
@@ -630,7 +630,7 @@ def load_kvcache(k_cache: torch.Tensor, v_cache: torch.Tensor,
     strategy = get_kv_cache_strategy()
     if strategy is None:
         return _load_kvcache_bf16(k_cache, v_cache, attn_metadata, k_new, v_new)
-
+    
     fmt = getattr(strategy, "kv_cache_format", "bf16")
     if fmt == "bf16":
         return _load_kvcache_bf16(k_cache, v_cache, attn_metadata, k_new, v_new)

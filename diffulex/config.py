@@ -46,6 +46,13 @@ class Config:
     # Attention-Q dtype (activation quantization). "bf16" default; "fp8" is a placeholder
     # for future kernels (enabling it will currently raise NotImplementedError at runtime).
     attn_q_dtype: str = "bf16"
+    # Linear quantization (weights + activations). All are placeholders for future kernels.
+    # Use "bf16" to disable quantization.
+    # Supported aliases (normalized in registry): bf16/int8/int4/fp8/fp8_e4m3/fp8_e5m2/gptq/awq.
+    linear_attn_weight_dtype: str = "bf16"
+    linear_mlp_weight_dtype: str = "bf16"
+    linear_attn_act_dtype: str = "bf16"
+    linear_mlp_act_dtype: str = "bf16"
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

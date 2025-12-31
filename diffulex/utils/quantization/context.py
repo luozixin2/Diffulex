@@ -13,6 +13,7 @@ from diffulex.utils.quantization.strategy import (
     KVCacheQuantizationStrategy,
     AttnQQuantizationStrategy,
     WeightQuantizationStrategy,
+    LinearQuantizationStrategy,
 )
 
 
@@ -76,6 +77,23 @@ class QuantizationContext:
         raise TypeError(
             f"attn_q strategy must be AttnQQuantizationStrategy, got {type(strategy)}"
         )
+
+    def set_linear_strategy(self, kind: str, strategy: LinearQuantizationStrategy) -> None:
+        """Set Linear quantization strategy for a kind ("attn"/"mlp"/"other")."""
+        key = f"linear_{(kind or 'other').strip().lower() or 'other'}"
+        self._strategies[key] = strategy
+
+    def get_linear_strategy(self, kind: str) -> Optional[LinearQuantizationStrategy]:
+        """Get Linear quantization strategy for a kind ("attn"/"mlp"/"other")."""
+        key = f"linear_{(kind or 'other').strip().lower() or 'other'}"
+        strategy = self._strategies.get(key)
+        if strategy is None:
+            return None
+        if isinstance(strategy, LinearQuantizationStrategy):
+            return strategy
+        raise TypeError(
+            f"{key} strategy must be LinearQuantizationStrategy, got {type(strategy)}"
+        )
     
     def clear(self):
         """Clear all strategies."""
@@ -129,4 +147,16 @@ def get_attn_q_strategy() -> Optional[AttnQQuantizationStrategy]:
     """Get Attention-Q quantization strategy."""
     ctx = QuantizationContext.current()
     return ctx.get_attn_q_strategy()
+
+
+def set_linear_strategy(kind: str, strategy: LinearQuantizationStrategy) -> None:
+    """Set Linear quantization strategy for a kind ("attn"/"mlp"/"other")."""
+    ctx = QuantizationContext.current()
+    ctx.set_linear_strategy(kind, strategy)
+
+
+def get_linear_strategy(kind: str) -> Optional[LinearQuantizationStrategy]:
+    """Get Linear quantization strategy for a kind ("attn"/"mlp"/"other")."""
+    ctx = QuantizationContext.current()
+    return ctx.get_linear_strategy(kind)
 

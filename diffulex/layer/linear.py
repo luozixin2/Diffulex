@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
+from diffulex.utils.quantization.context import get_linear_strategy
+
 
 def divide(numerator, denominator):
     assert numerator % denominator == 0
@@ -63,11 +65,13 @@ class LinearBase(nn.Module):
         input_size: int,
         output_size: int,
         tp_dim: int | None = None,
+        quant_kind: str = "other",
     ):
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
         self.tp_dim = tp_dim
+        self.quant_kind = (quant_kind or "other").strip().lower() or "other"
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
 
@@ -85,8 +89,9 @@ class ReplicatedLinear(LinearBase, LoRAMixin):
         r: int = 0,
         lora_alpha: float = 1.0,
         lora_dropout: float = 0.0,
+        quant_kind: str = "other",
     ):
-        LinearBase.__init__(self, input_size, output_size)
+        LinearBase.__init__(self, input_size, output_size, None, quant_kind)
         self.weight = nn.Parameter(torch.empty(self.output_size, self.input_size))
         self.weight.weight_loader = self.weight_loader
         if bias:
@@ -101,7 +106,11 @@ class ReplicatedLinear(LinearBase, LoRAMixin):
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        base_out = F.linear(x, self.weight, self.bias)
+        strategy = get_linear_strategy(self.quant_kind)
+        if strategy is None:
+            base_out = F.linear(x, self.weight, self.bias)
+        else:
+            base_out = strategy.linear_forward(x, self.weight, self.bias, quant_kind=self.quant_kind)
         return self.lora_forward(x, base_out)
 
 
@@ -115,8 +124,9 @@ class ColumnParallelLinear(LinearBase, LoRAMixin):
         r: int = 0,
         lora_alpha: float = 1.0,
         lora_dropout: float = 0.0,
+        quant_kind: str = "other",
     ):
-        LinearBase.__init__(self, input_size, output_size, 0)
+        LinearBase.__init__(self, input_size, output_size, 0, quant_kind)
         self.input_size_per_partition = input_size
         self.output_size_per_partition = divide(output_size, self.tp_size)
 
@@ -138,7 +148,11 @@ class ColumnParallelLinear(LinearBase, LoRAMixin):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        base_out = F.linear(x, self.weight, self.bias)
+        strategy = get_linear_strategy(self.quant_kind)
+        if strategy is None:
+            base_out = F.linear(x, self.weight, self.bias)
+        else:
+            base_out = strategy.linear_forward(x, self.weight, self.bias, quant_kind=self.quant_kind)
         return self.lora_forward(x, base_out)
 
 
@@ -152,9 +166,18 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         r: int = 0,
         lora_alpha: float = 1.0,
         lora_dropout: float = 0.0,
+        quant_kind: str = "other",
     ):
         self.output_sizes = output_sizes
-        super().__init__(input_size, sum(output_sizes), bias=bias, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout)
+        super().__init__(
+            input_size,
+            sum(output_sizes),
+            bias=bias,
+            r=r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            quant_kind=quant_kind,
+        )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int):
         param_data = param.data
@@ -177,6 +200,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         r: int = 0,
         lora_alpha: float = 1.0,
         lora_dropout: float = 0.0,
+        quant_kind: str = "attn",
     ):
         self.head_size = head_size
         self.total_num_heads = total_num_heads
@@ -186,7 +210,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
         input_size = hidden_size
         output_size = (self.total_num_heads + 2 * self.total_num_kv_heads) * self.head_size
-        super().__init__(input_size, output_size, bias, r, lora_alpha, lora_dropout)
+        super().__init__(input_size, output_size, bias, r, lora_alpha, lora_dropout, quant_kind=quant_kind)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str):
         param_data = param.data
@@ -215,8 +239,9 @@ class RowParallelLinear(LinearBase, LoRAMixin):
         r: int = 0,
         lora_alpha: float = 1.0,
         lora_dropout: float = 0.0,
+        quant_kind: str = "other",
     ):
-        LinearBase.__init__(self, input_size, output_size, 1)
+        LinearBase.__init__(self, input_size, output_size, 1, quant_kind)
         self.input_size_per_partition = divide(input_size, self.tp_size)
         self.output_size_per_partition = output_size
 
@@ -238,7 +263,12 @@ class RowParallelLinear(LinearBase, LoRAMixin):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+        bias = self.bias if self.tp_rank == 0 else None
+        strategy = get_linear_strategy(self.quant_kind)
+        if strategy is None:
+            y = F.linear(x, self.weight, bias)
+        else:
+            y = strategy.linear_forward(x, self.weight, bias, quant_kind=self.quant_kind)
         if self.tp_size > 1:
             dist.all_reduce(y)
         return self.lora_forward(x, y)
