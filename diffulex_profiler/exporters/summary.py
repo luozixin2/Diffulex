@@ -24,7 +24,6 @@ class SummaryExporter(ProfilerExporter):
         summary_lines.append("=" * 80)
         summary_lines.append("")
         
-        # Overall summary
         total_duration = sum(m.duration for m in metrics if m.duration)
         total_tokens = sum(m.total_tokens for m in metrics if m.total_tokens)
         avg_throughput = (
@@ -37,7 +36,6 @@ class SummaryExporter(ProfilerExporter):
         summary_lines.append(f"Average Throughput: {avg_throughput:.2f} tokens/sec")
         summary_lines.append("")
         
-        # Per-section details
         summary_lines.append("-" * 80)
         summary_lines.append("Section Details:")
         summary_lines.append("-" * 80)
@@ -56,14 +54,15 @@ class SummaryExporter(ProfilerExporter):
                 summary_lines.append(f"  Custom Metrics: {m.custom_metrics}")
             if m.metadata:
                 summary_lines.append(f"  Metadata: {m.metadata}")
+            if m.backend_data and m.backend_data.get("backend") == "viztracer":
+                output_file = m.backend_data.get("output_file", "N/A")
+                summary_lines.append(f"  VizTracer Output: {output_file}")
         
         summary_lines.append("")
         summary_lines.append("=" * 80)
         
-        # Write to file
         with open(output_file, "w") as f:
             f.write("\n".join(summary_lines))
         
-        # Also log to console
         logger.info("\n".join(summary_lines))
 

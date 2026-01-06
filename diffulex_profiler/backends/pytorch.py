@@ -63,7 +63,6 @@ class PyTorchProfilerBackend(ProfilerBackend):
         
         self.profiler.__exit__(None, None, None)
         
-        # Export trace
         trace_file = self.output_dir / f"pytorch_trace_{self.current_name}.json"
         try:
             self.profiler.export_chrome_trace(str(trace_file))
@@ -77,7 +76,6 @@ class PyTorchProfilerBackend(ProfilerBackend):
             "name": self.current_name,
         }
         
-        # Get summary statistics
         try:
             events = self.profiler.key_averages()
             result["summary"] = {

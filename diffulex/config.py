@@ -66,3 +66,12 @@ class Config:
         cfg_max_model_len = self.hf_config.max_position_embeddings if hasattr(self.hf_config, "max_position_embeddings") else self.hf_config.max_sequence_length
         self.max_model_len = min(self.max_model_len, cfg_max_model_len)
         assert self.max_num_batched_tokens >= self.max_model_len
+        
+        if not self.device_ids:
+            import torch
+            self.device_ids = (
+                [int(x) for x in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if x.strip()]
+                if os.environ.get("CUDA_VISIBLE_DEVICES", "")
+                else list(range(torch.cuda.device_count()))
+            )
+            logger.info(f"Using CUDA devices: {self.device_ids}")

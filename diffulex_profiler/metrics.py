@@ -24,25 +24,15 @@ class PerformanceMetrics:
     start_time: float = 0.0
     end_time: float = 0.0
     duration: float = 0.0
-    
-    # Throughput metrics
     total_tokens: int = 0
     throughput_tokens_per_sec: float = 0.0
-    
-    # GPU metrics
     gpu_metrics_start: Optional[Dict[str, Any]] = None
     gpu_metrics_end: Optional[Dict[str, Any]] = None
     gpu_utilization: float = 0.0
-    
-    # Memory metrics
     memory_metrics_start: Optional[Dict[str, Any]] = None
     memory_metrics_end: Optional[Dict[str, Any]] = None
     memory_delta_mb: float = 0.0
-    
-    # Custom metrics
     custom_metrics: Dict[str, Any] = field(default_factory=dict)
-    
-    # Backend-specific data
     backend_data: Optional[Dict[str, Any]] = None
     
     def to_dict(self) -> Dict[str, Any]:
@@ -71,13 +61,11 @@ def collect_gpu_metrics() -> Dict[str, Any]:
         metrics["device"] = device
         metrics["device_name"] = torch.cuda.get_device_name(device)
         
-        # Memory stats
         memory_stats = torch.cuda.memory_stats(device)
         metrics["allocated_mb"] = memory_stats.get("allocated_bytes.all.current", 0) / (1024 ** 2)
         metrics["reserved_mb"] = memory_stats.get("reserved_bytes.all.current", 0) / (1024 ** 2)
         metrics["peak_allocated_mb"] = memory_stats.get("allocated_bytes.all.peak", 0) / (1024 ** 2)
         
-        # Utilization (if available via nvitop or similar)
         try:
             import pynvml
             pynvml.nvmlInit()

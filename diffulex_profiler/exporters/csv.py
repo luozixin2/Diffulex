@@ -19,7 +19,6 @@ class CSVExporter(ProfilerExporter):
         if not metrics:
             return
         
-        # Collect all possible field names
         fieldnames = set(["name", "duration_sec", "total_tokens", "throughput_tokens_per_sec"])
         
         for m in metrics:
@@ -40,13 +39,8 @@ class CSVExporter(ProfilerExporter):
                     "total_tokens": m.total_tokens,
                     "throughput_tokens_per_sec": m.throughput_tokens_per_sec,
                 }
-                
-                # Add custom metrics
                 row.update(m.custom_metrics)
-                
-                # Add metadata with prefix
                 for k, v in m.metadata.items():
                     row[f"metadata_{k}"] = v
-                
                 writer.writerow(row)
 

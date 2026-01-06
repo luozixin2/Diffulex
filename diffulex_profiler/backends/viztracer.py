@@ -20,11 +20,12 @@ logger = get_logger(__name__)
 class VizTracerBackend(ProfilerBackend):
     """VizTracer-based profiling backend for detailed function call tracing."""
     
-    def __init__(self, output_file: Optional[str] = None, **kwargs):
+    def __init__(self, output_file: Optional[str] = None, output_dir: Optional[str] = None, **kwargs):
         if not VIZTRACER_AVAILABLE:
             raise ImportError("VizTracer is not installed. Install it with: pip install viztracer")
         
         self.output_file = output_file
+        self.output_dir = output_dir
         self.tracer: Optional[VizTracer] = None
         self.config = kwargs
     
@@ -34,7 +35,18 @@ class VizTracerBackend(ProfilerBackend):
             logger.warning("VizTracer already started, stopping previous instance")
             self.stop()
         
-        output_file = self.output_file or f"viztracer_{name}.json"
+        if self.output_file:
+            output_file = self.output_file
+        else:
+            output_file = f"viztracer_{name}.json"
+        
+        # If output_dir is specified, prepend it to the output_file path
+        if self.output_dir:
+            output_file = str(Path(self.output_dir) / Path(output_file).name)
+            # Ensure output directory exists
+            Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+        
+        logger.info(f"VizTracer output file: {output_file}")
         self.tracer = VizTracer(output_file=output_file, **self.config)
         self.tracer.start()
     

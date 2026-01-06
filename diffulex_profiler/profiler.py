@@ -55,13 +55,8 @@ class DiffulexProfiler:
         if not self.config.enabled:
             return
             
-        # Initialize backend
         self._init_backend()
-        
-        # Initialize exporters
         self._init_exporters()
-        
-        # Create output directory
         Path(self.config.output_dir).mkdir(parents=True, exist_ok=True)
     
     def _init_backend(self):
@@ -72,6 +67,9 @@ class DiffulexProfiler:
             try:
                 from diffulex_profiler.backends import VizTracerBackend
                 viztracer_config = self.config.viztracer_config or {}
+                # Pass output_dir to VizTracerBackend so it can save files in the correct location
+                if "output_dir" not in viztracer_config:
+                    viztracer_config["output_dir"] = self.config.output_dir
                 self.backend = VizTracerBackend(**viztracer_config)
             except ImportError:
                 logger.warning("VizTracer not available, falling back to simple timer")
@@ -118,7 +116,6 @@ class DiffulexProfiler:
             yield
             return
         
-        # Start profiling
         self.start(name, metadata)
         try:
             yield
@@ -130,21 +127,17 @@ class DiffulexProfiler:
         if not self.config.enabled:
             return
         
-        # Create new metrics entry
         self.current_metrics = PerformanceMetrics(
             name=name,
             metadata=metadata or {},
         )
         
-        # Start timing
         if self.config.collect_timing:
             self.current_metrics.start_time = time.perf_counter()
         
-        # Start backend profiling
         if self.backend:
             self.backend.start(name)
         
-        # Collect initial metrics
         if self.config.collect_gpu_metrics and torch.cuda.is_available():
             self.current_metrics.gpu_metrics_start = collect_gpu_metrics()
         
@@ -156,23 +149,19 @@ class DiffulexProfiler:
         if not self.config.enabled or self.current_metrics is None:
             return
         
-        # Stop timing
         if self.config.collect_timing:
             self.current_metrics.end_time = time.perf_counter()
             self.current_metrics.duration = (
                 self.current_metrics.end_time - self.current_metrics.start_time
             )
         
-        # Stop backend profiling
         if self.backend:
             backend_data = self.backend.stop()
             if backend_data:
                 self.current_metrics.backend_data = backend_data
         
-        # Collect final metrics
         if self.config.collect_gpu_metrics and torch.cuda.is_available():
             self.current_metrics.gpu_metrics_end = collect_gpu_metrics()
-            # Calculate GPU utilization delta
             if self.current_metrics.gpu_metrics_start and self.current_metrics.gpu_metrics_end:
                 self.current_metrics.gpu_utilization = (
                     self.current_metrics.gpu_metrics_end.get("utilization", 0) -
@@ -181,14 +170,12 @@ class DiffulexProfiler:
         
         if self.config.collect_memory_metrics:
             self.current_metrics.memory_metrics_end = collect_memory_metrics()
-            # Calculate memory delta
             if (self.current_metrics.memory_metrics_start and 
                 self.current_metrics.memory_metrics_end):
                 start_mem = self.current_metrics.memory_metrics_start.get("used_mb", 0)
                 end_mem = self.current_metrics.memory_metrics_end.get("used_mb", 0)
                 self.current_metrics.memory_delta_mb = end_mem - start_mem
         
-        # Add to metrics list
         self.metrics.append(self.current_metrics)
         self.current_metrics = None
     
@@ -230,7 +217,6 @@ class DiffulexProfiler:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # Export using all configured exporters
         for exporter in self.exporters:
             try:
                 exporter.export(self.metrics, output_path)
