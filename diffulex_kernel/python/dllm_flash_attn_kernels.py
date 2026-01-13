@@ -368,6 +368,222 @@ def dllm_flash_attn_decode_kernel(
     return kernel
 
 
+@tilelang.autotune(configs=build_configs())
+@tilelang.jit(
+    # NOTE: Disable TMA and warp specialized for now to avoid compile error on Hopper
+    out_idx=[-1], 
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    }
+)
+def dllm_flash_attn_decode_kernel_bf16_q_fp8_kv(
+    NUM_SEQS: int,
+    NUM_GROUPS: int,
+    NUM_PAGE_BLOCKS: int,
+    Q_LEN: int,
+    KV_LEN: int,
+    NUM_HEADS: int,
+    HEAD_DIM: int,
+    IS_BLOCK_ATTN: bool,
+    DIFFUSION_BLOCK_SIZE: int,
+    MAX_SEQ_NUM_BLOCKS: int,
+    PAGE_BLOCK_SIZE: int = 32,
+    BLOCK_M: int = 64,
+    BLOCK_N: int = 64,
+    NUM_STAGES: int = 1,
+    NUM_THREADS: int = 128,
+):
+    SCALE = (1.0 / HEAD_DIM)**0.5 * 1.44269504  # log2(e)
+    NUM_KV_HEADS = NUM_HEADS // NUM_GROUPS
+    Q_SHAPE = [Q_LEN, NUM_HEADS, HEAD_DIM]
+    KV_SHAPE = [KV_LEN, NUM_KV_HEADS, HEAD_DIM]
+    O_SHAPE = [Q_LEN, NUM_HEADS, HEAD_DIM]
+    K_CACHE_SHAPE = [NUM_PAGE_BLOCKS, PAGE_BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM]
+    V_CACHE_SHAPE = [NUM_PAGE_BLOCKS, PAGE_BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM]
+    MAX_SEQ_NUM_BLOCKS = T.dynamic("MAX_SEQ_NUM_BLOCKS", 'int32')
+    BLOCK_TABLES_SHAPE = [NUM_SEQS, MAX_SEQ_NUM_BLOCKS]
+    DTYPE = "bfloat16"
+    ACCUM_DTYPE = "float32"
+    FP8_DTYPE = "float8_e4m3fn"
+   
+    @T.prim_func
+    def kernel(
+        Q: T.Tensor(Q_SHAPE, DTYPE),
+        K: T.Tensor(KV_SHAPE, DTYPE),
+        V: T.Tensor(KV_SHAPE, DTYPE),
+        K_Cache: T.Tensor(K_CACHE_SHAPE, FP8_DTYPE),
+        V_Cache: T.Tensor(V_CACHE_SHAPE, FP8_DTYPE),
+        K_Scale: T.Tensor([NUM_KV_HEADS], "float32"),
+        V_Scale: T.Tensor([NUM_KV_HEADS], "float32"),
+        block_tables: T.Tensor(BLOCK_TABLES_SHAPE, "int32"),
+        context_lens: T.Tensor(NUM_SEQS, "int32"),
+        cu_seqlens_q: T.Tensor(NUM_SEQS + 1, "int32"),
+        cu_seqlens_k: T.Tensor(NUM_SEQS + 1, "int32"),
+        max_seqlen_q: T.int32, 
+        O: T.Tensor(O_SHAPE, DTYPE),
+    ):
+        with T.Kernel(NUM_SEQS, NUM_HEADS, threads=NUM_THREADS) as (bx, by):
+            Q_shared = T.alloc_shared([BLOCK_M, HEAD_DIM], DTYPE)
+            K_shared = T.alloc_shared([BLOCK_N, HEAD_DIM], DTYPE)
+            V_shared = T.alloc_shared([BLOCK_N, HEAD_DIM], DTYPE)
+            O_shared = T.alloc_shared([BLOCK_M, HEAD_DIM], DTYPE)
+            
+            # KV cache shared staging buffers (BF16):
+            # HBM(FP8) -> T.copy (implicit cast) -> shared(BF16) -> GEMM
+            K_Cache_shared_bf16 = T.alloc_shared([PAGE_BLOCK_SIZE, HEAD_DIM], DTYPE)
+            V_Cache_shared_bf16 = T.alloc_shared([PAGE_BLOCK_SIZE, HEAD_DIM], DTYPE)
+            
+            acc_score_kv = T.alloc_fragment([BLOCK_M, BLOCK_N], ACCUM_DTYPE)
+            acc_score_kv_cast = T.alloc_fragment([BLOCK_M, BLOCK_N], DTYPE)
+            acc_score_kvcache = T.alloc_fragment([BLOCK_M, PAGE_BLOCK_SIZE], ACCUM_DTYPE)
+            acc_score_kvcache_cast = T.alloc_fragment([BLOCK_M, PAGE_BLOCK_SIZE], DTYPE)
+            
+            acc_output = T.alloc_fragment([BLOCK_M, HEAD_DIM], ACCUM_DTYPE)
+            scores_max = T.alloc_fragment([BLOCK_M], ACCUM_DTYPE)
+            scores_max_prev = T.alloc_fragment([BLOCK_M], ACCUM_DTYPE)
+            scores_scale = T.alloc_fragment([BLOCK_M], ACCUM_DTYPE)
+            scores_sum = T.alloc_fragment([BLOCK_M], ACCUM_DTYPE)
+            log_sum = T.alloc_fragment([BLOCK_M], ACCUM_DTYPE)
+            
+            T.annotate_layout({
+                Q_shared: tilelang.layout.make_swizzled_layout(Q_shared),
+                O_shared: tilelang.layout.make_swizzled_layout(O_shared),
+            })
+
+            seq_idx = bx
+            head_idx = by
+            kv_head_idx = head_idx // NUM_GROUPS
+            
+            q_start_idx = cu_seqlens_q[seq_idx]
+            kv_start_idx = cu_seqlens_k[seq_idx]
+            q_end_idx = cu_seqlens_q[seq_idx + 1]
+            kv_end_idx = cu_seqlens_k[seq_idx + 1]
+            
+            cur_q_seqlen = q_end_idx - q_start_idx
+            cur_kv_seqlen = kv_end_idx - kv_start_idx
+            
+            cur_context_len = context_lens[seq_idx]
+            
+            T.copy(Q[q_start_idx : q_start_idx + BLOCK_M, head_idx, :], Q_shared)
+            
+            T.fill(acc_output, 0)
+            T.fill(acc_score_kv, 0)
+            T.fill(acc_score_kvcache, 0)
+            T.fill(log_sum, 0)
+            T.fill(scores_max, -T.infinity(ACCUM_DTYPE))
+            
+            # ==========================
+            # Stage 1: KV Cache Attention (Context)
+            # ==========================
+            for page_block_idx_local in T.Pipelined(MAX_SEQ_NUM_BLOCKS, num_stages=NUM_STAGES):
+                page_block_idx_global = block_tables[seq_idx, page_block_idx_local]
+                if page_block_idx_global >= 0:
+                    # Step 1: Load FP8 K_Cache, implicit cast to BF16 (vectorized path).
+                    # K_Scale will be applied on scores (much cheaper than scaling K elementwise).
+                    T.copy(K_Cache[page_block_idx_global, :, kv_head_idx, :], K_Cache_shared_bf16)
+                    
+                    # Initialize scores with mask, then GEMM accumulates into it (masked entries remain ~-1e9).
+                    for i, j in T.Parallel(BLOCK_M, PAGE_BLOCK_SIZE):
+                        acc_score_kvcache[i, j] = T.if_then_else(
+                            (i >= cur_q_seqlen or page_block_idx_local * PAGE_BLOCK_SIZE + j >= cur_context_len),
+                            -1e9,
+                            0,
+                        )
+                    
+                    # Compute attention scores
+                    T.gemm(Q_shared, K_Cache_shared_bf16, acc_score_kvcache, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                    # Apply per-head K scale on scores: (Q·(K*ks)) == (Q·K) * ks
+                    for i, j in T.Parallel(BLOCK_M, PAGE_BLOCK_SIZE):
+                        acc_score_kvcache[i, j] *= K_Scale[kv_head_idx]
+                    
+                    # Compute online softmax
+                    T.copy(scores_max, scores_max_prev)
+                    T.fill(scores_max, -T.infinity(ACCUM_DTYPE))
+                    T.reduce_max(acc_score_kvcache, scores_max, dim=1, clear=False)
+                    for i in T.Parallel(BLOCK_M):
+                        scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
+                    
+                    for i in T.Parallel(BLOCK_M):
+                        scores_scale[i] = T.exp2(scores_max_prev[i] * SCALE - scores_max[i] * SCALE)
+                        
+                    for i, j in T.Parallel(BLOCK_M, PAGE_BLOCK_SIZE):
+                        acc_score_kvcache[i, j] = T.exp2(acc_score_kvcache[i, j] * SCALE - scores_max[i] * SCALE)
+                        
+                    T.reduce_sum(acc_score_kvcache, scores_sum, dim=1)
+                    for i in T.Parallel(BLOCK_M):
+                        log_sum[i] = log_sum[i] * scores_scale[i] + scores_sum[i]
+                        
+                    # Cast weights to BF16 for V GEMM, fuse per-head V scale here:
+                    # (softmax * (V*vs)) == ((softmax*vs) · V)
+                    # Use separate loop to avoid layout infer conflict
+                    for i, j in T.Parallel(BLOCK_M, PAGE_BLOCK_SIZE):
+                        acc_score_kvcache_cast[i, j] = (acc_score_kvcache[i, j] * V_Scale[kv_head_idx]).astype(T.bfloat16)
+                    
+                    # Scale previous output accumulator
+                    for i, j in T.Parallel(BLOCK_M, HEAD_DIM):
+                        acc_output[i, j] *= scores_scale[i]
+                    
+                    # Step 2: Load FP8 V_Cache, implicit cast to BF16 (vectorized path).
+                    T.copy(V_Cache[page_block_idx_global, :, kv_head_idx, :], V_Cache_shared_bf16)
+                    
+                    # Accumulate current V_cache contribution using BF16 V_Cache shared buffer
+                    T.gemm(acc_score_kvcache_cast, V_Cache_shared_bf16, acc_output, policy=T.GemmWarpPolicy.FullRow)
+                
+                if page_block_idx_local == MAX_SEQ_NUM_BLOCKS - 1:
+                    # ==========================
+                    # Stage 2: Fresh KV Attention (Self-Attn)
+                    # ==========================
+                    for idx in T.Pipelined(T.ceildiv(DIFFUSION_BLOCK_SIZE, BLOCK_N), num_stages=NUM_STAGES):
+                        T.copy(K[kv_start_idx : kv_start_idx + BLOCK_N, kv_head_idx, :], K_shared)
+
+                        for i, j in T.Parallel(BLOCK_M, BLOCK_N):
+                            acc_score_kv[i, j] = T.if_then_else(i >= cur_q_seqlen or j >= cur_kv_seqlen, -1e9, 0)
+                        
+                        T.gemm(Q_shared, K_shared, acc_score_kv, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                        
+                        T.copy(scores_max, scores_max_prev)
+                        T.fill(scores_max, -T.infinity(ACCUM_DTYPE))
+                        T.reduce_max(acc_score_kv, scores_max, dim=1, clear=False)
+                        for i in T.Parallel(BLOCK_M):
+                            scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
+                        
+                        for i in T.Parallel(BLOCK_M):
+                            scores_scale[i] = T.exp2(scores_max_prev[i] * SCALE - scores_max[i] * SCALE)
+                        
+                        for i, j in T.Parallel(BLOCK_M, BLOCK_N):
+                            acc_score_kv[i, j] = T.exp2(acc_score_kv[i, j] * SCALE - scores_max[i] * SCALE)
+                            
+                        T.reduce_sum(acc_score_kv, scores_sum, dim=1)
+                        for i in T.Parallel(BLOCK_M):
+                            log_sum[i] = log_sum[i] * scores_scale[i] + scores_sum[i]
+                            
+                        T.copy(acc_score_kv, acc_score_kv_cast)
+                        
+                        # Scale previous output
+                        for i, j in T.Parallel(BLOCK_M, HEAD_DIM):
+                            acc_output[i, j] *= scores_scale[i]
+                        
+                        T.copy(V[kv_start_idx : kv_start_idx + BLOCK_N, kv_head_idx, :], V_shared)
+                        
+                        # Accumulate current V contribution
+                        T.gemm(acc_score_kv_cast, V_shared, acc_output, policy=T.GemmWarpPolicy.FullRow)
+            
+            # ==========================
+            # Stage 3: Finalize
+            # ==========================
+            for i, j in T.Parallel(BLOCK_M, HEAD_DIM):
+                acc_output[i, j] /= log_sum[i]
+
+            T.copy(acc_output, O_shared)
+            for i, d_idx in T.Parallel(BLOCK_M, HEAD_DIM):
+                if i < cur_q_seqlen:
+                    O[i + q_start_idx, head_idx, d_idx] = O_shared[i, d_idx] 
+            
+    return kernel
+
+
 def _dllm_flash_attn_prefill_bf16(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -447,6 +663,8 @@ def _dllm_flash_attn_decode_bf16(
     attn_metadata: AttnMetaDataBase
 ) -> torch.Tensor:
     if attn_metadata.decode_mode == "static":
+        # Use kernel_config from prefill if available, otherwise use empty dict
+        config_kwargs = kernel_config if kernel_config is not None else {}
         decode_kernel = dllm_flash_attn_decode_kernel(
             attn_metadata.num_seqs,
             q.shape[1] // k.shape[1],
@@ -459,7 +677,7 @@ def _dllm_flash_attn_decode_bf16(
             attn_metadata.diffusion_block_size,
             attn_metadata.block_tables.shape[1],
             attn_metadata.page_block_size,
-            **kernel_config
+            **config_kwargs
         )
         if not is_warming_up():
             CHECK_FLASH_ATTN_DECODE(

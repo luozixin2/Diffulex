@@ -52,6 +52,20 @@ def config_to_model_args(config: BenchmarkConfig) -> str:
         'wait_ready': True,
     }
     
+    # Add quantization parameters if specified
+    if engine.kv_cache_dtype is not None:
+        args_dict['kv_cache_dtype'] = engine.kv_cache_dtype
+    if engine.decode_mode is not None:
+        args_dict['decode_mode'] = engine.decode_mode
+    if engine.linear_attn_weight_dtype is not None:
+        args_dict['linear_attn_weight_dtype'] = engine.linear_attn_weight_dtype
+    if engine.linear_mlp_weight_dtype is not None:
+        args_dict['linear_mlp_weight_dtype'] = engine.linear_mlp_weight_dtype
+    if engine.linear_attn_act_dtype is not None:
+        args_dict['linear_attn_act_dtype'] = engine.linear_attn_act_dtype
+    if engine.linear_mlp_act_dtype is not None:
+        args_dict['linear_mlp_act_dtype'] = engine.linear_mlp_act_dtype
+    
     if engine.tokenizer_path:
         args_dict['tokenizer_path'] = engine.tokenizer_path
     
@@ -218,12 +232,19 @@ def load_config_from_args(args) -> BenchmarkConfig:
             max_num_seqs=getattr(args, 'max_num_seqs', 128),
             use_lora=args.use_lora,
             lora_path=args.lora_path,
-            enforce_eager=getattr(args, 'enforce_eager', False),
             kv_cache_layout=getattr(args, 'kv_cache_layout', 'unified'),
             accept_threshold=args.accept_threshold,
             complete_threshold=args.complete_threshold,
             add_new_block_threshold=args.add_new_block_threshold,
             diffusion_block_size=args.diffusion_block_size,
+            kv_cache_dtype=getattr(args, 'kv_cache_dtype', None),
+            decode_mode=getattr(args, 'decode_mode', None),
+            # Force enforce_eager=True for varlen mode to avoid CUDA graph capture error
+            enforce_eager=True if getattr(args, 'decode_mode', None) == 'varlen' else (args.enforce_eager if hasattr(args, 'enforce_eager') else False),
+            linear_attn_weight_dtype=getattr(args, 'linear_attn_weight_dtype', None),
+            linear_mlp_weight_dtype=getattr(args, 'linear_mlp_weight_dtype', None),
+            linear_attn_act_dtype=getattr(args, 'linear_attn_act_dtype', None),
+            linear_mlp_act_dtype=getattr(args, 'linear_mlp_act_dtype', None),
         )
         
         eval_config = EvalConfig(

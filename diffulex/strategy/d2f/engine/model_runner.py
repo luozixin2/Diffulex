@@ -25,6 +25,27 @@ class D2FModelRunner(ModelRunnerBase):
         
         super().__init__(config, rank, event)
 
+    def _get_decode_mode(self) -> str:
+        """
+        统一选择 decode_mode 的逻辑：
+        1. 如果 config.decode_mode 已设置，优先使用 config 的值
+        2. 否则，如果 kv_cache_dtype 是 FP8，自动切换到 "static"
+        3. 否则，默认使用 "varlen"
+        """
+        if self.config.decode_mode is not None:
+            return self.config.decode_mode
+        
+        # Auto-select based on kv_cache_dtype
+        decode_mode = "varlen"
+        try:
+            from diffulex.utils.kv_cache_dtype import parse_kv_cache_dtype
+            if parse_kv_cache_dtype(getattr(self.config, "kv_cache_dtype", "bf16")).is_fp8:
+                decode_mode = "static"
+        except Exception:
+            decode_mode = "varlen"
+        
+        return decode_mode
+
     def prepare_prefill(self, seqs: list[D2FSequence]):
         input_ids: list[int] = []
         positions: list[int] = []
@@ -97,6 +118,7 @@ class D2FModelRunner(ModelRunnerBase):
             )
         )
 
+        decode_mode = self._get_decode_mode()
         set_d2f_attn_metadata(
             True,
             cu_seqlens_q=cu_seqlens_q_tensor,
@@ -111,7 +133,7 @@ class D2FModelRunner(ModelRunnerBase):
             seq_lens=seq_lens,
             seq_lens_ts=seq_lens_ts,
             diffusion_block_size=self.diffusion_block_size,
-            decode_mode="varlen",
+            decode_mode=decode_mode,
             attn_type="full_attention",
         )
         return input_ids_tensor, positions_tensor
@@ -230,13 +252,8 @@ class D2FModelRunner(ModelRunnerBase):
         #   KV *slower* than BF16.
         # - Prefer TileLang's BF16Q+FP8KV decode kernel path by switching to "static" mode when
         #   FP8 KV is enabled.
-        decode_mode = "varlen"
-        try:
-            from diffulex.utils.kv_cache_dtype import parse_kv_cache_dtype
-            if parse_kv_cache_dtype(getattr(self.config, "kv_cache_dtype", "bf16")).is_fp8:
-                decode_mode = "static"
-        except Exception:
-            decode_mode = "varlen"
+        # - Allow manual override via config.decode_mode if specified
+        decode_mode = self._get_decode_mode()
         set_d2f_attn_metadata(
             False,
             slot_mapping=slot_mapping_tensor,

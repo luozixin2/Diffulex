@@ -288,9 +288,9 @@ def load_model(model: nn.Module, config: Config):
                             
                         if "layernorm" in param_name:
                             try:
-                            param = model.get_parameter(param_name)
-                            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                            weight_loader(param, f.get_tensor(weight_name))
+                                param = model.get_parameter(param_name)
+                                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                                weight_loader(param, f.get_tensor(weight_name))
                             except (AttributeError, KeyError):
                                 # Try buffer fallback for non-parameter weights
                                 try:
@@ -300,12 +300,12 @@ def load_model(model: nn.Module, config: Config):
                                     pass
                         else:
                             try:
-                            param = model.get_parameter(param_name)
-                            weight_loader = partial(getattr(param, "weight_loader"), param, f.get_tensor(weight_name)) 
-                            if shard_id is None:
-                                weight_loader()
-                            else:
-                                weight_loader(shard_id)
+                                param = model.get_parameter(param_name)
+                                weight_loader = partial(getattr(param, "weight_loader"), param, f.get_tensor(weight_name)) 
+                                if shard_id is None:
+                                    weight_loader()
+                                else:
+                                    weight_loader(shard_id)
                             except (AttributeError, KeyError):
                                 # Parameter might not exist if offline quantized weights were loaded
                                 # Skip it silently
@@ -313,9 +313,9 @@ def load_model(model: nn.Module, config: Config):
                         break
                 else:
                     try:
-                    param = model.get_parameter(weight_name)
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    weight_loader(param, f.get_tensor(weight_name))
+                        param = model.get_parameter(weight_name)
+                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                        weight_loader(param, f.get_tensor(weight_name))
                     except (AttributeError, KeyError):
                         # Try buffer fallback for non-parameter weights
                         try:

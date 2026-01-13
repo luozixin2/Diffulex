@@ -762,10 +762,18 @@ def main():
     print(f"最大生成 token 数: {args.max_tokens}")
     print("=" * 90)
     
-    # 测试 prompts
+    # 测试 prompts (10个样例)
     test_prompts = [
         "The capital of France is",
         "Python is a programming language",
+        "The largest planet in our solar system is",
+        "Machine learning is a subset of",
+        "The speed of light is approximately",
+        "Artificial intelligence has applications in",
+        "The Great Wall of China was built",
+        "Quantum computing uses principles from",
+        "The human brain contains approximately",
+        "Climate change is caused by",
     ]
     
     # 加载 tokenizer
@@ -789,6 +797,7 @@ def main():
         'max_num_seqs': 4,
         'max_model_len': 1024,
         'decoding_strategy': 'd2f',
+        'decode_mode': 'varlen',  # 统一设置为 varlen 模式
     }
     
     # 运行所有选定的策略
