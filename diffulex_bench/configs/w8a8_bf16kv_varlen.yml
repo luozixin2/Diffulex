@@ -12,10 +12,10 @@ engine:
   tensor_parallel_size: 1
   data_parallel_size: 1
   
-  gpu_memory_utilization: 0.7
+  gpu_memory_utilization: 0.5
   max_model_len: 2048
-  max_num_batched_tokens: 4096
-  max_num_seqs: 128
+  max_num_batched_tokens: 2048
+  max_num_seqs: 64
   
   enforce_eager: true  # Required for varlen mode
   kv_cache_layout: "unified"
