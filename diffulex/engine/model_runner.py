@@ -36,7 +36,13 @@ class ModelRunnerBase(ABC):
         # Initialize model, sampler, and kv cache
         init_method = f"tcp://{config.master_addr}:{config.master_port}"
         dist.init_process_group("nccl", init_method, world_size=self.world_size, rank=rank, device_id=config.device_ids[rank])
-        device_id = (getattr(config, "device_start", 0) or 0) + rank + config.device_ids[rank]
+        # Choose CUDA device for this TP rank.
+        # config.device_ids is already a list of logical CUDA device indices (respecting CUDA_VISIBLE_DEVICES).
+        # Do NOT add rank again, otherwise rank 1 with device_ids=[0,1] becomes device 2.
+        if getattr(config, "device_ids", None):
+            device_id = config.device_ids[rank]
+        else:
+            device_id = (getattr(config, "device_start", 0) or 0) + rank
         assert 0 <= device_id < torch.cuda.device_count(), f"Invalid device_id {device_id}."
         torch.cuda.set_device(device_id)
         default_dtype = torch.get_default_dtype()

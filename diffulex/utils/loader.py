@@ -12,6 +12,151 @@ from diffulex.logger import get_logger
 
 logger = get_logger(__name__)
 
+def _read_quantize_config(model_dir: str) -> dict:
+    """Read vLLM-style quantization metadata if present.
+
+    We use this to detect checkpoint formats like `gptq_marlin` which reuse the same
+    tensor keys (qweight/qzeros/scales[/g_idx]) but have different semantics.
+    """
+    cfg_path = os.path.join(model_dir, "quantize_config.json")
+    if not os.path.exists(cfg_path):
+        return {}
+    try:
+        with open(cfg_path, "r") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _make_packed_qzeros_constant(
+    *,
+    num_groups: int,
+    out_features: int,
+    bits: int,
+    device: torch.device | str,
+) -> torch.Tensor:
+    """Create a GPTQ-style packed qzeros tensor filled with a constant.
+
+    For vLLM GPTQ v1 checkpoints, zeros are stored as (zeros - 1) and then bit-packed
+    along the output dimension (N). For symmetric quantization, zeros is typically
+    bias=2^(bits-1), thus stored constant becomes (2^(bits-1) - 1).
+
+    This is primarily used as a *shape-compatible dummy* when loading gptq_marlin
+    checkpoints where runtime zero-points are intentionally unused (qzeros may be empty).
+    """
+    if bits not in (2, 4, 8):
+        raise ValueError(f"Unsupported bits={bits} for packed qzeros (expected 2/4/8)")
+    pack_factor = 32 // bits
+    if out_features % pack_factor != 0:
+        raise ValueError(
+            f"out_features={out_features} not divisible by pack_factor={pack_factor} for bits={bits}"
+        )
+    out_packed = out_features // pack_factor
+
+    # Stored constant for GPTQ v1: bias - 1, where bias = 2^(bits-1).
+    z = (1 << (bits - 1)) - 1
+    packed_val = 0
+    for i in range(pack_factor):
+        packed_val |= (z & ((1 << bits) - 1)) << (bits * i)
+
+    return torch.full(
+        (int(num_groups), int(out_packed)),
+        int(packed_val),
+        dtype=torch.int32,
+        device=device,
+    )
+
+
+def _infer_module_device(module: nn.Module) -> torch.device:
+    w = getattr(module, "weight", None)
+    if isinstance(w, torch.Tensor):
+        return w.device
+    for p in module.parameters(recurse=False):
+        return p.device
+    for b in module.buffers(recurse=False):
+        return b.device
+    return torch.device("cpu")
+
+
+def _set_offline_gptq_marlin_weight(
+    module: nn.Module,
+    *,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    out_features: int,
+    in_features: int,
+    group_size: int,
+    bits: int,
+    g_idx: torch.Tensor | None,
+) -> None:
+    """Directly set GPTQ-Marlin-ready offline weights into a Diffulex Linear module.
+
+    This bypasses `set_offline_quantized_weight` because marlin-exported `scales`
+    use a different layout (e.g. (2*num_groups, out_features/2)) and would fail
+    the standard GPTQ shape validation.
+
+    We still populate minimal GPTQ metadata/buffers so Diffulex forward chooses
+    the offline path, and then `LinearBase._maybe_prepare_offline_gptq_marlin`
+    will only allocate workspace / g_idx metadata (and not repack/permute again).
+    """
+    module_device = _infer_module_device(module)
+    if qweight.device != module_device:
+        qweight = qweight.to(device=module_device)
+    if scales.device != module_device:
+        scales = scales.to(device=module_device)
+    if g_idx is not None and g_idx.device != module_device:
+        g_idx = g_idx.to(device=module_device)
+
+    pack_factor = 32 // int(bits)
+    group_size_norm = in_features if group_size == -1 else group_size
+    if group_size_norm <= 0 or in_features % group_size_norm != 0:
+        raise ValueError(f"Invalid group_size={group_size} for in_features={in_features}")
+    num_groups = in_features // group_size_norm
+
+    # Minimal qzeros to satisfy offline presence checks. (Marlin GPTQ symmetric doesn't use runtime zp.)
+    qzeros = _make_packed_qzeros_constant(
+        num_groups=num_groups,
+        out_features=out_features,
+        bits=int(bits),
+        device=module_device,
+    )
+
+    # Populate GPTQ buffers (note: scales here are marlin layout; gptq kernels should not be used).
+    module.gptq_qweight = qweight
+    module.gptq_qzeros = qzeros
+    module.gptq_scales = scales.to(dtype=torch.float16)
+    if g_idx is None:
+        module.gptq_g_idx = torch.empty(0, dtype=torch.int32, device=module_device)
+    else:
+        if getattr(g_idx, "numel", lambda: 1)() == 0:
+            module.gptq_g_idx = torch.empty(0, dtype=torch.int32, device=module_device)
+        else:
+            module.gptq_g_idx = g_idx.to(dtype=torch.int32)
+
+    # Also mark as marlin-ready so LinearBase won't repack/permute again.
+    module.gptq_marlin_qweight = qweight
+    module.gptq_marlin_scales = module.gptq_scales
+
+    module._offline_quant_format = torch.tensor(1, dtype=torch.int8, device=module_device)
+    module._offline_quant_bits = torch.tensor(int(bits), dtype=torch.int32, device=module_device)
+    module._offline_quant_group_size = torch.tensor(group_size, dtype=torch.int32, device=module_device)
+    module._offline_quant_out_features = torch.tensor(out_features, dtype=torch.int32, device=module_device)
+    module._offline_quant_in_features = torch.tensor(in_features, dtype=torch.int32, device=module_device)
+    module._gptq_is_shuffled = torch.tensor(False, dtype=torch.bool, device=module_device)
+
+    # Reset marlin-prep caches (workspace/zp/g_idx meta will be created on first forward).
+    module._gptq_marlin_is_prepared = torch.tensor(False, dtype=torch.bool, device=module_device)
+    module.gptq_marlin_zp = torch.empty(0, dtype=torch.int32, device=module_device)
+    module.gptq_marlin_g_idx = torch.empty(0, dtype=torch.int32, device=module_device)
+    module.gptq_marlin_g_idx_sort_indices = torch.empty(0, dtype=torch.int32, device=module_device)
+    module.gptq_marlin_workspace = torch.empty(0, dtype=torch.int32, device=module_device)
+
+    # Drop bf16 weight Parameter if present (to free memory and avoid accidental fallback).
+    if hasattr(module, "_parameters") and "weight" in module._parameters:
+        module._parameters.pop("weight", None)
+        setattr(module, "weight", None)
+
 
 def load_lora_config(lora_path: str) -> dict:
     """Load LoRA configuration from adapter_config.json."""
@@ -61,9 +206,22 @@ def _load_gptq_awq_weights(model: nn.Module, config: Config):
     # Check if model is configured for GPTQ or AWQ
     weight_attn_dtype = getattr(config, "linear_attn_weight_dtype", "bf16") or "bf16"
     weight_mlp_dtype = getattr(config, "linear_mlp_weight_dtype", "bf16") or "bf16"
+    quantize_cfg = _read_quantize_config(getattr(config, "model", ""))
+    checkpoint_format = (quantize_cfg.get("checkpoint_format") or "").strip().lower()
+    ckpt_bits = int(quantize_cfg.get("bits", 0) or 0)
+    ckpt_group_size = int(quantize_cfg.get("group_size", 0) or 0)
     
-    use_gptq = weight_attn_dtype.lower() == "gptq" or weight_mlp_dtype.lower() == "gptq"
-    use_awq = weight_attn_dtype.lower() == "awq" or weight_mlp_dtype.lower() == "awq"
+    # NOTE: marlin variants reuse the same offline GPTQ/AWQ checkpoint keys
+    # (qweight/qzeros/scales[/g_idx]) and are repacked lazily in `LinearBase`
+    # on first forward.
+    gptq_dtypes = {"gptq", "gptq_marlin"}
+    awq_dtypes = {"awq", "awq_marlin"}
+    use_gptq = (weight_attn_dtype or "").lower() in gptq_dtypes or (weight_mlp_dtype or "").lower() in gptq_dtypes
+    use_awq = (weight_attn_dtype or "").lower() in awq_dtypes or (weight_mlp_dtype or "").lower() in awq_dtypes
+    want_gptq_marlin = (weight_attn_dtype or "").lower() == "gptq_marlin" or (weight_mlp_dtype or "").lower() == "gptq_marlin"
+    want_awq_marlin = (weight_attn_dtype or "").lower() == "awq_marlin" or (weight_mlp_dtype or "").lower() == "awq_marlin"
+    is_gptq_marlin_ckpt = checkpoint_format == "gptq_marlin"
+    is_awq_marlin_ckpt = checkpoint_format == "awq_marlin"
     
     if not (use_gptq or use_awq):
         return loaded_gptq, loaded_awq, skipped
@@ -145,13 +303,14 @@ def _load_gptq_awq_weights(model: nn.Module, config: Config):
             
             # Determine format: check if g_idx exists (GPTQ) or not (AWQ)
             has_g_idx = "g_idx" in key_dict
-            if has_g_idx and use_gptq:
+            is_gptq_keyset = has_g_idx or is_gptq_marlin_ckpt
+            if is_gptq_keyset and use_gptq:
                 format = "gptq"
-            elif not has_g_idx and use_awq:
+            elif (not is_gptq_keyset) and use_awq:
                 format = "awq"
             else:
                 # Prefer GPTQ if both are enabled and g_idx exists
-                format = "gptq" if (use_gptq and has_g_idx) else ("awq" if use_awq else None)
+                format = "gptq" if (use_gptq and is_gptq_keyset) else ("awq" if use_awq else None)
             
             if format is None:
                 skipped += 1
@@ -183,47 +342,267 @@ def _load_gptq_awq_weights(model: nn.Module, config: Config):
                 skipped += 1
                 continue
             
-            # Infer dimensions from tensor shapes
-            out_features, packed_in = qweight.shape
-            in_features = packed_in * 2  # Packed int4: 2 values per byte (max estimate)
-            # Refine in_features from scales shape if available
-            if scales.shape[1:] != ():
-                # scales is [num_groups, in_features] or [num_groups]
-                if len(scales.shape) == 2:
-                    in_features = scales.shape[1]
-            
-            # Default group_size for GPTQ/AWQ is 128
+            # Infer dimensions from tensor shapes (vLLM standard format) WITHOUT
+            # assuming bits=4. This enables GPTQ W2/W4/W8 checkpoints.
+            if format == "gptq":
+                if is_gptq_marlin_ckpt:
+                    # gptq_marlin export uses Marlin repacked qweight/scales layouts.
+                    # Empirically (vLLM marlin): qweight is packed on K in tiles of 16,
+                    # so qweight.shape[0] == in_features / 16; and scales carries original N.
+                    out_features = int(scales.shape[1]) if scales.ndim == 2 else int(qweight.shape[1])
+                    in_features = int(qweight.shape[0]) * 16
+                    if ckpt_bits not in (4, 8):
+                        print(
+                            f"Warning: gptq_marlin requires bits=4/8, got bits={ckpt_bits} for {module_name}. Skipping."
+                        )
+                        skipped += 1
+                        continue
+                    # Keep pack_factor for dummy qzeros creation later.
+                    pack_factor = 32 // int(ckpt_bits)
+                else:
+                    # Standard GPTQ: qweight [K/pack, N]
+                    out_features = int(qweight.shape[1])
+                    # qzeros: [K/group, N/pack] (may be empty for some checkpoints)
+                    if getattr(qzeros, "numel", lambda: 1)() == 0:
+                        if ckpt_bits not in (2, 4, 8):
+                            print(
+                                f"Warning: qzeros is empty and cannot infer bits for {module_name}. "
+                                f"Please ensure quantize_config.json contains bits (2/4/8). Skipping."
+                            )
+                            skipped += 1
+                            continue
+                        pack_factor = 32 // int(ckpt_bits)
+                    else:
+                        if int(qzeros.shape[1]) <= 0 or out_features % int(qzeros.shape[1]) != 0:
+                            print(
+                                f"Warning: Cannot infer GPTQ pack_factor from qzeros for {module_name}: "
+                                f"qzeros.shape={tuple(qzeros.shape)}, qweight.shape={tuple(qweight.shape)}. Skipping."
+                            )
+                            skipped += 1
+                            continue
+                        pack_factor = out_features // int(qzeros.shape[1])  # 32 / bits
+                    in_features = int(qweight.shape[0]) * pack_factor
+            else:
+                # awq: qweight: [K, N/pack], scales: [K/group, N]
+                out_features = int(scales.shape[1]) if scales.ndim == 2 else int(qweight.shape[1])
+                if int(qweight.shape[1]) <= 0 or out_features % int(qweight.shape[1]) != 0:
+                    print(
+                        f"Warning: Cannot infer AWQ pack_factor from scales/qweight for {module_name}: "
+                        f"scales.shape={tuple(scales.shape)}, qweight.shape={tuple(qweight.shape)}. Skipping."
+                    )
+                    skipped += 1
+                    continue
+                pack_factor = out_features // int(qweight.shape[1])  # 32 / bits (expected 8 for AWQ 4-bit)
+                in_features = int(qweight.shape[0])
+
+            # Infer group_size from qzeros/scales.
+            # qzeros/scales are groupwise on K (in_features).
             group_size = 128
-            # Infer group_size from scales/qzeros shape
-            num_groups = qzeros.shape[0]
-            if num_groups > 0:
-                estimated_group_size = (out_features + num_groups - 1) // num_groups
-                if estimated_group_size > 0:
-                    group_size = estimated_group_size
+            if ckpt_group_size not in (0, None):
+                # quantize_config.json stores actual group_size (may be -1)
+                group_size = int(ckpt_group_size)
+            else:
+                if is_gptq_marlin_ckpt and len(scales.shape) == 2 and int(scales.shape[0]) > 0:
+                    # marlin scales often use first dim = 2 * num_groups
+                    num_groups = int(scales.shape[0]) // 2
+                    if num_groups > 0 and in_features % num_groups == 0:
+                        group_size = in_features // num_groups
+                else:
+                    num_groups = int(qzeros.shape[0]) if getattr(qzeros, "numel", lambda: 1)() > 0 else 0
+                    if num_groups > 0 and in_features % num_groups == 0:
+                        group_size = in_features // num_groups
+                    elif len(scales.shape) == 2 and int(scales.shape[0]) > 0 and in_features % int(scales.shape[0]) == 0:
+                        group_size = in_features // int(scales.shape[0])
+
+            # For gptq_marlin checkpoints qzeros may be empty; create a shape-compatible dummy
+            # packed qzeros so LinearBase considers offline weights present.
+            if (
+                format == "gptq"
+                and getattr(qzeros, "numel", lambda: 1)() == 0
+                and (want_gptq_marlin or is_gptq_marlin_ckpt)
+                and ckpt_bits in (2, 4, 8)
+            ):
+                group_size_norm = in_features if group_size == -1 else group_size
+                if group_size_norm <= 0 or (in_features % group_size_norm) != 0:
+                    print(
+                        f"Warning: Invalid group_size={group_size} for {module_name} with in_features={in_features}. "
+                        "Skipping."
+                    )
+                    skipped += 1
+                    continue
+                num_groups = in_features // group_size_norm
+                try:
+                    qzeros = _make_packed_qzeros_constant(
+                        num_groups=num_groups,
+                        out_features=out_features,
+                        bits=int(ckpt_bits),
+                        device=qweight.device,
+                    )
+                except Exception as e:
+                    print(f"Warning: Failed to create dummy qzeros for {module_name}: {e}. Skipping.")
+                    skipped += 1
+                    continue
             
-            # Handle tensor parallel: if tp_size > 1, we need to handle sharding
-            # For MVP, only support TP=1 (tensor_parallel_size=1)
-            tp_size = getattr(module, "tp_size", 1)
+            # Handle tensor parallel sharding (TP>1).
+            # ColumnParallelLinear: tp_dim=0 (shard N/out_features)
+            # RowParallelLinear   : tp_dim=1 (shard K/in_features)
+            tp_size = int(getattr(module, "tp_size", 1) or 1)
+            tp_rank = int(getattr(module, "tp_rank", 0) or 0)
+            tp_dim = getattr(module, "tp_dim", None)
             if tp_size > 1:
-                print(
-                    f"Warning: Tensor parallel (TP={tp_size}) is not fully supported for offline quantized weights. "
-                    f"Skipping {module_name}. Please provide a TP=1 checkpoint or implement TP sharding logic."
-                )
-                skipped += 1
-                continue
+                if tp_dim not in (0, 1):
+                    print(
+                        f"Warning: Unsupported tp_dim={tp_dim} for offline quantized weights. "
+                        f"Skipping {module_name}."
+                    )
+                    skipped += 1
+                    continue
+
+                # Shard along output features (N) for column-parallel modules.
+                if tp_dim == 0:
+                    if out_features % tp_size != 0:
+                        print(
+                            f"Warning: out_features={out_features} not divisible by TP={tp_size} for {module_name}. "
+                            "Skipping offline quant weights for this module."
+                        )
+                        skipped += 1
+                        continue
+                    out_per = out_features // tp_size
+                    out_start = tp_rank * out_per
+                    out_end = out_start + out_per
+                    if out_per % pack_factor != 0:
+                        print(
+                            f"Warning: out_features_per_partition={out_per} not divisible by pack_factor={pack_factor} "
+                            f"for {module_name}. Skipping."
+                        )
+                        skipped += 1
+                        continue
+                    out_packed_per = out_per // pack_factor
+                    out_packed_start = out_start // pack_factor
+                    out_packed_end = out_packed_start + out_packed_per
+
+                    if format == "gptq":
+                        if is_gptq_marlin_ckpt:
+                            # Marlin qweight packs N by a factor (bits/2): N_packed = N * (bits/2)
+                            n_factor = int(ckpt_bits) // 2
+                            if n_factor <= 0:
+                                print(f"Warning: invalid gptq_marlin n_factor for bits={ckpt_bits} ({module_name}). Skipping.")
+                                skipped += 1
+                                continue
+                            qweight = qweight[:, (out_start * n_factor):(out_end * n_factor)]
+                            # scales keep original N
+                            scales = scales[:, out_start:out_end]
+                            # qzeros stays dummy/empty; g_idx stays on K.
+                            out_features = out_per
+                        else:
+                            # qweight: [K/pack, N]
+                            qweight = qweight[:, out_start:out_end]
+                            # qzeros: [K/group, N/pack]
+                            qzeros = qzeros[:, out_packed_start:out_packed_end]
+                            # scales: [K/group, N]
+                            scales = scales[:, out_start:out_end]
+                            out_features = out_per
+                    else:
+                        # awq qweight: [K, N/pack]
+                        qweight = qweight[:, out_packed_start:out_packed_end]
+                        qzeros = qzeros[:, out_packed_start:out_packed_end]
+                        scales = scales[:, out_start:out_end]
+                        out_features = out_per
+
+                # Shard along input features (K) for row-parallel modules.
+                elif tp_dim == 1:
+                    if in_features % tp_size != 0:
+                        print(
+                            f"Warning: in_features={in_features} not divisible by TP={tp_size} for {module_name}. "
+                            "Skipping offline quant weights for this module."
+                        )
+                        skipped += 1
+                        continue
+                    in_per = in_features // tp_size
+                    in_start = tp_rank * in_per
+                    in_end = in_start + in_per
+                    if group_size <= 0 or (in_per % group_size) != 0 or (in_start % group_size) != 0:
+                        print(
+                            f"Warning: group_size={group_size} incompatible with TP sharding for {module_name} "
+                            f"(in_per={in_per}, in_start={in_start}). Skipping."
+                        )
+                        skipped += 1
+                        continue
+                    g_start = in_start // group_size
+                    g_end = in_end // group_size
+
+                    if format == "gptq":
+                        if is_gptq_marlin_ckpt:
+                            # Marlin qweight packs K in tiles of 16: K_packed = K / 16
+                            if in_start % 16 != 0:
+                                print(
+                                    f"Warning: gptq_marlin requires in_start divisible by 16, got in_start={in_start} "
+                                    f"for {module_name}. Skipping."
+                                )
+                                skipped += 1
+                                continue
+                            q_start = in_start // 16
+                            q_end = in_end // 16
+                            qweight = qweight[q_start:q_end, :]
+                            # scales first dim is typically 2*num_groups
+                            scales = scales[(2 * g_start):(2 * g_end), :]
+                            if g_idx is not None and getattr(g_idx, "numel", lambda: 1)() > 0:
+                                g_idx = g_idx[in_start:in_end]
+                            in_features = in_per
+                        else:
+                            # qweight: [K/pack, N] (packed on K)
+                            if in_start % pack_factor != 0:
+                                print(
+                                    f"Warning: in_start={in_start} not divisible by pack_factor={pack_factor} "
+                                    f"for {module_name}. Skipping."
+                                )
+                                skipped += 1
+                                continue
+                            q_start = in_start // pack_factor
+                            q_end = in_end // pack_factor
+                            qweight = qweight[q_start:q_end, :]
+                            qzeros = qzeros[g_start:g_end, :]
+                            scales = scales[g_start:g_end, :]
+                            if g_idx is not None and getattr(g_idx, "numel", lambda: 1)() > 0:
+                                g_idx = g_idx[in_start:in_end]
+                            in_features = in_per
+                    else:
+                        # awq qweight: [K, N/pack]
+                        qweight = qweight[in_start:in_end, :]
+                        qzeros = qzeros[g_start:g_end, :]
+                        scales = scales[g_start:g_end, :]
+                        in_features = in_per
             
+            # Treat empty g_idx as "not provided" for GPTQ (desc_act=False checkpoints often store empty).
+            if g_idx is not None and getattr(g_idx, "numel", lambda: 1)() == 0:
+                g_idx = None
+
             # Set offline quantized weight
             try:
-                module.set_offline_quantized_weight(
-                    format=format,
-                    qweight=qweight,
-                    qzeros=qzeros,
-                    scales=scales,
-                    out_features=out_features,
-                    in_features=in_features,
-                    group_size=group_size,
-                    g_idx=g_idx,
-                )
+                if format == "gptq" and is_gptq_marlin_ckpt:
+                    if ckpt_bits not in (4, 8):
+                        raise ValueError(f"gptq_marlin checkpoint requires bits=4/8, got bits={ckpt_bits}")
+                    _set_offline_gptq_marlin_weight(
+                        module,
+                        qweight=qweight,
+                        scales=scales,
+                        out_features=out_features,
+                        in_features=in_features,
+                        group_size=group_size,
+                        bits=int(ckpt_bits),
+                        g_idx=g_idx,
+                    )
+                else:
+                    module.set_offline_quantized_weight(
+                        format=format,
+                        qweight=qweight,
+                        qzeros=qzeros,
+                        scales=scales,
+                        out_features=out_features,
+                        in_features=in_features,
+                        group_size=group_size,
+                        g_idx=g_idx,
+                    )
                 if format == "gptq":
                     loaded_gptq += 1
                 else:
