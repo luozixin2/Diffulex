@@ -32,7 +32,17 @@ def _build_linear_awq_w4a16() -> LinearQuantizationStrategy:
 class LinearAWQW4A16Strategy(LinearQuantizationStrategy):
     def __init__(self) -> None:
         super().__init__()
-        self._ops_available: bool = bool(ops is not None and hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "awq_gemm"))
+        # Resolve the concrete kernel entry point once (avoid per-call dispatch).
+        awq_gemm = None
+        try:
+            if hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "awq_gemm"):
+                awq_gemm = torch.ops._C.awq_gemm
+        except Exception:
+            awq_gemm = None
+        if awq_gemm is None and ops is not None and hasattr(ops, "awq_gemm"):
+            awq_gemm = ops.awq_gemm
+        self._awq_gemm = awq_gemm
+        self._ops_available: bool = bool(self._awq_gemm is not None)
 
     @property
     def name(self) -> str:
@@ -114,10 +124,7 @@ class LinearAWQW4A16Strategy(LinearQuantizationStrategy):
         # Always use awq_gemm to avoid large temporary dequantized weight allocations.
         # vLLM API: awq_gemm(input, qweight, qzeros, scales, split_k_iters)
         split_k_iters = 1
-        if reshaped_x.is_contiguous() and qweight.is_contiguous() and qzeros.is_contiguous() and scales.is_contiguous():
-            out = torch.ops._C.awq_gemm(reshaped_x, qweight, qzeros, scales, split_k_iters)
-        else:
-            out = ops.awq_gemm(reshaped_x, qweight, qzeros, scales, split_k_iters)
+        out = self._awq_gemm(reshaped_x, qweight, qzeros, scales, split_k_iters)  # type: ignore[misc]
 
         if bias is not None:
             out.add_(bias.to(dtype=out.dtype))

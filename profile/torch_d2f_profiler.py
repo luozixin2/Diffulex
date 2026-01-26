@@ -106,6 +106,13 @@ def main() -> None:
     parser.add_argument("--linear-attn-act-dtype", type=str, default="bf16")
     parser.add_argument("--linear-mlp-act-dtype", type=str, default="bf16")
 
+    # CUDA Graph
+    parser.add_argument(
+        "--use-cudagraph",
+        action="store_true",
+        help="启用 CUDA Graph（仅 decode_mode=static 且 shape 稳定时有意义）；默认关闭以避免 capture 成本影响分析。",
+    )
+
     # Engine settings (force single-process profiling by default)
     parser.add_argument("--tensor-parallel-size", type=int, default=1, help="建议保持 1，否则会 spawn 子进程导致采集不到 CUDA")
     parser.add_argument("--data-parallel-size", type=int, default=1)
@@ -171,7 +178,7 @@ def main() -> None:
         use_lora=use_lora,
         model_name="dream",
         decoding_strategy="d2f",
-        enforce_eager=True,
+        enforce_eager=not args.use_cudagraph,
         tensor_parallel_size=args.tensor_parallel_size,
         data_parallel_size=args.data_parallel_size,
         master_addr=args.master_addr,

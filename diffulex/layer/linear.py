@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -11,6 +14,500 @@ from diffulex.utils.quantization.context import get_linear_strategy
 def divide(numerator, denominator):
     assert numerator % denominator == 0
     return numerator // denominator
+
+
+@dataclass
+class _ForwardPlanSig:
+    """Signature for validating cached forward plans.
+
+    We intentionally keep it small and Python-only so it is CUDA-graph friendly
+    (no `.item()` and no device sync).
+    """
+
+    device_type: str
+    device_index: int
+    x_dtype: torch.dtype
+    x_shape: tuple[int, ...]
+    has_bias: bool
+    mode: str  # "bf16" | "quant" | "offline"
+    strategy_name: str
+
+
+class _ForwardPlanBase:
+    sig: _ForwardPlanSig
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:  # pragma: no cover
+        raise NotImplementedError
+
+
+class _BF16Plan(_ForwardPlanBase):
+    def __init__(
+        self,
+        *,
+        sig: _ForwardPlanSig,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+    ) -> None:
+        self.sig = sig
+        self._weight = weight
+        self._bias = bias
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, self._weight, self._bias)
+
+
+class _QuantInt8W8A16Plan(_ForwardPlanBase):
+    def __init__(
+        self,
+        *,
+        sig: _ForwardPlanSig,
+        strategy,
+        quant_kind: str,
+        qweight: torch.Tensor,
+        scales_1xn: torch.Tensor,
+        out_features: int,
+        bias: Optional[torch.Tensor],
+    ) -> None:
+        self.sig = sig
+        self._strategy = strategy
+        self._quant_kind = (quant_kind or "other").strip().lower() or "other"
+        self._qweight = qweight
+        self._scales_1xn = scales_1xn
+        self._out_features = int(out_features)
+        self._bias = bias
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        return self._strategy.linear_forward(
+            x,
+            self._qweight,
+            self._bias,
+            quant_kind=self._quant_kind,
+            quant_scales=self._scales_1xn,
+            out_features=self._out_features,
+        )
+
+
+class _QuantInt8W8A8Plan(_ForwardPlanBase):
+    def __init__(
+        self,
+        *,
+        sig: _ForwardPlanSig,
+        strategy,
+        quant_kind: str,
+        qweight: torch.Tensor,
+        scales_1xn: torch.Tensor,
+        out_features: int,
+        bias: Optional[torch.Tensor],
+    ) -> None:
+        self.sig = sig
+        self._strategy = strategy
+        self._quant_kind = (quant_kind or "other").strip().lower() or "other"
+        self._qweight = qweight
+        self._scales_1xn = scales_1xn
+        self._out_features = int(out_features)
+        self._bias = bias
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        return self._strategy.linear_forward(
+            x,
+            self._qweight,
+            self._bias,
+            quant_kind=self._quant_kind,
+            quant_scales=self._scales_1xn,
+            out_features=self._out_features,
+        )
+
+
+class _QuantGenericPlan(_ForwardPlanBase):
+    def __init__(
+        self,
+        *,
+        sig: _ForwardPlanSig,
+        strategy,
+        quant_kind: str,
+        weight: torch.Tensor,
+        scales: torch.Tensor,
+        bias: Optional[torch.Tensor],
+    ) -> None:
+        self.sig = sig
+        self._strategy = strategy
+        self._quant_kind = (quant_kind or "other").strip().lower() or "other"
+        self._weight = weight
+        self._scales = scales
+        self._bias = bias
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        return self._strategy.linear_forward(
+            x,
+            self._weight,
+            self._bias,
+            quant_kind=self._quant_kind,
+            quant_scales=self._scales,
+        )
+
+
+class _OfflineGPTQPlan(_ForwardPlanBase):
+    def __init__(
+        self,
+        *,
+        sig: _ForwardPlanSig,
+        strategy,
+        quant_kind: str,
+        qweight: torch.Tensor,
+        qzeros: torch.Tensor,
+        scales: torch.Tensor,
+        g_idx: torch.Tensor,
+        weight_bits: int,
+        out_features: int,
+        in_features: int,
+        group_size: int,
+        bias: Optional[torch.Tensor],
+    ) -> None:
+        self.sig = sig
+        self._strategy = strategy
+        self._quant_kind = (quant_kind or "other").strip().lower() or "other"
+        self._qweight = qweight
+        self._qzeros = qzeros
+        self._scales = scales
+        self._g_idx = g_idx
+        self._weight_bits = int(weight_bits)
+        self._out_features = int(out_features)
+        self._in_features = int(in_features)
+        self._group_size = int(group_size)
+        self._bias = bias
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        return self._strategy.linear_forward(
+            x,
+            None,
+            self._bias,
+            quant_kind=self._quant_kind,
+            gptq_qweight=self._qweight,
+            gptq_qzeros=self._qzeros,
+            gptq_scales=self._scales,
+            gptq_g_idx=self._g_idx,
+            weight_bits=self._weight_bits,
+            use_v2_format=False,
+            out_features=self._out_features,
+            in_features=self._in_features,
+            group_size=self._group_size,
+        )
+
+
+class _OfflineAWQPlan(_ForwardPlanBase):
+    def __init__(
+        self,
+        *,
+        sig: _ForwardPlanSig,
+        strategy,
+        quant_kind: str,
+        qweight: torch.Tensor,
+        qzeros: torch.Tensor,
+        scales: torch.Tensor,
+        pack_factor: int,
+        out_features: int,
+        in_features: int,
+        group_size: int,
+        bias: Optional[torch.Tensor],
+    ) -> None:
+        self.sig = sig
+        self._strategy = strategy
+        self._quant_kind = (quant_kind or "other").strip().lower() or "other"
+        self._qweight = qweight
+        self._qzeros = qzeros
+        self._scales = scales
+        self._pack_factor = int(pack_factor)
+        self._out_features = int(out_features)
+        self._in_features = int(in_features)
+        self._group_size = int(group_size)
+        self._bias = bias
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        return self._strategy.linear_forward(
+            x,
+            None,
+            self._bias,
+            quant_kind=self._quant_kind,
+            awq_qweight=self._qweight,
+            awq_qzeros=self._qzeros,
+            awq_scales=self._scales,
+            pack_factor=self._pack_factor,
+            out_features=self._out_features,
+            in_features=self._in_features,
+            group_size=self._group_size,
+        )
+
+
+class _OfflineGPTQMarlinPlan(_ForwardPlanBase):
+    def __init__(
+        self,
+        *,
+        sig: _ForwardPlanSig,
+        strategy,
+        quant_kind: str,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        zp: torch.Tensor,
+        g_idx: torch.Tensor,
+        g_idx_sort_indices: torch.Tensor,
+        workspace: torch.Tensor,
+        in_features: int,
+        out_features: int,
+        group_size: int,
+        weight_bits: int,
+        tp_dim: Optional[int],
+        bias: Optional[torch.Tensor],
+    ) -> None:
+        self.sig = sig
+        self._strategy = strategy
+        self._quant_kind = (quant_kind or "other").strip().lower() or "other"
+        self._qweight = qweight
+        self._scales = scales
+        self._zp = zp
+        self._g_idx = g_idx
+        self._g_idx_sort_indices = g_idx_sort_indices
+        self._workspace = workspace
+        self._in_features = int(in_features)
+        self._out_features = int(out_features)
+        self._group_size = int(group_size)
+        self._weight_bits = int(weight_bits)
+        self._tp_dim = tp_dim
+        self._bias = bias
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        return self._strategy.linear_forward(
+            x,
+            None,
+            self._bias,
+            quant_kind=self._quant_kind,
+            qweight=self._qweight,
+            scales=self._scales,
+            zp=self._zp,
+            g_idx=self._g_idx,
+            g_idx_sort_indices=self._g_idx_sort_indices,
+            workspace=self._workspace,
+            in_features=self._in_features,
+            out_features=self._out_features,
+            group_size=self._group_size,
+            weight_bits=self._weight_bits,
+            tp_dim=self._tp_dim,
+        )
+
+
+class _OfflineAWQMarlinPlan(_ForwardPlanBase):
+    def __init__(
+        self,
+        *,
+        sig: _ForwardPlanSig,
+        strategy,
+        quant_kind: str,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        zp: torch.Tensor,
+        workspace: torch.Tensor,
+        in_features: int,
+        out_features: int,
+        group_size: int,
+        tp_dim: Optional[int],
+        bias: Optional[torch.Tensor],
+    ) -> None:
+        self.sig = sig
+        self._strategy = strategy
+        self._quant_kind = (quant_kind or "other").strip().lower() or "other"
+        self._qweight = qweight
+        self._scales = scales
+        self._zp = zp
+        self._workspace = workspace
+        self._in_features = int(in_features)
+        self._out_features = int(out_features)
+        self._group_size = int(group_size)
+        self._tp_dim = tp_dim
+        self._bias = bias
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        return self._strategy.linear_forward(
+            x,
+            None,
+            self._bias,
+            quant_kind=self._quant_kind,
+            qweight=self._qweight,
+            scales=self._scales,
+            zp=self._zp,
+            workspace=self._workspace,
+            in_features=self._in_features,
+            out_features=self._out_features,
+            group_size=self._group_size,
+            tp_dim=self._tp_dim,
+        )
+
+
+class _DirectGPTQGemmPlan(_ForwardPlanBase):
+    """Direct GPTQ GEMM plan (bypass Python strategy glue).
+
+    This calls `torch.ops._C.gptq_gemm` directly with pre-resolved static args.
+    """
+
+    def __init__(
+        self,
+        *,
+        sig: _ForwardPlanSig,
+        qweight: torch.Tensor,
+        qzeros: torch.Tensor,
+        scales: torch.Tensor,
+        g_idx: torch.Tensor,
+        weight_bits: int,
+        out_features: int,
+        bias: Optional[torch.Tensor],
+        use_exllama: bool = True,
+        use_v2_format: bool = False,
+        cast_back_to_x_dtype: bool = True,
+    ) -> None:
+        self.sig = sig
+        self._qweight = qweight
+        self._qzeros = qzeros
+        self._scales = scales
+        self._g_idx = g_idx
+        self._weight_bits = int(weight_bits)
+        self._out_features = int(out_features)
+        self._bias = bias
+        self._use_exllama = bool(use_exllama)
+        self._use_v2_format = bool(use_v2_format)
+        self._cast_back = bool(cast_back_to_x_dtype)
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        # vLLM GPTQ kernels expect FP16 activations.
+        x_in = x if x.dtype == torch.float16 else x.to(dtype=torch.float16)
+        x2 = x_in.reshape(-1, x_in.shape[-1]) if x_in.dim() != 2 else x_in
+        if not x2.is_contiguous():
+            x2 = x2.contiguous()
+
+        out = torch.ops._C.gptq_gemm(
+            x2,
+            self._qweight,
+            self._qzeros,
+            self._scales,
+            self._g_idx,
+            self._use_exllama,
+            self._use_v2_format,
+            self._weight_bits,
+        )
+        if self._bias is not None:
+            out.add_(self._bias.to(dtype=out.dtype))
+        out = out.reshape(x.shape[:-1] + (self._out_features,))
+        if self._cast_back and out.dtype != x.dtype:
+            return out.to(dtype=x.dtype)
+        return out
+
+
+class _DirectAWQGemmPlan(_ForwardPlanBase):
+    """Direct AWQ GEMM plan (bypass Python strategy glue)."""
+
+    def __init__(
+        self,
+        *,
+        sig: _ForwardPlanSig,
+        awq_gemm,
+        qweight: torch.Tensor,
+        qzeros: torch.Tensor,
+        scales: torch.Tensor,
+        out_features: int,
+        bias: Optional[torch.Tensor],
+        split_k_iters: int = 1,
+        cast_back_to_x_dtype: bool = True,
+    ) -> None:
+        self.sig = sig
+        self._awq_gemm = awq_gemm
+        self._qweight = qweight
+        self._qzeros = qzeros
+        self._scales = scales
+        self._out_features = int(out_features)
+        self._bias = bias
+        self._split_k_iters = int(split_k_iters)
+        self._cast_back = bool(cast_back_to_x_dtype)
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        # vLLM AWQ kernels expect FP16 activations.
+        x_in = x if x.dtype == torch.float16 else x.to(dtype=torch.float16)
+        reshaped_x = x_in.reshape(-1, x_in.shape[-1])
+        if not reshaped_x.is_contiguous():
+            reshaped_x = reshaped_x.contiguous()
+
+        out = self._awq_gemm(reshaped_x, self._qweight, self._qzeros, self._scales, self._split_k_iters)
+        if self._bias is not None:
+            out.add_(self._bias.to(dtype=out.dtype))
+        out = out.reshape(x.shape[:-1] + (self._out_features,))
+        if self._cast_back and out.dtype != x.dtype:
+            return out.to(dtype=x.dtype)
+        return out
+
+
+class _DirectMarlinGemmPlan(_ForwardPlanBase):
+    """Direct Marlin GEMM plan (bypass Python strategy glue).
+
+    This calls `torch.ops._C.gptq_marlin_gemm` directly with pre-resolved static args.
+    """
+
+    def __init__(
+        self,
+        *,
+        sig: _ForwardPlanSig,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        zp: torch.Tensor,
+        g_idx: torch.Tensor,
+        g_idx_sort_indices: torch.Tensor,
+        workspace: torch.Tensor,
+        wtype_id: int,
+        n: int,
+        is_k_full: bool,
+        use_atomic_add: bool,
+        marlin_bias: Optional[torch.Tensor],
+        cast_back_to_x_dtype: bool = True,
+    ) -> None:
+        self.sig = sig
+        self._qweight = qweight
+        self._scales = scales
+        self._zp = zp
+        self._g_idx = g_idx
+        self._g_idx_sort_indices = g_idx_sort_indices
+        self._workspace = workspace
+        self._wtype_id = int(wtype_id)
+        self._n = int(n)
+        self._is_k_full = bool(is_k_full)
+        self._use_atomic_add = bool(use_atomic_add)
+        self._bias = marlin_bias
+        self._cast_back = bool(cast_back_to_x_dtype)
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        reshaped_x = x.reshape(-1, x.shape[-1])
+        out_shape = x.shape[:-1] + (int(self._n),)
+        m = int(reshaped_x.shape[0])
+        k = int(reshaped_x.shape[1])
+        out = torch.ops._C.gptq_marlin_gemm(
+            reshaped_x,
+            None,
+            self._qweight,
+            self._bias,
+            self._scales,
+            None,
+            None,
+            self._zp,
+            self._g_idx,
+            self._g_idx_sort_indices,
+            self._workspace,
+            self._wtype_id,
+            m,
+            int(self._n),
+            k,
+            self._is_k_full,
+            self._use_atomic_add,
+            True,  # use_fp32_reduce
+            False,  # is_zp_float
+        )
+        out = out.reshape(out_shape)
+        if self._cast_back and out.dtype != x.dtype:
+            return out.to(dtype=x.dtype)
+        return out
 
 
 class LoRAMixin:
@@ -146,6 +643,404 @@ class LinearBase(nn.Module):
         self._gptq_is_shuffled_py: bool = False
         self._gptq_marlin_is_prepared_py: bool = False
         self._awq_marlin_is_prepared_py: bool = False
+
+        # ---- Forward plan cache (for static/graph-friendly dispatch) ----
+        # When enabled, we build a per-layer callable plan that fixes the runtime
+        # dispatch decisions (bf16 vs quant vs offline, and which concrete kernel path).
+        # This removes heavy Python branching from the hot path and makes CUDA graph
+        # capture more stable.
+        self._forward_plan_enabled: bool = False
+        self._forward_plan: Optional[_ForwardPlanBase] = None
+
+    def _invalidate_forward_plan(self) -> None:
+        self._forward_plan = None
+
+    @staticmethod
+    def _device_index(device: torch.device) -> int:
+        if device.type == "cuda" and device.index is not None:
+            return int(device.index)
+        return -1
+
+    def enable_forward_plan(self, enabled: bool = True) -> None:
+        """Enable/disable cached forward plan dispatch for this layer."""
+        self._forward_plan_enabled = bool(enabled)
+        if not self._forward_plan_enabled:
+            self._invalidate_forward_plan()
+
+    def build_forward_plan_for_static(self, example_x: torch.Tensor, bias: Optional[torch.Tensor]) -> None:
+        """Build a cached forward plan for a fixed static decode-step shape.
+
+        This should be called during warmup/capture. After building, `_forward_base`
+        can execute with minimal Python overhead by invoking the cached plan.
+        """
+        strategy = self._get_linear_strategy()
+        # Ensure we don't keep bf16 and quant weights both resident.
+        self._maybe_promote_weight_to_quantized_at_runtime(example_x, strategy)
+
+        device = example_x.device
+        dev_idx = self._device_index(device)
+        has_bias = bias is not None
+        strategy_name = getattr(strategy, "name", "") if strategy is not None else ""
+
+        # Offline quantized weights have highest priority.
+        if self.has_offline_quantized_weight():
+            if strategy is None:
+                raise RuntimeError("Offline quantized weight is present but no linear strategy is configured.")
+            weight_format = getattr(strategy, "linear_weight_format", None)
+            out_features, in_features, group_size = self._offline_meta()
+            sig = _ForwardPlanSig(
+                device_type=device.type,
+                device_index=dev_idx,
+                x_dtype=example_x.dtype,
+                x_shape=tuple(int(x) for x in example_x.shape),
+                has_bias=has_bias,
+                mode="offline",
+                strategy_name=strategy_name,
+            )
+
+            if weight_format == "gptq":
+                self._maybe_prepare_offline_gptq(example_x)
+                bits = self._infer_gptq_weight_bits(in_features=in_features)
+                # Use already-correct g_idx buffer (can be empty), moved once to the example device.
+                g_idx = self.gptq_g_idx
+                if g_idx.device != device:
+                    g_idx = g_idx.to(device=device, dtype=torch.int)
+
+                # Prefer direct torch.ops entry point to bypass Python strategy glue.
+                if hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "gptq_gemm"):
+                    self._forward_plan = _DirectGPTQGemmPlan(
+                        sig=sig,
+                        qweight=self.gptq_qweight,
+                        qzeros=self.gptq_qzeros,
+                        scales=self.gptq_scales,
+                        g_idx=g_idx,
+                        weight_bits=bits,
+                        out_features=out_features,
+                        bias=bias,
+                        use_exllama=True,
+                        use_v2_format=False,
+                        cast_back_to_x_dtype=True,
+                    )
+                else:
+                    self._forward_plan = _OfflineGPTQPlan(
+                        sig=sig,
+                        strategy=strategy,
+                        quant_kind=self.quant_kind,
+                        qweight=self.gptq_qweight,
+                        qzeros=self.gptq_qzeros,
+                        scales=self.gptq_scales,
+                        g_idx=g_idx,
+                        weight_bits=bits,
+                        out_features=out_features,
+                        in_features=in_features,
+                        group_size=group_size,
+                        bias=bias,
+                    )
+                return
+
+            if weight_format == "awq":
+                bits = int(self._offline_quant_bits_py) if int(self._offline_quant_bits_py) > 0 else 4
+                pack_factor = 32 // max(1, bits)
+                # Prefer direct torch.ops entry point to bypass Python strategy glue.
+                awq_gemm = None
+                try:
+                    if hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "awq_gemm"):
+                        awq_gemm = torch.ops._C.awq_gemm
+                except Exception:
+                    awq_gemm = None
+
+                if awq_gemm is not None:
+                    self._forward_plan = _DirectAWQGemmPlan(
+                        sig=sig,
+                        awq_gemm=awq_gemm,
+                        qweight=self.awq_qweight,
+                        qzeros=self.awq_qzeros,
+                        scales=self.awq_scales,
+                        out_features=out_features,
+                        bias=bias,
+                        split_k_iters=1,
+                        cast_back_to_x_dtype=True,
+                    )
+                else:
+                    self._forward_plan = _OfflineAWQPlan(
+                        sig=sig,
+                        strategy=strategy,
+                        quant_kind=self.quant_kind,
+                        qweight=self.awq_qweight,
+                        qzeros=self.awq_qzeros,
+                        scales=self.awq_scales,
+                        pack_factor=pack_factor,
+                        out_features=out_features,
+                        in_features=in_features,
+                        group_size=group_size,
+                        bias=bias,
+                    )
+                return
+
+            if weight_format == "gptq_marlin":
+                self._maybe_prepare_offline_gptq_marlin(example_x)
+                bits = self._infer_gptq_weight_bits(in_features=in_features)
+                # Prefer direct torch.ops entry point to bypass Python strategy glue.
+                if hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "gptq_marlin_gemm"):
+                    try:
+                        from vllm.model_executor.layers.quantization.utils.marlin_utils import (  # type: ignore
+                            marlin_is_k_full,
+                            marlin_make_empty_g_idx,
+                            should_use_atomic_add_reduce,
+                            marlin_permute_bias,
+                        )
+                        from vllm.scalar_type import scalar_types  # type: ignore
+                    except Exception:
+                        marlin_is_k_full = None  # type: ignore
+                        marlin_make_empty_g_idx = None  # type: ignore
+                        should_use_atomic_add_reduce = None  # type: ignore
+                        marlin_permute_bias = None  # type: ignore
+                        scalar_types = None  # type: ignore
+
+                    if scalar_types is None:
+                        # Fall back to the strategy path if vLLM marlin utils are unavailable.
+                        self._forward_plan = _OfflineGPTQMarlinPlan(
+                            sig=sig,
+                            strategy=strategy,
+                            quant_kind=self.quant_kind,
+                            qweight=self.gptq_marlin_qweight,
+                            scales=self.gptq_marlin_scales,
+                            zp=self.gptq_marlin_zp,
+                            g_idx=self.gptq_marlin_g_idx,
+                            g_idx_sort_indices=self.gptq_marlin_g_idx_sort_indices,
+                            workspace=self.gptq_marlin_workspace,
+                            in_features=in_features,
+                            out_features=out_features,
+                            group_size=group_size,
+                            weight_bits=bits,
+                            tp_dim=self.tp_dim,
+                            bias=bias,
+                        )
+                        return
+
+                    device = example_x.device
+                    dev_key = self._device_index(device)
+                    # Prefer already prepared tensors; if missing, use cached empties.
+                    def _empty() -> torch.Tensor:
+                        if marlin_make_empty_g_idx is not None:
+                            return marlin_make_empty_g_idx(device)
+                        return torch.empty((0,), device=device, dtype=torch.int32)
+
+                    g_idx = self.gptq_marlin_g_idx if self.gptq_marlin_g_idx.numel() > 0 else _empty()
+                    g_idx_sort = (
+                        self.gptq_marlin_g_idx_sort_indices
+                        if self.gptq_marlin_g_idx_sort_indices.numel() > 0
+                        else _empty()
+                    )
+                    row_parallel = bool(self.tp_dim == 1)
+                    has_g_idx = bool(g_idx.numel() > 0)
+                    is_k_full = True if marlin_is_k_full is None else marlin_is_k_full(has_g_idx, row_parallel)
+
+                    marlin_bias = None
+                    if bias is not None:
+                        marlin_bias = marlin_permute_bias(bias) if marlin_permute_bias is not None else bias
+
+                    reshaped_x = example_x.reshape(-1, example_x.shape[-1])
+                    m = int(reshaped_x.shape[0])
+                    n = int(out_features)
+                    k = int(reshaped_x.shape[1])
+                    use_atomic_add = False
+                    if should_use_atomic_add_reduce is not None:
+                        use_atomic_add = bool(
+                            should_use_atomic_add_reduce(m=m, n=n, k=k, device=device, dtype=reshaped_x.dtype)
+                        )
+
+                    if bits == 4:
+                        wtype = scalar_types.uint4b8
+                    elif bits == 8:
+                        wtype = scalar_types.uint8b128
+                    else:
+                        raise RuntimeError(f"gptq_marlin: unsupported weight_bits={bits} (expected 4 or 8)")
+
+                    self._forward_plan = _DirectMarlinGemmPlan(
+                        sig=sig,
+                        qweight=self.gptq_marlin_qweight,
+                        scales=self.gptq_marlin_scales,
+                        zp=self.gptq_marlin_zp,
+                        g_idx=g_idx,
+                        g_idx_sort_indices=g_idx_sort,
+                        workspace=self.gptq_marlin_workspace,
+                        wtype_id=wtype.id,
+                        n=out_features,
+                        is_k_full=is_k_full,
+                        use_atomic_add=use_atomic_add,
+                        marlin_bias=marlin_bias,
+                        cast_back_to_x_dtype=True,
+                    )
+                else:
+                    self._forward_plan = _OfflineGPTQMarlinPlan(
+                        sig=sig,
+                        strategy=strategy,
+                        quant_kind=self.quant_kind,
+                        qweight=self.gptq_marlin_qweight,
+                        scales=self.gptq_marlin_scales,
+                        zp=self.gptq_marlin_zp,
+                        g_idx=self.gptq_marlin_g_idx,
+                        g_idx_sort_indices=self.gptq_marlin_g_idx_sort_indices,
+                        workspace=self.gptq_marlin_workspace,
+                        in_features=in_features,
+                        out_features=out_features,
+                        group_size=group_size,
+                        weight_bits=bits,
+                        tp_dim=self.tp_dim,
+                        bias=bias,
+                    )
+                return
+
+            if weight_format == "awq_marlin":
+                self._maybe_prepare_offline_awq_marlin(example_x)
+                if hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "gptq_marlin_gemm"):
+                    try:
+                        from vllm.model_executor.layers.quantization.utils.marlin_utils import (  # type: ignore
+                            marlin_make_empty_g_idx,
+                            should_use_atomic_add_reduce,
+                            marlin_permute_bias,
+                        )
+                        from vllm.scalar_type import scalar_types  # type: ignore
+                    except Exception:
+                        marlin_make_empty_g_idx = None  # type: ignore
+                        should_use_atomic_add_reduce = None  # type: ignore
+                        marlin_permute_bias = None  # type: ignore
+                        scalar_types = None  # type: ignore
+
+                    if scalar_types is None:
+                        self._forward_plan = _OfflineAWQMarlinPlan(
+                            sig=sig,
+                            strategy=strategy,
+                            quant_kind=self.quant_kind,
+                            qweight=self.awq_marlin_qweight,
+                            scales=self.awq_marlin_scales,
+                            zp=self.awq_marlin_zp,
+                            workspace=self.awq_marlin_workspace,
+                            in_features=in_features,
+                            out_features=out_features,
+                            group_size=group_size,
+                            tp_dim=self.tp_dim,
+                            bias=bias,
+                        )
+                        return
+
+                    device = example_x.device
+                    empty = (
+                        marlin_make_empty_g_idx(device)
+                        if marlin_make_empty_g_idx is not None
+                        else torch.empty((0,), device=device, dtype=torch.int32)
+                    )
+                    marlin_bias = None
+                    if bias is not None:
+                        marlin_bias = marlin_permute_bias(bias) if marlin_permute_bias is not None else bias
+
+                    reshaped_x = example_x.reshape(-1, example_x.shape[-1])
+                    m = int(reshaped_x.shape[0])
+                    n = int(out_features)
+                    k = int(reshaped_x.shape[1])
+                    use_atomic_add = False
+                    if should_use_atomic_add_reduce is not None:
+                        use_atomic_add = bool(
+                            should_use_atomic_add_reduce(m=m, n=n, k=k, device=device, dtype=reshaped_x.dtype)
+                        )
+
+                    self._forward_plan = _DirectMarlinGemmPlan(
+                        sig=sig,
+                        qweight=self.awq_marlin_qweight,
+                        scales=self.awq_marlin_scales,
+                        zp=self.awq_marlin_zp,
+                        g_idx=empty,
+                        g_idx_sort_indices=empty,
+                        workspace=self.awq_marlin_workspace,
+                        wtype_id=scalar_types.uint4.id,
+                        n=out_features,
+                        is_k_full=True,
+                        use_atomic_add=use_atomic_add,
+                        marlin_bias=marlin_bias,
+                        cast_back_to_x_dtype=True,
+                    )
+                else:
+                    self._forward_plan = _OfflineAWQMarlinPlan(
+                        sig=sig,
+                        strategy=strategy,
+                        quant_kind=self.quant_kind,
+                        qweight=self.awq_marlin_qweight,
+                        scales=self.awq_marlin_scales,
+                        zp=self.awq_marlin_zp,
+                        workspace=self.awq_marlin_workspace,
+                        in_features=in_features,
+                        out_features=out_features,
+                        group_size=group_size,
+                        tp_dim=self.tp_dim,
+                        bias=bias,
+                    )
+                return
+
+            # If a new offline strategy is added, fall back to the generic runtime dispatcher.
+            raise RuntimeError(
+                f"Offline quantized weight is present but strategy weight_format={weight_format!r} is not supported by forward plan."
+            )
+
+        # Online/load-time quantized weights.
+        if self.has_quantized_weight():
+            if strategy is None:
+                raise RuntimeError("Quantized weight is present but no linear strategy is configured.")
+            sig = _ForwardPlanSig(
+                device_type=device.type,
+                device_index=dev_idx,
+                x_dtype=example_x.dtype,
+                x_shape=tuple(int(x) for x in example_x.shape),
+                has_bias=has_bias,
+                mode="quant",
+                strategy_name=strategy_name,
+            )
+            if getattr(strategy, "name", "") == "linear_int8_w8a16":
+                self._forward_plan = _QuantInt8W8A16Plan(
+                    sig=sig,
+                    strategy=strategy,
+                    quant_kind=self.quant_kind,
+                    qweight=self.quant_weight_int8,
+                    scales_1xn=self.quant_scales_1xn,
+                    out_features=self._forward_out_features,
+                    bias=bias,
+                )
+                return
+            if getattr(strategy, "name", "") == "linear_int8_w8a8":
+                self._forward_plan = _QuantInt8W8A8Plan(
+                    sig=sig,
+                    strategy=strategy,
+                    quant_kind=self.quant_kind,
+                    qweight=self.quant_weight_int8,
+                    scales_1xn=self.quant_scales_1xn,
+                    out_features=self._forward_out_features,
+                    bias=bias,
+                )
+                return
+            self._forward_plan = _QuantGenericPlan(
+                sig=sig,
+                strategy=strategy,
+                quant_kind=self.quant_kind,
+                weight=self.quant_weight_int8,
+                scales=self.quant_scales,
+                bias=bias,
+            )
+            return
+
+        # BF16 weights (no quant).
+        weight = getattr(self, "weight", None)
+        if weight is None:
+            raise RuntimeError("No quantized/offline weights are present but bf16 weight is missing.")
+        sig = _ForwardPlanSig(
+            device_type=device.type,
+            device_index=dev_idx,
+            x_dtype=example_x.dtype,
+            x_shape=tuple(int(x) for x in example_x.shape),
+            has_bias=has_bias,
+            mode="bf16",
+            strategy_name=strategy_name,
+        )
+        self._forward_plan = _BF16Plan(sig=sig, weight=weight, bias=bias)
 
     def has_quantized_weight(self) -> bool:
         return self._weight_is_quantized_py and self.quant_weight_int8.numel() > 0 and self.quant_scales.numel() > 0
@@ -363,6 +1258,9 @@ class LinearBase(nn.Module):
         if "weight" in self._parameters:
             self._parameters.pop("weight", None)
             setattr(self, "weight", None)
+
+        # Offline weights changed; cached forward plan is no longer valid.
+        self._invalidate_forward_plan()
 
     def _maybe_prepare_offline_gptq(self, x: torch.Tensor) -> None:
         """Prepare vLLM GPTQ weights on first use (required gptq_shuffle)."""
@@ -669,6 +1567,8 @@ class LinearBase(nn.Module):
         self.quant_scales_1xn = quant_scales if quant_scales.dim() == 2 else quant_scales.view(1, -1)
         self._weight_is_quantized.fill_(True)
         self._weight_is_quantized_py = True
+        # Quant buffers changed; cached forward plan is no longer valid.
+        self._invalidate_forward_plan()
 
     def _maybe_promote_weight_to_quantized_at_runtime(
         self,
@@ -879,6 +1779,37 @@ class LinearBase(nn.Module):
 
     def _forward_base(self, x: torch.Tensor, bias: Optional[torch.Tensor]) -> torch.Tensor:
         """Unified forward dispatcher for bf16 / online quant / offline GPTQ/AWQ."""
+        if getattr(self, "_forward_plan_enabled", False):
+            plan = getattr(self, "_forward_plan", None)
+            if plan is None:
+                self.build_forward_plan_for_static(x, bias)
+                plan = getattr(self, "_forward_plan", None)
+            if plan is not None:
+                sig = plan.sig
+                dev = x.device
+                dev_idx = self._device_index(dev)
+                if (
+                    sig.device_type == dev.type
+                    and sig.device_index == dev_idx
+                    and sig.x_dtype == x.dtype
+                    and sig.x_shape == tuple(int(v) for v in x.shape)
+                    and sig.has_bias == (bias is not None)
+                ):
+                    return plan(x)
+                # Static mode but shape/dtype changed: rebuild once and retry.
+                self.build_forward_plan_for_static(x, bias)
+                plan = getattr(self, "_forward_plan", None)
+                if plan is not None:
+                    sig = plan.sig
+                    if (
+                        sig.device_type == dev.type
+                        and sig.device_index == dev_idx
+                        and sig.x_dtype == x.dtype
+                        and sig.x_shape == tuple(int(v) for v in x.shape)
+                        and sig.has_bias == (bias is not None)
+                    ):
+                        return plan(x)
+
         strategy = self._get_linear_strategy()
         # Runtime safety net: ensure we don't keep bf16+quant weights both resident.
         self._maybe_promote_weight_to_quantized_at_runtime(x, strategy)

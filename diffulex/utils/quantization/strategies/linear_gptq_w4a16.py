@@ -37,6 +37,8 @@ class LinearGPTQW4A16Strategy(LinearQuantizationStrategy):
     def __init__(self) -> None:
         super().__init__()
         self._ops_available: bool = bool(ops is not None and hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "gptq_gemm"))
+        # Cache empty g_idx tensor per device to avoid per-call allocations.
+        self._empty_cache: dict[int, torch.Tensor] = {}
 
     @property
     def name(self) -> str:
@@ -121,10 +123,16 @@ class LinearGPTQW4A16Strategy(LinearQuantizationStrategy):
         if not x2.is_contiguous():
             x2 = x2.contiguous()
 
+        device = x.device
+        dev_key = int(device.index) if device.type == "cuda" and device.index is not None else -1
         if g_idx is None or g_idx.numel() == 0:
-            g_idx_t = torch.empty((0,), device=x.device, dtype=torch.int)
+            empty = self._empty_cache.get(dev_key)
+            if empty is None or empty.device != device:
+                empty = torch.empty((0,), device=device, dtype=torch.int)
+                self._empty_cache[dev_key] = empty
+            g_idx_t = empty
         else:
-            g_idx_t = g_idx if (g_idx.device == x.device and g_idx.dtype == torch.int) else g_idx.to(device=x.device, dtype=torch.int)
+            g_idx_t = g_idx if (g_idx.device == device and g_idx.dtype == torch.int) else g_idx.to(device=device, dtype=torch.int)
 
         output = torch.ops._C.gptq_gemm(
             x2,

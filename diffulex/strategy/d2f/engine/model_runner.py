@@ -292,20 +292,34 @@ class D2FModelRunner(ModelRunnerBase):
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
-        bs = input_ids.size(0)
+        num_tokens = input_ids.size(0)
         context = fetch_d2f_attn_metadata()
-        graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+        bucket_tokens = next(x for x in self.graph_bs if x >= num_tokens)
+        graph = self.graphs[bucket_tokens]
         graph_vars = self.graph_vars
         for key, value in graph_vars.items():
             if key != "outputs":
                 value.zero_()
-        graph_vars["input_ids"][:bs] = input_ids
-        graph_vars["positions"][:bs] = positions
-        graph_vars["slot_mapping"][:bs] = context.slot_mapping
-        graph_vars["context_lens"][:bs] = context.context_lens
-        graph_vars["block_tables"][:bs, : context.block_tables.size(1)] = context.block_tables
+        graph_vars["input_ids"][:num_tokens] = input_ids
+        graph_vars["positions"][:num_tokens] = positions
+        graph_vars["slot_mapping"][:num_tokens] = context.slot_mapping
+        num_seqs = int(context.context_lens.numel())
+        graph_vars["context_lens"][:num_seqs] = context.context_lens
+        # cu_seqlens are required by unified paged-attn decode kernels.
+        if getattr(context, "cu_seqlens_q", None) is not None:
+            graph_vars["cu_seqlens_q"][: num_seqs + 1] = context.cu_seqlens_q
+            bucket_num_seqs = int(bucket_tokens // max(1, int(self.diffusion_block_size)))
+            if bucket_num_seqs > num_seqs:
+                graph_vars["cu_seqlens_q"][num_seqs + 1 : bucket_num_seqs + 1].fill_(int(num_tokens))
+        if getattr(context, "cu_seqlens_k", None) is not None:
+            graph_vars["cu_seqlens_k"][: num_seqs + 1] = context.cu_seqlens_k
+            bucket_num_seqs = int(bucket_tokens // max(1, int(self.diffusion_block_size)))
+            if bucket_num_seqs > num_seqs:
+                last_k = context.cu_seqlens_k[num_seqs]
+                graph_vars["cu_seqlens_k"][num_seqs + 1 : bucket_num_seqs + 1] = last_k
+        graph_vars["block_tables"][:num_seqs, : context.block_tables.size(1)] = context.block_tables
         graph.replay()
-        return self.model.compute_logits(graph_vars["outputs"][:bs])
+        return self.model.compute_logits(graph_vars["outputs"][:num_tokens])
 
     def run(self, seqs: list[SequenceBase], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
@@ -317,8 +331,107 @@ class D2FModelRunner(ModelRunnerBase):
 
     @torch.inference_mode()
     def capture_cudagraph(self):
-        """
-        TODO: Varlen decoding does not support CUDA graph capture yet.
-        Can be implemented, but requires drastically high overhead.
-        """
-        raise NotImplementedError("CUDA graph capture for DiffusionLM is not implemented yet.")
+        # Static-mode CUDA graph capture for D2F decode.
+        #
+        # NOTE:
+        # - This matches `run_model()`'s replay protocol: we only overwrite
+        #   input_ids/positions/slot_mapping/context_lens/block_tables per step.
+        # - Varlen mode is intentionally not supported here (assume static flow).
+        from tqdm import tqdm
+
+        # Enable per-layer forward-plan dispatch to stabilize capture and minimize
+        # Python branching inside the captured region.
+        try:
+            from diffulex.layer.linear import LinearBase
+            for m in self.model.modules():
+                if isinstance(m, LinearBase):
+                    m.enable_forward_plan(True)
+        except Exception:
+            pass
+
+        set_warming_up(True)
+        config = self.config
+        hf_config = config.hf_config
+        diffusion_block_size = int(self.diffusion_block_size)
+        max_num_seqs = int(self.config.max_num_seqs)
+        # Graph path is only used when num_tokens <= 512.
+        max_num_seqs_for_graph = max(1, min(max_num_seqs, 512 // max(1, diffusion_block_size)))
+        max_num_tokens = max_num_seqs_for_graph * diffusion_block_size
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+
+        # Allocate graph buffers on the same device/dtype as the model.
+        try:
+            p0 = next(self.model.parameters())
+            graph_device = p0.device
+            graph_dtype = p0.dtype
+        except StopIteration:
+            graph_device = torch.device("cuda")
+            graph_dtype = torch.float16
+
+        # Allocate max-size graph buffers.
+        input_ids = torch.zeros(max_num_tokens, dtype=torch.int64, device=graph_device)
+        positions = torch.zeros(max_num_tokens, dtype=torch.int64, device=graph_device)
+        slot_mapping = torch.zeros(max_num_tokens, dtype=torch.int32, device=graph_device)
+        context_lens = torch.zeros(max_num_seqs_for_graph, dtype=torch.int32, device=graph_device)
+        block_tables = torch.zeros(max_num_seqs_for_graph, max_num_blocks, dtype=torch.int32, device=graph_device)
+        outputs = torch.zeros(max_num_tokens, hf_config.hidden_size, dtype=graph_dtype, device=graph_device)
+        cu_seqlens_q = torch.zeros(max_num_seqs_for_graph + 1, dtype=torch.int32, device=graph_device)
+        cu_seqlens_k = torch.zeros(max_num_seqs_for_graph + 1, dtype=torch.int32, device=graph_device)
+
+        # Capture bucketed graphs by num_tokens (bucketed by num_seqs * diffusion_block_size).
+        self.graph_bs = []
+        seq_bs_list = [1, 2, 4, 8] + list(range(16, max_num_seqs_for_graph + 1, 16))
+        for num_seqs in sorted(set([b for b in seq_bs_list if b <= max_num_seqs_for_graph] + [max_num_seqs_for_graph])):
+            self.graph_bs.append(int(num_seqs) * diffusion_block_size)
+        self.graphs = {}
+        self.graph_pool = None
+
+        for num_tokens in tqdm(reversed(self.graph_bs), desc="Capturing CUDA graphs"):
+            num_seqs = int(num_tokens // diffusion_block_size)
+            graph = torch.cuda.CUDAGraph()
+            # Fill placeholder metadata with valid monotonic cu_seqlens to satisfy kernel assertions.
+            cu_seqlens_q[: num_seqs + 1] = (
+                torch.arange(num_seqs + 1, dtype=torch.int32, device=graph_device) * diffusion_block_size
+            )
+            # Use a conservative max-seqlen for K to keep shapes stable; values are overwritten before replay.
+            cu_seqlens_k[: num_seqs + 1] = (
+                torch.arange(num_seqs + 1, dtype=torch.int32, device=graph_device) * int(config.max_model_len)
+            )
+            context_lens[:num_seqs].fill_(int(config.max_model_len))
+            # For static decode, use placeholder metadata tensors; per-step values are copied
+            # into `graph_vars` before replay.
+            set_d2f_attn_metadata(
+                False,
+                slot_mapping=slot_mapping[:num_tokens],
+                context_lens=context_lens[:num_seqs],
+                cu_seqlens_q=cu_seqlens_q[: num_seqs + 1],
+                cu_seqlens_k=cu_seqlens_k[: num_seqs + 1],
+                max_seqlen_q=diffusion_block_size,
+                max_seqlen_k=int(config.max_model_len),
+                block_tables=block_tables[:num_seqs],
+                kv_cache_layout=self.config.kv_cache_layout,
+                need_kv_cache_store=True,
+                diffusion_block_size=self.diffusion_block_size,
+                decode_mode="static",
+                attn_type="full_attention",
+            )
+            outputs[:num_tokens] = self.model(input_ids[:num_tokens], positions[:num_tokens])  # warmup
+            with torch.cuda.graph(graph, self.graph_pool):
+                outputs[:num_tokens] = self.model(input_ids[:num_tokens], positions[:num_tokens])  # capture
+            if self.graph_pool is None:
+                self.graph_pool = graph.pool()
+            self.graphs[num_tokens] = graph
+            torch.cuda.synchronize()
+            reset_d2f_attn_metadata()
+
+        self.graph_vars = dict(
+            input_ids=input_ids,
+            positions=positions,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            block_tables=block_tables,
+            outputs=outputs,
+        )
+        reset_warming_up()
