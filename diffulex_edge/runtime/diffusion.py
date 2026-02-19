@@ -5,12 +5,17 @@ including DiffusionBlock management, logits shifting, and confidence-based
 token acceptance.
 """
 
+import logging
 import torch
 import torch.nn.functional as F
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Dict, Any, Iterator
+from pathlib import Path
+from typing import List, Optional, Tuple, Dict, Any, Iterator, Union
 import math
+
+# Setup logger
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -593,27 +598,142 @@ class DiffusionEngine:
     """Inference engine for diffusion-based generation.
     
     Supports iterative denoising with confidence-based token acceptance.
+    Can run with either PyTorch models (for development) or ExecuTorch
+    PTE models (for deployment).
+    
+    Usage:
+        # Load PyTorch model
+        engine = DiffusionEngine.from_model(model)
+        
+        # Or load ExecuTorch model
+        engine = DiffusionEngine.from_pte("model.pte")
+        
+        # Generate text
+        tokens = engine.generate(prompt_tokens, config)
     """
     
     def __init__(
         self,
         model: Optional[torch.nn.Module] = None,
+        pte_path: Optional[Union[str, Path]] = None,
         device: str = "cpu",
     ):
         """Initialize diffusion engine.
         
         Args:
             model: PyTorch model for inference
+            pte_path: Path to .pte file (if loading ExecuTorch model)
             device: Device to run on
+            
+        Raises:
+            ValueError: If both model and pte_path are provided, or neither
+            FileNotFoundError: If pte_path is provided but file doesn't exist
+            ImportError: If pte_path is provided but ExecuTorch not installed
         """
+        # Validate exclusive parameters
+        if model is not None and pte_path is not None:
+            raise ValueError(
+                "Cannot provide both 'model' and 'pte_path'. "
+                "Use from_model() or from_pte() for clarity."
+            )
+        
+        if model is None and pte_path is None:
+            logger.warning(
+                "Initializing DiffusionEngine without model. "
+                "Call from_model() or from_pte() to load a model."
+            )
+        
         self.model = model
+        self.pte_path = Path(pte_path) if pte_path is not None else None
         self.device = device
         self.block_manager = DiffusionBlockManager()
         self.sampler = DiffusionSampler()
         
+        # PTE state
+        self._is_pte: bool = self.pte_path is not None
+        self._pte_module: Any = None
+        self._pte_program: Any = None
+        
+        # Load model if provided
         if model is not None:
             self.model.eval()
             self.model.to(device)
+            logger.debug(f"Loaded PyTorch model on {device}")
+        elif self.pte_path is not None:
+            self._load_pte_model()
+    
+    def _load_pte_model(self) -> None:
+        """Load ExecuTorch model from pte_path.
+        
+        Raises:
+            FileNotFoundError: If PTE file doesn't exist
+            ImportError: If ExecuTorch runtime not available
+            RuntimeError: If loading fails for other reasons
+        """
+        if self.pte_path is None:
+            raise RuntimeError("pte_path is None - cannot load PTE model")
+        
+        # Validate file exists
+        if not self.pte_path.exists():
+            raise FileNotFoundError(f"PTE file not found: {self.pte_path}")
+        
+        try:
+            from executorch.runtime import Runtime, Verification
+            
+            runtime = Runtime.get()
+            self._pte_program = runtime.load_program(
+                str(self.pte_path),
+                verification=Verification.Minimal
+            )
+            self._pte_module = self._pte_program.load_method("forward")
+            logger.info(f"Loaded ExecuTorch model from {self.pte_path}")
+        except ImportError as e:
+            raise ImportError(
+                "ExecuTorch runtime not available. "
+                "Install with: pip install executorch"
+            ) from e
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load PTE model from {self.pte_path}: {e}"
+            ) from e
+    
+    @classmethod
+    def from_model(
+        cls,
+        model: torch.nn.Module,
+        device: str = "cpu",
+    ) -> "DiffusionEngine":
+        """Create engine from PyTorch model.
+        
+        Args:
+            model: PyTorch model
+            device: Device to run on
+            
+        Returns:
+            Configured DiffusionEngine
+        """
+        model.eval()
+        model.to(device)
+        logger.debug(f"Creating DiffusionEngine from PyTorch model on {device}")
+        return cls(model=model, device=device)
+    
+    @classmethod
+    def from_pte(
+        cls,
+        pte_path: Union[str, Path],
+        device: str = "cpu",
+    ) -> "DiffusionEngine":
+        """Create engine from .pte file.
+        
+        Args:
+            pte_path: Path to .pte file
+            device: Device to run on
+            
+        Returns:
+            Configured DiffusionEngine
+        """
+        logger.debug(f"Creating DiffusionEngine from PTE: {pte_path}")
+        return cls(pte_path=Path(pte_path), device=device)
     
     def generate(
         self,
@@ -661,18 +781,22 @@ class DiffusionEngine:
             # Add mask tokens to sequence
             sequence.extend([config.mask_token_id] * block_len)
         
+        logger.debug(
+            f"Starting generation: prompt_len={prompt_len}, "
+            f"num_blocks={num_blocks}, max_new_tokens={config.max_new_tokens}"
+        )
+        
         # Iterative denoising
         for iteration in range(config.num_iterations):
             if config.early_stop and not self.block_manager.has_active_blocks():
+                logger.debug(f"Early stop at iteration {iteration}")
                 break
             
             # Prepare input
             input_ids = torch.tensor([sequence], dtype=torch.long, device=self.device)
             
             # Forward pass
-            with torch.no_grad():
-                logits = self._forward(input_ids)  # [1, seq_len, vocab_size]
-            
+            logits = self._forward(input_ids)  # [1, seq_len, vocab_size]
             logits = logits[0]  # [seq_len, vocab_size]
             
             # Apply shift (with caching for multi-step)
@@ -684,7 +808,11 @@ class DiffusionEngine:
             # Update sequence with accepted tokens
             for pos, token_id in output.accepted_tokens.items():
                 sequence[pos] = token_id
+            
+            num_accepted = len(output.accepted_tokens)
+            logger.debug(f"Iteration {iteration}: accepted {num_accepted} tokens")
         
+        logger.debug(f"Generation complete: sequence length={len(sequence)}")
         return sequence
     
     def _forward(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -696,10 +824,60 @@ class DiffusionEngine:
         Returns:
             Logits [batch, seq_len, vocab_size]
         """
+        if self._is_pte:
+            return self._forward_pte(input_ids)
+        else:
+            return self._forward_torch(input_ids)
+    
+    def _forward_torch(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Forward pass using PyTorch model.
+        
+        Args:
+            input_ids: Input token IDs [batch, seq_len]
+            
+        Returns:
+            Logits [batch, seq_len, vocab_size]
+        """
         if self.model is None:
             raise RuntimeError("No model loaded")
         
-        return self.model(input_ids)[0]
+        with torch.no_grad():
+            return self.model(input_ids)[0]
+    
+    def _forward_pte(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Forward pass using ExecuTorch model.
+        
+        Args:
+            input_ids: Input token IDs [batch, seq_len]
+            
+        Returns:
+            Logits [batch, seq_len, vocab_size]
+        """
+        if self._pte_module is None:
+            raise RuntimeError("No PTE model loaded")
+        
+        # Convert to list for ExecuTorch
+        input_list = input_ids.tolist()
+        
+        # Run inference
+        result = self._pte_module.forward(input_list)
+        
+        # Convert result back to tensor
+        # Handle different return formats
+        if isinstance(result, (list, tuple)):
+            logits = torch.tensor(result[0])
+        else:
+            logits = torch.tensor(result)
+        
+        # Ensure correct shape [batch, seq_len, vocab_size]
+        if logits.dim() == 2:
+            # [seq_len, vocab_size] -> [1, seq_len, vocab_size]
+            logits = logits.unsqueeze(0)
+        elif logits.dim() == 1:
+            # [vocab_size] -> [1, 1, vocab_size]
+            logits = logits.unsqueeze(0).unsqueeze(0)
+        
+        return logits
     
     def generate_stream(
         self,
@@ -749,8 +927,7 @@ class DiffusionEngine:
             
             input_ids = torch.tensor([sequence], dtype=torch.long, device=self.device)
             
-            with torch.no_grad():
-                logits = self._forward(input_ids)[0]
+            logits = self._forward(input_ids)[0]
             
             shifted_logits = self.sampler.shift_logits(logits)
             output = self.sampler.sample_blocks(self.block_manager, shifted_logits)

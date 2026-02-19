@@ -1,16 +1,6 @@
 # DiffuLex Edge - Architecture
 
-This document describes the architecture and implementation details of DiffuLex Edge.
-
-## Table of Contents
-
-1. [System Architecture](#system-architecture)
-2. [Model Architecture](#model-architecture)
-3. [KV Cache Design](#kv-cache-design)
-4. [Diffusion Sampling](#diffusion-sampling)
-5. [Quantization](#quantization)
-6. [Backend System](#backend-system)
-7. [Export Pipeline](#export-pipeline)
+Technical architecture and implementation details.
 
 ## System Architecture
 
@@ -41,39 +31,61 @@ This document describes the architecture and implementation details of DiffuLex 
 
 ## Model Architecture
 
-### FastdLLMV2Edge
+### Unified Forward Interface
 
-Simplified version of FastdLLM V2 with the following modifications:
-
-| Component | Original | Edge Version |
-|-----------|----------|--------------|
-| Linear | Column/RowParallelLinear | nn.Linear |
-| Attention | Custom flash kernels | F.scaled_dot_product_attention |
-| KV Cache | PagedAttention | Static input/output |
-| RMSNorm | torch.compile | Standard implementation |
-
-### Key Classes
+All 4 models implement a consistent forward interface:
 
 ```python
-class FastdLLMV2EdgeConfig:
-    vocab_size: int = 32000
-    hidden_size: int = 4096
-    num_hidden_layers: int = 32
-    num_attention_heads: int = 32
-    num_key_value_heads: int = 8        # GQA
-    intermediate_size: int = 14336
-    max_position_embeddings: int = 32768
+def forward(
+    self,
+    input_ids: torch.Tensor,           # [batch, seq_len]
+    positions: Optional[torch.Tensor] = None,
+    kv_cache: Optional[torch.Tensor] = None,
+    start_pos: int = 0,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """
+    Returns:
+        logits: [batch, seq_len, vocab_size]
+        kv_cache: [num_layers, 2, batch, kv_heads, max_seq, head_dim] or None
+    """
+```
 
-class FastdLLMV2Edge(nn.Module):
-    def forward(self, input_ids, kv_cache=None, start_pos=0)
-    def generate_step(self, input_ids, kv_cache, start_pos)
+### Model Configurations
+
+| Model | Vocab | Hidden | Layers | Heads | KV Heads | Intermediate |
+|-------|-------|--------|--------|-------|----------|--------------|
+| FastdLLM V2 | 126k | 2048 | 22 | 16 | 4 | 5504 |
+| Dream | 100k | 2048 | 24 | 32 | 8 | 5504 |
+| LLaDA | 100k | 2048 | 26 | 32 | 8 | 5504 |
+| SDAR-1.7B | 152k | 2048 | 28 | 16 | 8 | 6144 |
+
+### Rotary Embedding
+
+All models use unified RotaryEmbedding implementation:
+
+```python
+class RotaryEmbedding(nn.Module):
+    """
+    Cache shape: [max_position, dim]
+    Indexing: cos_cached[positions].unsqueeze(1) -> [batch, 1, seq, dim]
+    """
+    def forward(
+        self,
+        positions: torch.Tensor,      # [batch, seq_len]
+        q: torch.Tensor,              # [batch, heads, seq, head_dim]
+        k: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        cos = self.cos_cached[positions].unsqueeze(1)  # [B, 1, S, D]
+        sin = self.sin_cached[positions].unsqueeze(1)
+        # Apply rotation
+        return q_rot, k_rot
 ```
 
 ## KV Cache Design
 
 ### Static KV Cache
 
-Pre-allocated fixed-size cache for edge device compatibility:
+Pre-allocated fixed-size cache for edge compatibility:
 
 ```
 Cache Shape: [num_layers, 2, batch, kv_heads, max_seq, head_dim]
@@ -90,200 +102,79 @@ Cache Shape: [num_layers, 2, batch, kv_heads, max_seq, head_dim]
 ```
 Size = layers × 2 × batch × kv_heads × max_seq × head_dim × dtype_bytes
 
-Example (FP32, 2 layers, 512 seq):
-= 2 × 2 × 1 × 2 × 512 × 64 × 4 = 1.0 MB
-
-With INT8 quantization:
-= 0.25 MB (75% reduction)
-```
-
-### Usage Pattern
-
-```python
-# Prefill phase
-logits, new_kv = model(input_ids, kv_cache=cache.get_cache_tensor(), start_pos=0)
-cache.update_from_tensor(new_kv, start_pos=0)
-
-# Decode phase (incremental)
-for i in range(max_new_tokens):
-    logits, new_kv = model(next_token, kv_cache=cache.get_cache_tensor(), start_pos=current_len)
-    cache.update_from_tensor(new_kv, start_pos=current_len)
-    current_len += 1
+Example (BF16, 28 layers, 2048 seq):
+= 28 × 2 × 1 × 8 × 2048 × 64 × 2 = 117 MB
 ```
 
 ## Diffusion Sampling
 
-### Core Concepts
+### Sampler Architecture
 
-Diffusion LLMs generate tokens in parallel through an iterative denoising process:
-
-1. **Diffusion Blocks**: Sequence divided into blocks of mask positions
-2. **Shift Logits**: Special operation for dependency handling
-3. **Confidence-based Acceptance**: High-confidence tokens accepted early
-4. **Iterative Refinement**: Remaining masks refined in next iteration
+```
+sampler/
+├── base.py                      # Core sampling functions
+│   ├── sample_tokens()          # Temperature, top-p, top-k
+│   ├── top_p_logits()           # Nucleus filtering
+│   └── top_k_logits()           # Top-k filtering
+├── shift.py                     # Logits shifting
+│   ├── ShiftLogitsSampler       # FastdLLM V2, Dream, SDAR
+│   └── NoShiftLogitsSampler     # LLaDA
+└── models/                      # Model-specific samplers
+    ├── fast_dllm_v2.py          # Global threshold, always accept 1
+    ├── llada.py                 # No shift, per-block threshold
+    ├── dream.py                 # Shift + per-block threshold
+    └── sdar.py                  # Like FastdLLM V2
+```
 
 ### DiffusionBlock
 
 ```python
 @dataclass
 class DiffusionBlock:
-    start_pos: int           # Block start in sequence
-    end_pos: int             # Block end in sequence
-    mask_positions: List[int]  # Relative positions still masked
-    is_active: bool          # Whether block needs more iterations
-    accept_threshold: float  # Confidence threshold (default 0.95)
+    start_pos: int
+    length: int
+    accept_threshold: float = 0.95      # Per-block (LLaDA/Dream)
+    pre_block_complete: bool = False    # Previous block status
+    
+    @property
+    def global_mask_token_ids(self) -> List[int]:
+        """Positions still masked in this block"""
 ```
-
-### DiffusionSampler
-
-```python
-class DiffusionSampler:
-    def sample_blocks(logits, blocks, positions) -> SampleOutput
-    def shift_logits(logits, last_logits) -> shifted_logits
-    def compute_confidence(probs, method) -> confidence_scores
-```
-
-### Generation Flow
-
-```
-Input:  [The, mask, mask, is, mask]
-        └───────┬───────┘  └─┬─┘
-            Block 0      Block 1
-
-Iteration 1:
-  Block 0: [The, weather, mask]  → accept "weather" (conf 0.97)
-  Block 1: [is, mask]            → no high conf tokens
-
-Iteration 2:
-  Block 0: [The, weather, today] → accept "today" (conf 0.96)
-  Block 1: [is, sunny]           → accept "sunny" (conf 0.98)
-
-Output: [The, weather, today, is, sunny]
-```
-
-## Quantization
-
-### Supported Modes
-
-| Mode | Description | Use Case |
-|------|-------------|----------|
-| Dynamic INT8 | Weight-only, dynamic activation | Balanced speed/quality |
-| Static INT8 | Both weights and activations | Maximum speed |
-| Weight-only | Offline weight quantization | Model size reduction |
-
-### Implementation
-
-```python
-# Dynamic quantization
-from diffulex_edge.quant import apply_dynamic_quantization
-q_model = apply_dynamic_quantization(model)
-
-# Static quantization with calibration
-from diffulex_edge.quant import DiffuLexQuantizer
-quantizer = DiffuLexQuantizer()
-q_model = quantizer.quantize_static(model, calibration_data)
-```
-
-## Backend System
-
-### Backend Hierarchy
-
-```
-EdgeBackend (ABC)
-├── XNNPACKBackend      # Generic CPU (ARM64/x86)
-├── QNNBackend          # Qualcomm NPU
-└── CoreMLBackend       # Apple Neural Engine
-```
-
-### Backend Selection
-
-```python
-from diffulex_edge.backends import BackendRegistry
-
-# Auto-select based on platform
-backend = BackendRegistry.get_default()
-
-# Manual selection
-backend = BackendRegistry.create("xnnpack")
-
-# Export
-result = backend.export(model, example_inputs)
-```
-
-### Backend Compatibility
-
-| Model | XNNPACK | QNN | CoreML |
-|-------|---------|-----|--------|
-| FastdLLM V2 | ✅ | ✅ | ✅ |
-| Dream | ✅ | ⚠️ | ⚠️ |
-| LLaDA | ✅ | ⚠️ | ⚠️ |
-| SDAR | ✅ | ⚠️ | ❌ |
 
 ## Export Pipeline
 
-### Standard Export Flow
+```
+PyTorch Model (nn.Module)
+         ↓
+torch.export.export()           # Capture computation graph
+         ↓
+ExportedProgram
+         ↓
+to_edge()                       # Convert to Edge IR
+         ↓
+Edge IR (EdgeProgramManager)
+         ↓
+to_backend()                    # Lower to backend
+         ↓
+Backend IR (XNNPACK/CoreML/QNN)
+         ↓
+to_executorch()                 # Generate .pte
+         ↓
+model.pte
+```
+
+### Backend Integration
 
 ```python
-from diffulex_edge.export import export_model
-
-result = export_model(
-    model,
-    example_inputs,
-    output_path="model.pte",
-    backend="xnnpack",           # or "qnn", "coreml"
-    quantization="dynamic_int8", # or "static_int8", "none"
-)
+class EdgeBackend(ABC):
+    @abstractmethod
+    def export(self, model, example_inputs) -> ExportResult:
+        """Export model to backend format"""
+        
+    @abstractmethod
+    def load(self, path) -> RuntimeModule:
+        """Load exported model for inference"""
 ```
-
-### Internal Pipeline
-
-```
-PyTorch Model
-     ↓
-torch.export.export()  → ExportedProgram
-     ↓
-to_edge()              → Edge IR
-     ↓
-to_backend()           → Backend-specific IR
-     ↓
-to_executorch()        → .pte file
-```
-
-### Multi-Model Export
-
-```python
-from diffulex_edge.export.model_exporter import export_model
-
-# Export with automatic format detection
-paths = export_model(
-    model=model,
-    model_type="fast_dllm_v2",
-    output_dir="./exported",
-)
-# Returns: {'torchscript': ..., 'onnx': ..., 'metadata': ...}
-```
-
-## Performance Considerations
-
-### Memory Optimization
-
-1. **Static KV Cache**: Pre-allocated, no dynamic allocation during inference
-2. **Quantization**: INT8 reduces memory by 50-75%
-3. **Block-wise Generation**: Only compute necessary positions
-
-### Speed Optimization
-
-1. **XNNPACK**: Optimized CPU kernels for ARM64
-2. **Diffusion Sampling**: Parallel token acceptance vs autoregressive
-3. **Kernel Fusion**: ExecuTorch fuses compatible operations
-
-### Trade-offs
-
-| Optimization | Benefit | Cost |
-|--------------|---------|------|
-| INT8 Quantization | 2x speed, 50% memory | <2% quality loss |
-| Diffusion Blocks | Parallel generation | Multiple iterations |
-| Static KV Cache | Predictable memory | Fixed max sequence |
 
 ## Testing Architecture
 
@@ -293,8 +184,8 @@ paths = export_model(
 Unit Tests (70%)
 ├── Model: 22 tests
 ├── KV Cache: 12 tests
-├── Sampler: 46 tests
-├── Engine: 18 tests
+├── Sampler: 38 tests
+├── Engine: 37 tests (PTE)
 └── Backend: 10 tests
 
 Integration Tests (20%)
@@ -306,13 +197,43 @@ Performance Tests (10%)
 └── Memory: 3 tests
 ```
 
-### Test Categories
+### Numerical Equivalence Testing
 
-| Category | Count | Purpose |
-|----------|-------|---------|
-| Functional | 33 | Basic functionality |
-| Boundary | 30 | Edge cases |
-| Error Handling | 18 | Exception handling |
-| Numerical | 13 | Precision/accuracy |
-| Integration | 15 | Module interaction |
-| Performance | 5 | Speed benchmarks |
+Framework for verifying HF vs Edge model outputs:
+
+```python
+def verify_numerical_equivalence(
+    hf_model_path: str,
+    edge_model,
+    test_inputs: List[torch.Tensor],
+    tolerance: float = 1e-5,
+) -> bool:
+    """Verify Edge model matches HF outputs within tolerance"""
+```
+
+## Performance Considerations
+
+### Memory Optimization
+
+1. **Static KV Cache**: Pre-allocated, no dynamic allocation
+2. **Quantization**: INT8 reduces memory by 50%
+3. **Block-wise Generation**: Only compute necessary positions
+
+### Speed Optimization
+
+1. **XNNPACK**: Optimized CPU kernels for ARM64
+2. **Diffusion Sampling**: Parallel token acceptance
+3. **Kernel Fusion**: ExecuTorch fuses compatible operations
+
+### Trade-offs
+
+| Optimization | Benefit | Cost |
+|--------------|---------|------|
+| INT8 Quantization | 2x speed, 50% memory | <2% quality loss |
+| Diffusion Blocks | Parallel generation | Multiple iterations |
+| Static KV Cache | Predictable memory | Fixed max sequence |
+
+## See Also
+
+- [Test Plan](TEST_PLAN.md) - Testing strategy
+- [Export Guide](EXPORT.md) - Export documentation

@@ -150,7 +150,7 @@ class QNNBackend(EdgeBackend):
         
         try:
             from torch.export import export
-            from executorch.exir import to_edge
+            from executorch.exir import to_edge_transform_and_lower
             from executorch.exir.passes import MemoryPlanningPass
             from executorch.exir.program._program import ExecutorchBackendConfig
             
@@ -168,20 +168,29 @@ class QNNBackend(EdgeBackend):
                     example_inputs = (example_inputs,)
                 ep = export(model, example_inputs)
             
-            # 3. 转换为 Edge Dialect
-            logger.info("Converting to Edge Dialect...")
-            edge = to_edge(ep)
-            
-            # 4. 分区到 QNN
-            logger.info("Partitioning to QNN...")
+            # 3. 使用新的工作流：to_edge_transform_and_lower
+            logger.info("Converting to Edge Dialect and lowering to QNN...")
             partitioner = self.get_partitioner()
-            edge = edge.to_backend(partitioner)
-            logger.info("QNN partitioning successful")
+            edge = to_edge_transform_and_lower(
+                ep,
+                partitioner=[partitioner],
+            )
+            logger.info("Edge conversion and QNN lowering successful")
             
-            # 5. 生成 .pte 文件
+            # 4. 生成 .pte 文件
             logger.info("Generating ExecuTorch program...")
+            # memory_planning_algo 需要是一个 callable，而不是字符串
+            from executorch.exir.memory_planning import greedy, MemoryPlanningAlgorithmSuite
+            
+            if self.config.memory_planning == "greedy":
+                algo = greedy
+            else:
+                algo = MemoryPlanningAlgorithmSuite()
+            
             memory_planning_pass = MemoryPlanningPass(
-                memory_planning_algo=self.config.memory_planning
+                memory_planning_algo=algo,
+                alloc_graph_input=False,
+                alloc_graph_output=False,
             )
             
             exec_config = ExecutorchBackendConfig(

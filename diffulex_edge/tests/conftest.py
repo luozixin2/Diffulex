@@ -221,6 +221,156 @@ def empty_prompt():
 
 
 # ============================================================================
+# PTE Model Fixtures
+# ============================================================================
+
+import tempfile
+from pathlib import Path
+
+
+class SimplePTECompatibleModel(nn.Module):
+    """Simple model compatible with PTE export."""
+    
+    def __init__(self, vocab_size: int = 1000, hidden_size: int = 64):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.embedding = nn.Embedding(vocab_size, hidden_size)
+        self.linear = nn.Linear(hidden_size, vocab_size)
+    
+    def forward(self, input_ids: torch.Tensor):
+        x = self.embedding(input_ids)
+        logits = self.linear(x)
+        return logits
+
+
+class MockExecuTorchModule:
+    """Mock ExecuTorch runtime module for testing without actual ExecuTorch runtime."""
+    
+    def __init__(self, pytorch_model: nn.Module):
+        self._model = pytorch_model
+        self._model.eval()
+    
+    def forward(self, input_list, start_pos=0):
+        """Mock forward method matching ExecuTorch interface.
+        
+        Args:
+            input_list: List of token IDs or nested list
+            start_pos: Starting position for KV cache
+            
+        Returns:
+            List of logits
+        """
+        # Convert list input to tensor
+        if isinstance(input_list, list):
+            if len(input_list) == 0:
+                return []
+            # Handle nested list
+            if isinstance(input_list[0], list):
+                tensor_input = torch.tensor(input_list, dtype=torch.long)
+            else:
+                tensor_input = torch.tensor([input_list], dtype=torch.long)
+        else:
+            tensor_input = input_list
+        
+        with torch.no_grad():
+            output = self._model(tensor_input)
+            # Return as list to match ExecuTorch interface
+            if output.dim() == 3:
+                return output.squeeze(0).tolist()
+            return output.tolist()
+
+
+@pytest.fixture
+def simple_model():
+    """Return a simple model suitable for PTE export."""
+    return SimplePTECompatibleModel()
+
+
+@pytest.fixture
+def simple_model_with_params():
+    """Return a simple model with specific parameters."""
+    model = SimplePTECompatibleModel(vocab_size=500, hidden_size=32)
+    # Set deterministic weights for reproducibility
+    with torch.no_grad():
+        for param in model.parameters():
+            param.fill_(0.1)
+    return model
+
+
+@pytest.fixture
+def temp_pte_file(tmp_path):
+    """Return a temporary path for PTE file."""
+    return tmp_path / "test_model.pte"
+
+
+@pytest.fixture
+def exported_pte_buffer(simple_model):
+    """Export simple model and return the PTE buffer.
+    
+    This fixture uses the XNNPACK backend to export a model.
+    """
+    try:
+        from diffulex_edge.backends import XNNPACKBackend, BackendConfig
+        
+        backend = XNNPACKBackend(BackendConfig(quantize=False))
+        
+        if not backend.is_available():
+            pytest.skip("XNNPACK backend not available")
+        
+        # Create example inputs
+        example_inputs = (torch.randint(0, 1000, (1, 10)),)
+        
+        # Export model
+        result = backend.export(simple_model, example_inputs)
+        
+        if not result.success:
+            pytest.skip(f"Export failed: {result.error_message}")
+        
+        return result.buffer
+        
+    except ImportError as e:
+        pytest.skip(f"Backend not available: {e}")
+
+
+@pytest.fixture
+def exported_pte_file(tmp_path, simple_model):
+    """Export simple model to a temporary PTE file."""
+    try:
+        from diffulex_edge.backends import XNNPACKBackend, BackendConfig
+        
+        backend = XNNPACKBackend(BackendConfig(quantize=False))
+        
+        if not backend.is_available():
+            pytest.skip("XNNPACK backend not available")
+        
+        # Create example inputs
+        example_inputs = (torch.randint(0, 1000, (1, 10)),)
+        
+        # Export model
+        result = backend.export(simple_model, example_inputs)
+        
+        if not result.success:
+            pytest.skip(f"Export failed: {result.error_message}")
+        
+        # Save to file
+        pte_path = tmp_path / "test_model.pte"
+        with open(pte_path, "wb") as f:
+            f.write(result.buffer)
+        
+        return pte_path
+        
+    except ImportError as e:
+        pytest.skip(f"Backend not available: {e}")
+
+
+@pytest.fixture
+def mock_pte_module(simple_model):
+    """Return a mock ExecuTorch module wrapping a simple model."""
+    return MockExecuTorchModule(simple_model)
+
+
+# ============================================================================
 # Pytest Configuration
 # ============================================================================
 

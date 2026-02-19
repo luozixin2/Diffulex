@@ -1,232 +1,208 @@
 #!/usr/bin/env python3
-"""Command-line tool to export DiffuLex models to ExecuTorch format.
+"""Export DiffuLex models to ExecuTorch .pte format.
 
-Usage:
-    python -m diffulex_edge.scripts.export_model \
-        --output model.pte \
-        --hidden-size 512 \
-        --num-layers 4 \
-        --quantization dynamic_int8
+Examples:
+    # Export from HuggingFace safetensors (recommended)
+    python export_model.py /path/to/sdar-1.7b -o model.pte
+    
+    # Export with specific backend and quantization
+    python export_model.py /path/to/model --backend xnnpack --quantization fp16 -o model.pte
+    
+    # Export a demo model for testing
+    python export_model.py --demo --model-type fast_dllm_v2 -o demo.pte
 """
 
 import argparse
-import dataclasses
 import sys
 from pathlib import Path
+
+import torch
 
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-import torch
-
-from diffulex_edge.model.fast_dllm_v2_edge import FastdLLMV2Edge, FastdLLMV2EdgeConfig
 from diffulex_edge.export import ExportConfig, BackendType, QuantizationType, DiffuLexExporter
+from diffulex_edge.model import load_hf_model, MODEL_REGISTRY
 
 
-def parse_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(
-        description="Export DiffuLex model to ExecuTorch .pte format"
+def create_demo_model(model_type: str):
+    """Create a demo model for testing."""
+    from diffulex_edge.model import (
+        FastdLLMV2EdgeConfig, FastdLLMV2Edge,
+        DreamEdgeConfig, DreamEdge,
+        LLaDAEdgeConfig, LLaDAEdge,
+        SDAREdgeConfig, SDAREdge,
+    )
+
+    configs = {
+        "fast_dllm_v2": (FastdLLMV2EdgeConfig, FastdLLMV2Edge, {
+            "vocab_size": 32000, "hidden_size": 768, "num_hidden_layers": 12,
+            "num_attention_heads": 12, "intermediate_size": 2048,
+            "max_position_embeddings": 2048,
+        }),
+        "dream": (DreamEdgeConfig, DreamEdge, {
+            "vocab_size": 32000, "hidden_size": 768, "num_hidden_layers": 12,
+            "num_attention_heads": 12, "intermediate_size": 2048,
+            "max_position_embeddings": 2048,
+        }),
+        "llada": (LLaDAEdgeConfig, LLaDAEdge, {
+            "vocab_size": 126464, "hidden_size": 768, "num_hidden_layers": 12,
+            "num_attention_heads": 12, "intermediate_size": 2048,
+            "max_position_embeddings": 2048, "mask_token_id": 126336,
+        }),
+        "sdar": (SDAREdgeConfig, SDAREdge, {
+            "vocab_size": 151936, "hidden_size": 2048, "num_hidden_layers": 28,
+            "num_attention_heads": 16, "num_key_value_heads": 8,
+            "intermediate_size": 6144, "max_position_embeddings": 4096,
+        }),
+    }
+
+    if model_type not in configs:
+        raise ValueError(f"Unknown model type: {model_type}")
+
+    config_class, model_class, config_dict = configs[model_type]
+    config = config_class(**config_dict)
+    model = model_class(config)
+    return model, config
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Export DiffuLex models to ExecuTorch")
+    
+    # Model source
+    parser.add_argument(
+        "model_path",
+        nargs="?",
+        help="Path to HuggingFace model directory (with config.json and .safetensors)",
+    )
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Export a demo model instead of loading from HF",
+    )
+    parser.add_argument(
+        "--model-type",
+        choices=["fast_dllm_v2", "dream", "llada", "sdar"],
+        help="Model type for demo export",
     )
     
-    # Model configuration
+    # Output
     parser.add_argument(
-        "--output", "-o",
+        "-o", "--output",
         type=str,
-        default="model.pte",
-        help="Output path for .pte file"
-    )
-    parser.add_argument(
-        "--hidden-size",
-        type=int,
-        default=512,
-        help="Hidden dimension size"
-    )
-    parser.add_argument(
-        "--num-layers",
-        type=int,
-        default=4,
-        help="Number of transformer layers"
-    )
-    parser.add_argument(
-        "--num-heads",
-        type=int,
-        default=8,
-        help="Number of attention heads"
-    )
-    parser.add_argument(
-        "--num-kv-heads",
-        type=int,
-        default=None,
-        help="Number of KV heads (for GQA, defaults to num-heads)"
-    )
-    parser.add_argument(
-        "--intermediate-size",
-        type=int,
-        default=None,
-        help="FFN intermediate dimension (default: 4 * hidden-size)"
-    )
-    parser.add_argument(
-        "--vocab-size",
-        type=int,
-        default=32000,
-        help="Vocabulary size"
-    )
-    parser.add_argument(
-        "--max-seq-len",
-        type=int,
-        default=2048,
-        help="Maximum sequence length"
-    )
-    parser.add_argument(
-        "--head-dim",
-        type=int,
-        default=None,
-        help="Attention head dimension (default: hidden-size // num-heads)"
+        required=True,
+        help="Output .pte file path",
     )
     
     # Export options
     parser.add_argument(
         "--backend",
-        type=str,
-        default="reference",
-        choices=["reference", "xnnpack", "coreml", "qnn", "mps"],
-        help="Target backend"
+        choices=["reference", "xnnpack", "coreml", "qnn"],
+        default="xnnpack",
+        help="Target backend (default: xnnpack)",
     )
     parser.add_argument(
-        "--quantization", "-q",
-        type=str,
-        default="none",
-        choices=["none", "dynamic_int8", "static_int8", "weight_only_int8", "fp16"],
-        help="Quantization type"
-    )
-    parser.add_argument(
-        "--no-kv-cache",
-        action="store_true",
-        help="Disable KV cache"
-    )
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default=None,
-        help="Path to checkpoint file to load"
-    )
-    parser.add_argument(
-        "--calibration-data",
-        type=str,
-        default=None,
-        help="Path to calibration data (for static quantization)"
-    )
-    
-    # Input configuration
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=1,
-        help="Batch size for example inputs"
+        "--quantization",
+        choices=["none", "fp16", "dynamic_int8"],
+        default="fp16",
+        help="Quantization type (default: fp16)",
     )
     parser.add_argument(
         "--seq-len",
         type=int,
-        default=32,
-        help="Sequence length for example inputs"
+        default=128,
+        help="Sequence length for example inputs (default: 128)",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Batch size for example inputs (default: 1)",
+    )
+    parser.add_argument(
+        "--max-seq-len",
+        type=int,
+        default=2048,
+        help="Maximum sequence length for KV cache (default: 2048)",
     )
     
-    return parser.parse_args()
-
-
-def main():
-    """Main export function."""
-    args = parse_args()
+    args = parser.parse_args()
+    
+    if not args.demo and not args.model_path:
+        parser.error("Must specify either --demo or model_path")
+    
+    if args.demo and not args.model_type:
+        parser.error("Must specify --model-type when using --demo")
+    
+    output_path = Path(args.output).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     
     print("=" * 60)
-    print("DiffuLex Edge Model Export")
+    print("DiffuLex ExecuTorch Export")
     print("=" * 60)
     
-    # Create model config
-    model_config = FastdLLMV2EdgeConfig(
-        vocab_size=args.vocab_size,
-        hidden_size=args.hidden_size,
-        num_layers=args.num_layers,
-        num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads or args.num_heads,
-        head_dim=args.head_dim or (args.hidden_size // args.num_heads),
-        intermediate_size=args.intermediate_size or (4 * args.hidden_size),
+    # Load or create model
+    if args.demo:
+        print(f"\n[1/3] Creating demo model: {args.model_type}")
+        model, config = create_demo_model(args.model_type)
+        print(f"      Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
+    else:
+        model_path = Path(args.model_path)
+        
+        print(f"\n[1/3] Loading model from: {model_path}")
+        
+        dtype = torch.float32 if args.quantization == "none" else torch.float16
+        
+        try:
+            model, model_type, hf_config = load_hf_model(str(model_path), dtype=dtype)
+            
+            # Create a simple config object for vocab_size access
+            class SimpleConfig:
+                def __init__(self, vocab_size):
+                    self.vocab_size = vocab_size
+            
+            config = SimpleConfig(hf_config.get("vocab_size", 32000))
+            print(f"      Type: {model_type}")
+            print(f"      Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
+        except Exception as e:
+            print(f"Error: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+    
+    # Prepare export
+    print(f"\n[2/3] Configuring export:")
+    print(f"      Backend: {args.backend}")
+    print(f"      Quantization: {args.quantization}")
+    print(f"      Output: {output_path}")
+    
+    vocab_size = config.vocab_size
+    example_inputs = (torch.randint(0, vocab_size, (args.batch_size, args.seq_len)),)
+    
+    export_config = ExportConfig(
+        output_path=output_path,
+        backend=BackendType(args.backend),
+        quantization=QuantizationType(args.quantization),
+        memory_planning="greedy",
         max_seq_len=args.max_seq_len,
     )
     
-    print(f"\nModel Configuration:")
-    print(f"  Hidden size: {model_config.hidden_size}")
-    print(f"  Layers: {model_config.num_layers}")
-    print(f"  Heads: {model_config.num_heads}")
-    print(f"  KV Heads: {model_config.num_kv_heads}")
-    print(f"  Vocab size: {model_config.vocab_size}")
-    print(f"  Max seq len: {model_config.max_seq_len}")
-    
-    # Create export config
-    export_config = ExportConfig(
-        output_path=Path(args.output),
-        backend=BackendType(args.backend),
-        quantization=QuantizationType(args.quantization),
-        use_kv_cache=not args.no_kv_cache,
-        checkpoint_path=Path(args.checkpoint) if args.checkpoint else None,
-        calibration_data_path=Path(args.calibration_data) if args.calibration_data else None,
-        **dataclasses.asdict(model_config),
-    )
-    
-    print(f"\nExport Configuration:")
-    print(f"  Output: {export_config.output_path}")
-    print(f"  Backend: {export_config.backend.value}")
-    print(f"  Quantization: {export_config.quantization.value}")
-    print(f"  KV Cache: {export_config.use_kv_cache}")
-    
-    # Create model
-    print(f"\nCreating model...")
-    model = FastdLLMV2Edge(model_config)
-    
-    # Count parameters
-    num_params = sum(p.numel() for p in model.parameters())
-    print(f"  Parameters: {num_params:,} ({num_params / 1e6:.2f}M)")
-    
-    # Create example inputs
-    print(f"\nPreparing example inputs (batch={args.batch_size}, seq={args.seq_len})...")
-    input_ids = torch.randint(0, args.vocab_size, (args.batch_size, args.seq_len))
-    positions = torch.arange(args.seq_len).unsqueeze(0).expand(args.batch_size, -1)
-    
-    if export_config.use_kv_cache:
-        # Create KV cache for example
-        kv_cache = torch.zeros(
-            model_config.num_layers, 2, args.batch_size,
-            model_config.num_kv_heads, model_config.max_seq_len, model_config.head_dim
-        )
-        example_inputs = (input_ids, positions, None, kv_cache, 0)
-    else:
-        example_inputs = (input_ids, positions, None, None, 0)
-    
     # Export
-    print(f"\nStarting export...")
+    print(f"\n[3/3] Exporting to ExecuTorch...")
     exporter = DiffuLexExporter(export_config)
     result = exporter.export(model, example_inputs)
     
-    # Print result
-    print("\n" + "=" * 60)
     if result.success:
-        print("Export Successful!")
-        print(f"  Output: {result.output_path}")
-        print(f"  File size: {result.file_size_mb:.2f} MB")
-        print(f"  Time: {result.compilation_time_sec:.2f}s")
-        
-        # Calculate compression
-        param_size_mb = num_params * 4 / (1024 * 1024)  # FP32
-        print(f"  Compression ratio: {param_size_mb / result.file_size_mb:.2f}x")
+        print(f"\n      Success!")
+        print(f"      File: {result.output_path}")
+        print(f"      Size: {result.file_size_mb:.2f} MB")
+        print(f"      Time: {result.compilation_time_sec:.2f}s")
     else:
-        print("Export Failed!")
-        print(f"  Error: {result.error_message}")
-        return 1
+        print(f"\n      Failed: {result.error_message}")
+        sys.exit(1)
     
-    print("=" * 60)
-    return 0
+    print("\n" + "=" * 60)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

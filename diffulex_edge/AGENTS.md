@@ -1,200 +1,138 @@
 # DiffuLex Edge - Agent Guide
 
-This guide provides essential information for AI agents working on the DiffuLex Edge project.
+AI Agent 工作指南 for DiffuLex Edge project.
 
-## Quick Navigation
+## 快速导航
 
-| Document | Purpose |
-|----------|---------|
-| [README.md](README.md) | Project overview, quick start, features |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Technical implementation details |
-| [TEST_PLAN.md](TEST_PLAN.md) | Testing strategy and running tests |
+| 文档 | 用途 |
+|------|------|
+| [README.md](README.md) | 项目概览、快速开始 |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 技术架构详情 |
+| [docs/TEST_PLAN.md](docs/TEST_PLAN.md) | 测试策略 |
+| [docs/EXPORT.md](docs/EXPORT.md) | 模型导出指南 |
 
-## Project Structure
+## 项目结构
 
 ```
 diffulex_edge/
-├── README.md              # Main documentation
-├── ARCHITECTURE.md        # Technical architecture
-├── TEST_PLAN.md           # Testing documentation
-├── AGENTS.md             # This file
-├── __init__.py           # Package init
-├── model/                # Model implementations
-│   ├── fast_dllm_v2_edge.py
-│   └── kv_cache.py
-├── runtime/              # Inference runtime
-│   ├── engine.py
-│   ├── sampler.py
-│   └── diffusion.py      # Diffusion sampling
-├── quant/                # Quantization
-│   ├── quantizer.py
-│   └── observers.py
-├── export/               # Model export
-│   ├── exporter.py
-│   ├── config.py
-│   └── model_exporter.py
-├── backends/             # Backend implementations
-│   ├── base.py
-│   ├── xnnpack_backend.py
-│   ├── qnn_backend.py
-│   └── coreml_backend.py
-├── scripts/              # CLI tools
-│   └── export_model.py
-└── tests/                # Test suite
-    ├── test_*.py
-    └── integration/
+├── model/                    # 模型实现
+│   ├── fast_dllm_v2_edge.py  # FastdLLM V2
+│   ├── dream_edge.py         # Dream
+│   ├── llada_edge.py         # LLaDA
+│   ├── sdar_edge.py          # SDAR
+│   └── model_loader.py       # HF模型加载
+├── runtime/                  # 推理运行时
+│   ├── engine.py             # InferenceEngine (自回归)
+│   ├── diffusion.py          # DiffusionEngine (扩散)
+│   ├── block.py              # DiffusionBlock管理
+│   └── sampler/              # 采样器
+│       ├── base.py           # 基础采样函数
+│       ├── shift.py          # Logits偏移
+│       └── models/           # 模型特有采样器
+├── export/                   # 模型导出
+│   ├── exporter.py           # DiffuLexExporter
+│   └── config.py             # 导出配置
+├── backends/                 # 后端实现
+│   ├── xnnpack_backend.py    # XNNPACK (CPU)
+│   ├── coreml_backend.py     # CoreML (Apple)
+│   └── qnn_backend.py        # QNN (Qualcomm)
+└── scripts/
+    └── export_model.py       # 导出脚本
 ```
 
-## Key Implementation Notes
+## 关键设计原则
 
-### 1. Model Architecture
+### 1. 采样器对齐 (已完成)
 
-- **FastdLLMV2Edge**: Simplified model without tensor parallel
-- Uses `F.scaled_dot_product_attention` instead of custom CUDA kernels
-- Static KV cache with input/output mode for ExecuTorch compatibility
+四个模型各自有独立的采样器实现，与原版 diffulex 行为对齐：
 
-### 2. Diffusion Sampling (Phase 6+)
+| 模型 | Shift Logits | Per-block Threshold | pre_block_complete |
+|------|-------------|---------------------|-------------------|
+| FastdLLM V2 | ✅ | ❌ | ❌ |
+| LLaDA | ❌ | ✅ | ✅ |
+| Dream | ✅ | ✅ | ✅ |
+| SDAR | ✅ | ❌ | ❌ |
 
-Core files:
-- `runtime/diffusion.py` - DiffusionSampler, DiffusionBlockManager
+核心文件：
+- `runtime/sampler/base.py`: `sample_tokens`, `top_p_logits`, `top_k_logits`
+- `runtime/sampler/shift.py`: `ShiftLogitsSampler`, `NoShiftLogitsSampler`
+- `runtime/sampler/models/`: 四个模型各自的采样器
 
-Key concepts:
-- Diffusion blocks divide sequence into chunks
-- Shift logits operation for dependency handling
-- Confidence-based token acceptance (threshold 0.95)
-- Iterative denoising process
+### 2. 模型导出流程
 
-### 3. Multi-Model Support (Phase 7+)
+```python
+# 从HuggingFace加载并导出
+from diffulex_edge.model import load_hf_model
+from diffulex_edge.export import DiffuLexExporter, ExportConfig
 
-Core files:
-- `export/model_exporter.py` - ModelExporterFactory, per-model exporters
+model, model_type, hf_config = load_hf_model("path/to/hf/model", dtype=torch.bfloat16)
 
-Supported models:
-- FastdLLM V2
-- Dream
-- LLaDA
-- SDAR
+export_config = ExportConfig(
+    output_path="model.pte",
+    backend="xnnpack",
+    dtype=torch.bfloat16,
+)
 
-### 4. Backend System
+exporter = DiffuLexExporter(export_config)
+example_inputs = (torch.zeros(1, 128, dtype=torch.long),)  # input_ids
+result = exporter.export(model, example_inputs)
+```
 
-All backends inherit from `EdgeBackend` base class:
-- XNNPACKBackend - Generic CPU
-- QNNBackend - Qualcomm NPU
-- CoreMLBackend - Apple Neural Engine
+### 3. 推理引擎
 
-### 5. Testing
+两种引擎，API一致：
 
-**Always run tests before submitting changes:**
+```python
+# 自回归生成
+from diffulex_edge.runtime import InferenceEngine, GenerationConfig
+engine = InferenceEngine.from_pte("model.pte")
+tokens = engine.generate(prompt, GenerationConfig(max_new_tokens=100))
+
+# 扩散生成
+from diffulex_edge.runtime import DiffusionEngine, DiffusionGenerationConfig
+engine = DiffusionEngine.from_pte("model.pte", model_type="fast_dllm_v2")
+tokens = engine.generate(prompt, DiffusionGenerationConfig(max_new_tokens=100))
+```
+
+## 常用任务
+
+### 添加新模型支持
+
+1. 创建 `model/{model_name}_edge.py`
+2. 创建 `runtime/sampler/models/{model_name}.py`
+3. 添加到 `runtime/sampler/models/__init__.py` 的 `SAMPLER_REGISTRY`
+4. 添加到 `model/model_loader.py` 的 `MODEL_REGISTRY`
+5. 添加测试到 `tests/test_multi_model_support.py`
+
+### 运行测试
 
 ```bash
-# Quick sanity check
-pytest diffulex_edge/tests/test_diffusion_blocks.py -v
+# 全部测试
+pytest diffulex_edge/tests/ -v
 
-# Full test suite
-pytest diffulex_edge/tests/ -v --tb=short
+# 特定模块
+pytest diffulex_edge/tests/test_sampler_alignment.py -v
+pytest diffulex_edge/tests/test_diffusion_pte.py -v
 
-# With coverage
+# 覆盖率
 pytest --cov=diffulex_edge --cov-report=html
 ```
 
-**Current test count**: 167+ tests passing
+## 平台限制
 
-## Common Tasks
+- **Windows**: 无法生成 .pte 文件 (缺少 flatc)，可用 WSL2
+- **CoreML**: 仅 macOS/iOS
+- **QNN**: 仅 Linux/Android
 
-### Adding a New Model
-
-1. Create model class in `model/{model_name}_edge.py`
-2. Create sampler in `runtime/diffusion.py` or separate file
-3. Add exporter in `export/model_exporter.py`
-4. Register in `ModelExporterFactory`
-5. Add tests in `tests/test_multi_model_support.py`
-
-### Adding a New Backend
-
-1. Create backend class in `backends/{name}_backend.py`
-2. Inherit from `EdgeBackend`
-3. Implement `export()` and `load()` methods
-4. Register in `BackendRegistry`
-5. Add tests in `tests/test_backends.py`
-
-### Modifying Diffusion Sampler
-
-1. Edit `runtime/diffusion.py`
-2. Ensure `shift_logits()` maintains numerical precision
-3. Update `compute_confidence()` for new confidence methods
-4. Run diffusion tests:
-   ```bash
-   pytest diffulex_edge/tests/test_diffusion_*.py -v
-   ```
-
-## Code Style
-
-- Follow PEP 8
-- Use type hints
-- Add docstrings for public methods
-- Keep functions focused and small
-
-## Platform Considerations
-
-**Windows Development**:
-- Can develop and test up to Edge IR stage
-- Cannot generate .pte files (flatc not available)
-- Use WSL2 or remote Linux for full export testing
-
-**Linux/macOS**:
-- Full development environment
-- Can generate .pte files
-- Required for backend testing (QNN on Linux, CoreML on macOS)
-
-## Dependencies
-
-Core:
-- torch >= 2.3.0
-- numpy >= 1.24.0
-
-Optional:
-- executorch >= 0.3.0 (for .pte export)
-- transformers >= 4.40.0 (for tokenizer)
-
-Backend-specific:
-- executorch[xnnpack]
-- executorch[qnn]
-- executorch[coreml]
-
-## Troubleshooting
-
-### Import Errors
+## 依赖
 
 ```bash
-# Ensure package is installed in editable mode
-pip install -e .
-```
+# 核心
+pip install torch numpy
 
-### ExecuTorch Not Available
-
-```bash
-# Install ExecuTorch
+# 导出
 pip install executorch
 
-# Or run without export tests
-pytest diffulex_edge/tests/ -v --ignore=diffulex_edge/tests/test_export.py
+# 完整
+pip install -e .
 ```
-
-### Test Failures
-
-1. Check Python version (3.10+ recommended)
-2. Update dependencies: `pip install -e . -U`
-3. Run with verbose output: `pytest -vvv`
-
-## Resources
-
-- [ExecuTorch Documentation](https://pytorch.org/executorch/)
-- [ExecuTorch LLM Example](https://github.com/pytorch/executorch/tree/main/examples/models/llama)
-- Main project: See root README.md
-
-## Contact
-
-For questions about the codebase, refer to:
-- Architecture questions → ARCHITECTURE.md
-- Testing questions → TEST_PLAN.md
-- General usage → README.md

@@ -296,6 +296,10 @@ class DiffuLexExporter:
             # Step 2: Apply quantization (if before export)
             if self.config.quantization == QuantizationType.STATIC_INT8:
                 pass  # Will be handled in Step 5
+            elif self.config.quantization == QuantizationType.DYNAMIC_INT8:
+                # Dynamic quantization uses eager mode which is not compatible with torch.export
+                # Apply it here so it will fail during export with a helpful message
+                model = self._apply_quantization(model, example_inputs)
             elif self.config.quantization == QuantizationType.FP16:
                 model = model.half()
             
