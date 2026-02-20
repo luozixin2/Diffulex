@@ -106,13 +106,62 @@ class XNNPACKBackend(EdgeBackend):
             # 2. 导出为 ExportedProgram
             logger.info("Exporting to ExportedProgram...")
             
+            # Check if model has forward_export method (SDAREdge style)
+            # If so, wrap it so export uses forward_export instead of forward
+            if hasattr(model, 'forward_export'):
+                logger.info("Detected forward_export method, wrapping for export...")
+                
+                # Wrapper for SDAREdge forward_export with Block Diffusion masks
+                class SDAREdgeExportWrapper(torch.nn.Module):
+                    """Wrapper that exposes forward_export as forward for ExecuTorch export.
+                    
+                    Input/Output format matches forward_export:
+                    - input_ids: [batch, block_size]
+                    - positions: [batch, block_size]  
+                    - kv_cache: [num_layers, 2, batch, num_kv_heads, max_len, head_dim]
+                    - attention_mask: [num_layers, batch, 1, block_size, max_len + block_size]
+                    - insert_matrix: [num_layers, batch, 1, max_len, block_size]
+                    - keep_mask: [num_layers, batch, 1, max_len, 1]
+                    
+                    Returns:
+                    - logits: [batch, block_size, vocab_size]
+                    - updated_kv_cache: same shape as input kv_cache
+                    """
+                    def __init__(self, inner_model):
+                        super().__init__()
+                        self.inner = inner_model
+                        # Register all parameters from inner model with sanitized names
+                        # ExecuTorch doesn't allow '.' in parameter names
+                        self._param_map = {}  # Maps sanitized name -> original name
+                        for name, param in inner_model.named_parameters():
+                            safe_name = name.replace('.', '_')
+                            self._param_map[safe_name] = name
+                            self.register_parameter(safe_name, param)
+                    
+                    def forward(self, input_ids, positions, kv_cache, attention_mask, 
+                               insert_matrix, keep_mask):
+                        """Static forward for ExecuTorch export."""
+                        return self.inner.forward_export(
+                            input_ids, positions, kv_cache,
+                            attention_mask, insert_matrix, keep_mask
+                        )
+                    
+                    @property
+                    def config(self):
+                        return self.inner.config
+                
+                wrapped_model = SDAREdgeExportWrapper(model)
+                export_model = wrapped_model
+            else:
+                export_model = model
+            
             # 处理输入格式
             if isinstance(example_inputs, dict):
-                ep = export(model, (), example_inputs)
+                ep = export(export_model, (), example_inputs)
             else:
                 if not isinstance(example_inputs, tuple):
                     example_inputs = (example_inputs,)
-                ep = export(model, example_inputs)
+                ep = export(export_model, example_inputs)
             
             logger.info("ExportedProgram created successfully")
             

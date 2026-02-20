@@ -180,8 +180,8 @@ def main():
     
     # Check if model uses forward_export (SDAREdge style with KV cache)
     if hasattr(model, 'forward_export'):
-        # SDAREdge style: forward_export(input_ids, positions, kv_cache)
-        print(f"      Detected forward_export method, using 3-input format")
+        # SDAREdge style: forward_export(input_ids, positions, kv_cache, attention_mask, insert_matrix, keep_mask)
+        print(f"      Detected forward_export method, using Block Diffusion mask format")
         
         # Get config from model
         model_config = model.config
@@ -192,14 +192,28 @@ def main():
         head_dim = getattr(model_config, 'head_dim', None) or (model_config.hidden_size // model_config.num_attention_heads)
         num_layers = model_config.num_hidden_layers
         
-        # Create example inputs for forward_export
+        # Create example inputs for forward_export (Block Diffusion format)
         input_ids = torch.zeros(batch_size, block_size, dtype=torch.long)
         positions = torch.arange(block_size, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
         kv_cache = torch.zeros(num_layers, 2, batch_size, num_kv_heads, max_seq_len, head_dim, dtype=torch.float32)
-        cache_len = torch.tensor(0, dtype=torch.long)  # Scalar tensor for cache length
         
-        example_inputs = (input_ids, positions, kv_cache, cache_len)
-        print(f"      Input shapes: input_ids={input_ids.shape}, positions={positions.shape}, kv_cache={kv_cache.shape}, cache_len=scalar(0)")
+        # Block Diffusion masks (for empty cache, valid_cache_len=0)
+        # attention_mask: [num_layers, batch, 1, block_size, max_len + block_size]
+        attention_mask = torch.zeros(num_layers, batch_size, 1, block_size, max_seq_len + block_size, dtype=torch.float32)
+        attention_mask[:, :, :, :, 0:max_seq_len] = -10000.0  # All cache positions invalid
+        
+        # insert_matrix: [num_layers, batch, 1, max_len, block_size]
+        insert_matrix = torch.zeros(num_layers, batch_size, 1, max_seq_len, block_size, dtype=torch.float32)
+        for i in range(block_size):
+            insert_matrix[:, :, :, i, i] = 1.0  # block[i] -> cache[i]
+        
+        # keep_mask: [num_layers, batch, 1, max_len, 1]
+        keep_mask = torch.ones(num_layers, batch_size, 1, max_seq_len, 1, dtype=torch.float32)
+        keep_mask[:, :, :, 0:block_size, :] = 0.0  # Overwrite positions [0:block_size]
+        
+        example_inputs = (input_ids, positions, kv_cache, attention_mask, insert_matrix, keep_mask)
+        print(f"      Input shapes: input_ids={input_ids.shape}, positions={positions.shape}, kv_cache={kv_cache.shape}")
+        print(f"      Mask shapes: attention_mask={attention_mask.shape}, insert_matrix={insert_matrix.shape}, keep_mask={keep_mask.shape}")
     else:
         # Standard format: forward(input_ids)
         example_inputs = (torch.randint(0, vocab_size, (args.batch_size, args.seq_len)),)
