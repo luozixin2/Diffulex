@@ -16,13 +16,15 @@ import os
 # Add parent directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from runtime.diffusion import (
+from diffulex_edge.runtime.diffusion import (
     DiffusionBlock,
     DiffusionBlockManager,
     DiffusionSampler,
+    SampleOutput,
+)
+from diffulex_edge.runtime.engine import (
     DiffusionEngine,
     DiffusionGenerationConfig,
-    SampleOutput,
 )
 
 

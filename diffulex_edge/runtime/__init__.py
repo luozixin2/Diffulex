@@ -1,49 +1,60 @@
 """Runtime module for DiffuLex Edge.
 
-Provides inference engines for running exported models.
+Provides inference engines and samplers for running exported models.
 
-Two main engines are available:
-- InferenceEngine: Autoregressive generation engine (PyTorch + PTE)
-- DiffusionEngine: Diffusion-based generation engine (PyTorch + PTE)
+Two main engine types are available:
+- DiffusionEngine: For diffusion-based generation (supports both PyTorch and PTE)
+- InferenceEngine: Alias for DiffusionEngine (backward compatibility)
 
 Usage:
-    # PyTorch model
-    engine = InferenceEngine.from_model(model)
-    # or
-    engine = DiffusionEngine.from_model(model)
+    # PyTorch model with KV cache
+    from diffulex_edge.runtime import DiffusionEngine
+    engine = DiffusionEngine.from_model(model, model_type="sdar")
+    tokens = engine.generate(prompt_tokens)
     
     # ExecuTorch PTE model
-    engine = InferenceEngine.from_pte("model.pte")
-    # or
-    engine = DiffusionEngine.from_pte("model.pte")
+    engine = DiffusionEngine.from_pte("model.pte", model_type="sdar", max_seq_len=2048)
+    tokens = engine.generate(prompt_tokens)
+    
+    # Token-level sampling (autoregressive)
+    from diffulex_edge.runtime.sampler import GreedySampler, TopKSampler
+    
+    # Block-level sampling (diffusion)
+    from diffulex_edge.runtime.sampler import SDARSampler, FastdLLMV2Sampler
 """
 
-from .engine import InferenceEngine, GenerationConfig
-from .sampler import Sampler, GreedySampler, TopKSampler, TopPSampler
-from .diffusion import (
-    DiffusionBlock,
-    DiffusionBlockManager,
-    DiffusionSampler,
+# Engine (unified - from engine.py)
+from diffulex_edge.runtime.engine import (
     DiffusionEngine,
     DiffusionGenerationConfig,
+    InferenceEngine,  # Backward compatibility alias
+    GenerationConfig,  # Backward compatibility alias
+)
+
+# Block management (from block.py)
+from diffulex_edge.runtime.block import (
+    DiffusionBlock,
+    DiffusionBlockManager,
+    BlockStatus,
+)
+
+# Additional diffusion components (from diffusion.py)
+from diffulex_edge.runtime.diffusion import (
     SampleOutput,
+    DiffusionSampler,
 )
 
 __all__ = [
-    # Inference engines
-    "InferenceEngine",
+    # Engines
     "DiffusionEngine",
-    # Configurations
-    "GenerationConfig",
+    "InferenceEngine",  # Alias for backward compatibility
     "DiffusionGenerationConfig",
-    # Samplers
-    "Sampler",
-    "GreedySampler",
-    "TopKSampler",
-    "TopPSampler",
-    # Diffusion components
+    "GenerationConfig",  # Alias for backward compatibility
+    # Block management
     "DiffusionBlock",
     "DiffusionBlockManager",
-    "DiffusionSampler",
+    "BlockStatus",
+    # Diffusion components
     "SampleOutput",
+    "DiffusionSampler",
 ]

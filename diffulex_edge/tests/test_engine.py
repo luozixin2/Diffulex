@@ -4,8 +4,7 @@ import pytest
 import torch
 
 from diffulex_edge.model.fast_dllm_v2_edge import FastdLLMV2Edge, FastdLLMV2EdgeConfig
-from diffulex_edge.runtime import InferenceEngine, GenerationConfig
-from diffulex_edge.runtime.sampler import GreedySampler, TopKSampler, TopPSampler
+from diffulex_edge.runtime import DiffusionEngine, DiffusionGenerationConfig
 
 
 class TestSamplers:

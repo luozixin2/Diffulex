@@ -12,12 +12,11 @@ from typing import Tuple
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from runtime.diffusion import (
+from diffulex_edge.runtime.diffusion import (
     DiffusionEngine, DiffusionGenerationConfig,
     DiffusionSampler, DiffusionBlockManager
 )
-from runtime.engine import InferenceEngine, GenerationConfig
-from runtime.sampler import GreedySampler, TopKSampler, TopPSampler
+from diffulex_edge.runtime.engine import DiffusionEngine, DiffusionGenerationConfig
 
 
 class SimpleTestModel(nn.Module):

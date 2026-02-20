@@ -138,6 +138,7 @@ def create_edge_config(model_type: str, hf_config: Dict[str, Any]) -> Any:
             rope_theta=hf_config.get("rope_theta", 1000000.0),
             attention_bias=hf_config.get("attention_bias", False),
             head_dim=hf_config.get("head_dim", 128),
+            diffusion_block_size=hf_config.get("diffusion_block_size", 4),  # SDAR default is 4
         )
     else:
         raise ValueError(f"Unknown model type: {model_type}")

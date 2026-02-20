@@ -1,253 +1,205 @@
-"""Diffusion block management for dLLM models.
+"""Simplified diffusion block management - block confirmation mechanism.
 
-Aligned with diffulex block concepts including:
-- Per-block accept_threshold (for LLaDA/Dream)
-- pre_block_complete tracking (for LLaDA/Dream)
+Align with autoregressive pattern:
+- Autoregressive: generate 1 token → confirm → next
+- Block Diffusion: generate N tokens → confirm all → next N
+
+This is simpler than original diffulex's KV-cache approach but achieves
+the same "block-by-block" generation semantics.
 """
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+from enum import Enum
+
+
+class BlockStatus(Enum):
+    """Block status in confirmation mechanism."""
+    PENDING = "pending"      # Future block, all masks
+    ACTIVE = "active"        # Current block being generated
+    CONFIRMED = "confirmed"  # Block confirmed, tokens fixed
 
 
 @dataclass
 class DiffusionBlock:
-    """
-    Represents a block of tokens in diffusion generation.
+    """Simplified block - just tracks tokens and confirmation status.
     
-    Aligned with diffulex block concepts:
-    - Tracks mask positions and accepted tokens
-    - Supports per-block accept_threshold
-    - Tracks pre_block_complete status
-    
-    Attributes:
-        start_pos: Start position of this block in the sequence
-        length: Length of the block
-        mask_token_id: Token ID used for masking
-        is_active: Whether this block is still being processed
-        accepted_token_ids: Map from local position to accepted token ID
-        accept_threshold: Per-block confidence threshold (LLaDA/Dream)
-        pre_block_complete: Whether previous block is complete (LLaDA/Dream)
-        local_mask_tokens: Local mask status for each position
+    Unlike original diffulex's complex state machine (ACTIVE/TO_CACHE/IN_CACHE),
+    this uses a simple confirmation pattern similar to autoregressive generation.
     """
+    block_id: int
     start_pos: int
     length: int
+    status: BlockStatus = BlockStatus.PENDING
+    tokens: Dict[int, int] = field(default_factory=dict)  # local_pos -> token_id
     mask_token_id: int = 126336
-    is_active: bool = True
-    accepted_token_ids: Dict[int, int] = field(default_factory=dict)
-    accept_threshold: float = 0.95
-    pre_block_complete: bool = False
+    accept_threshold: float = 0.95  # Per-block threshold for LLaDA/Dream
     
     @property
-    def global_mask_token_ids(self) -> List[int]:
-        """Get global positions of tokens that are still masked.
-        
-        Align with: block.global_mask_token_ids in diffulex
+    def is_confirmed(self) -> bool:
+        """Check if all positions have confirmed tokens."""
+        return len(self.tokens) == self.length
+    
+    @property
+    def is_active(self) -> bool:
+        return self.status == BlockStatus.ACTIVE
+    
+    @property
+    def confirmed_count(self) -> int:
+        return len(self.tokens)
+    
+    def confirm_token(self, local_pos: int, token_id: int) -> bool:
+        """Confirm a token at local position.
         
         Returns:
-            List of global positions that haven't been accepted yet
-        """
-        return [
-            self.start_pos + i 
-            for i in range(self.length) 
-            if i not in self.accepted_token_ids
-        ]
-    
-    @property
-    def local_mask_tokens(self) -> List[bool]:
-        """Get local mask status for each position.
-        
-        Returns:
-            List of bool indicating whether each local position is masked
-        """
-        return [i not in self.accepted_token_ids for i in range(self.length)]
-    
-    @property
-    def is_complete(self) -> bool:
-        """Check if all tokens in this block have been accepted."""
-        return len(self.accepted_token_ids) == self.length
-    
-    def accept_token(self, local_pos: int, token_id: int) -> None:
-        """Accept a token at the given local position.
-        
-        Args:
-            local_pos: Position within the block (0 to length-1)
-            token_id: Token ID to accept
-            
-        Raises:
-            IndexError: If local_pos is out of range
-            ValueError: If token already accepted at this position
+            True if this was the last token needed to confirm the block
         """
         if local_pos < 0 or local_pos >= self.length:
-            raise IndexError(
-                f"Local position {local_pos} out of range [0, {self.length})"
-            )
-        if local_pos in self.accepted_token_ids:
-            raise ValueError(f"Token already accepted at position {local_pos}")
+            raise IndexError(f"Local position {local_pos} out of range [0, {self.length})")
         
-        self.accepted_token_ids[local_pos] = token_id
+        if local_pos not in self.tokens:
+            self.tokens[local_pos] = token_id
         
-        # Mark block as inactive if complete
-        if self.is_complete:
-            self.is_active = False
+        return self.is_confirmed
     
-    def get_global_pos(self, local_pos: int) -> int:
-        """Convert local position to global position.
-        
-        Args:
-            local_pos: Position within block (0 to length-1)
-            
-        Returns:
-            Global position in sequence
-        """
-        if local_pos < 0 or local_pos >= self.length:
-            raise IndexError(
-                f"Local position {local_pos} out of range [0, {self.length})"
-            )
-        return self.start_pos + local_pos
+    def get_global_mask_positions(self) -> List[int]:
+        """Get global positions that are still masked (not confirmed)."""
+        return [self.start_pos + i for i in range(self.length) if i not in self.tokens]
+    
+    def get_local_mask_positions(self) -> List[int]:
+        """Get local positions that are still masked."""
+        return [i for i in range(self.length) if i not in self.tokens]
+    
+    def get_sequence_tokens(self) -> List[int]:
+        """Get full sequence for this block (confirmed tokens or mask)."""
+        return [self.tokens.get(i, self.mask_token_id) for i in range(self.length)]
+    
+    def activate(self) -> None:
+        """Activate this block for generation."""
+        self.status = BlockStatus.ACTIVE
+    
+    def confirm(self) -> None:
+        """Mark block as confirmed (all tokens fixed)."""
+        if not self.is_confirmed:
+            raise ValueError("Cannot confirm block with unconfirmed tokens")
+        self.status = BlockStatus.CONFIRMED
 
 
 class DiffusionBlockManager:
-    """Manages multiple diffusion blocks during generation.
+    """Manages blocks with confirmation mechanism.
     
-    Handles creation, tracking, and lifecycle of diffusion blocks.
-    Also manages pre_block_complete status across blocks.
+    Similar to autoregressive's "generated tokens" list, but for blocks.
     """
     
     def __init__(self, mask_token_id: int = 126336):
-        """Initialize the block manager.
-        
-        Args:
-            mask_token_id: Token ID used for masking
-        """
         self.mask_token_id = mask_token_id
         self.blocks: List[DiffusionBlock] = []
-        self._block_id_counter = 0
+        self._current_block_idx: int = 0
     
-    def create_block(
-        self,
-        start_pos: int,
-        length: int,
-        accept_threshold: float = 0.95,
-    ) -> int:
-        """Create a new diffusion block.
+    def create_blocks(self, prompt_len: int, max_new_tokens: int, block_size: int, 
+                      accept_threshold: float = 0.95) -> None:
+        """Create all blocks for generation.
         
         Args:
-            start_pos: Start position in the sequence
-            length: Length of the block
-            accept_threshold: Per-block confidence threshold
-            
-        Returns:
-            Block ID for the created block
-            
-        Raises:
-            ValueError: If length <= 0 or start_pos < 0
+            prompt_len: Length of prompt (for calculating start positions)
+            max_new_tokens: Maximum tokens to generate
+            block_size: Size of each block
+            accept_threshold: Per-block threshold (for LLaDA/Dream)
         """
-        if length <= 0:
-            raise ValueError(f"Block length must be positive, got {length}")
-        if start_pos < 0:
-            raise ValueError(f"Start position must be non-negative, got {start_pos}")
+        self.blocks.clear()
+        self._current_block_idx = 0
         
-        block = DiffusionBlock(
-            start_pos=start_pos,
-            length=length,
-            mask_token_id=self.mask_token_id,
-            accept_threshold=accept_threshold,
-        )
+        num_blocks = (max_new_tokens + block_size - 1) // block_size
         
-        block_id = self._block_id_counter
-        self.blocks.append(block)
-        self._block_id_counter += 1
-        
-        # Update pre_block_complete for this block
-        self._update_pre_block_complete()
-        
-        return block_id
-    
-    def get_block(self, block_id: int) -> Optional[DiffusionBlock]:
-        """Get a block by ID.
-        
-        Args:
-            block_id: Block identifier
+        for i in range(num_blocks):
+            start_pos = prompt_len + i * block_size
+            remaining = max_new_tokens - i * block_size
+            length = min(block_size, remaining)
             
-        Returns:
-            The DiffusionBlock or None if not found
-        """
-        if block_id < 0 or block_id >= len(self.blocks):
-            return None
-        return self.blocks[block_id]
-    
-    def get_active_blocks(self) -> List[Tuple[int, DiffusionBlock]]:
-        """Get all active blocks with their IDs.
-        
-        Returns:
-            List of (block_id, block) tuples for active blocks
-        """
-        return [
-            (i, block) 
-            for i, block in enumerate(self.blocks) 
-            if block.is_active
-        ]
-    
-    def update_block(
-        self, 
-        block_id: int, 
-        accepted_positions: List[int], 
-        accepted_tokens: List[int]
-    ) -> None:
-        """Update a block with newly accepted tokens.
-        
-        Args:
-            block_id: Block to update
-            accepted_positions: Local positions being accepted
-            accepted_tokens: Token IDs to accept
-            
-        Raises:
-            IndexError: If block_id is invalid
-            ValueError: If positions and tokens length mismatch
-        """
-        if block_id < 0 or block_id >= len(self.blocks):
-            raise IndexError(f"Invalid block_id: {block_id}")
-        
-        if len(accepted_positions) != len(accepted_tokens):
-            raise ValueError(
-                f"Mismatched lengths: positions={len(accepted_positions)}, "
-                f"tokens={len(accepted_tokens)}"
+            block = DiffusionBlock(
+                block_id=i,
+                start_pos=start_pos,
+                length=length,
+                status=BlockStatus.PENDING,
+                mask_token_id=self.mask_token_id,
+                accept_threshold=accept_threshold,
             )
+            self.blocks.append(block)
         
-        block = self.blocks[block_id]
-        for pos, token in zip(accepted_positions, accepted_tokens):
-            block.accept_token(pos, token)
-        
-        # Update pre_block_complete after block update
-        self._update_pre_block_complete()
+        # Activate first block
+        if self.blocks:
+            self.blocks[0].activate()
     
-    def _update_pre_block_complete(self) -> None:
-        """Update pre_block_complete status for all blocks.
+    def get_active_block(self) -> Optional[DiffusionBlock]:
+        """Get the currently active block."""
+        if 0 <= self._current_block_idx < len(self.blocks):
+            block = self.blocks[self._current_block_idx]
+            if block.is_active:
+                return block
+        return None
+    
+    def confirm_current_block(self) -> bool:
+        """Confirm current block and advance to next.
         
-        Sets pre_block_complete=True for a block if all previous blocks
-        are complete. This is used by LLaDA and Dream samplers.
+        Returns:
+            True if there are more blocks to generate
         """
-        prev_complete = True
-        for block in self.blocks:
-            block.pre_block_complete = prev_complete
-            prev_complete = block.is_complete
+        if not (0 <= self._current_block_idx < len(self.blocks)):
+            return False
+        
+        current = self.blocks[self._current_block_idx]
+        if not current.is_confirmed:
+            return True  # Not ready to advance
+        
+        current.confirm()
+        self._current_block_idx += 1
+        
+        # Activate next block
+        if self._current_block_idx < len(self.blocks):
+            self.blocks[self._current_block_idx].activate()
+            return True
+        return False  # No more blocks
     
-    def has_active_blocks(self) -> bool:
-        """Check if any blocks are still active."""
-        return any(block.is_active for block in self.blocks)
+    def has_active_block(self) -> bool:
+        """Check if there's an active block."""
+        return self.get_active_block() is not None
     
-    def get_all_mask_positions(self) -> List[int]:
-        """Get all global positions that are still masked across all blocks."""
-        positions = []
+    def get_confirmed_token_count(self) -> int:
+        """Get total number of confirmed tokens across all blocks."""
+        return sum(len(block.tokens) for block in self.blocks)
+    
+    def build_sequence(self, prompt_tokens: List[int]) -> List[int]:
+        """Build full sequence: prompt + confirmed tokens + active masks + future masks.
+        
+        This is the key method - it constructs what the model sees.
+        """
+        sequence = list(prompt_tokens)
+        
         for block in self.blocks:
-            positions.extend(block.global_mask_token_ids)
-        return positions
+            if block.status == BlockStatus.CONFIRMED:
+                # Use confirmed tokens
+                sequence.extend(block.get_sequence_tokens())
+            elif block.status == BlockStatus.ACTIVE:
+                # Active block: use masks (will be sampled)
+                sequence.extend([self.mask_token_id] * block.length)
+            else:
+                # Pending blocks: masks
+                sequence.extend([self.mask_token_id] * block.length)
+        
+        return sequence
+    
+    def get_confirmed_tokens_list(self) -> List[int]:
+        """Get all confirmed tokens as a flat list."""
+        tokens = []
+        for block in self.blocks:
+            if block.status == BlockStatus.CONFIRMED:
+                tokens.extend(block.get_sequence_tokens())
+        return tokens
     
     def reset(self) -> None:
-        """Clear all blocks and reset state."""
+        """Reset all blocks."""
         self.blocks.clear()
-        self._block_id_counter = 0
+        self._current_block_idx = 0
     
     def __len__(self) -> int:
-        """Return number of blocks."""
         return len(self.blocks)

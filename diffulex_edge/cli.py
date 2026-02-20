@@ -33,7 +33,6 @@ except ImportError:
 
 try:
     from .runtime.engine import DiffusionEngine, DiffusionGenerationConfig
-    from .runtime.engine_legacy import InferenceEngine, GenerationConfig
     from .model import (
         FastdLLMV2Edge, FastdLLMV2EdgeConfig,
         DreamEdge, DreamEdgeConfig,
@@ -43,7 +42,6 @@ try:
 except ImportError:
     sys.path.insert(0, str(Path(__file__).parent))
     from runtime.engine import DiffusionEngine, DiffusionGenerationConfig
-    from runtime.engine_legacy import InferenceEngine, GenerationConfig
     from model import (
         FastdLLMV2Edge, FastdLLMV2EdgeConfig,
         DreamEdge, DreamEdgeConfig,
@@ -100,7 +98,19 @@ class TokenizerWrapper:
     def apply_chat_template(self, messages: List[dict], tokenize: bool = True) -> Union[str, List[int]]:
         """应用对话模板"""
         if self.is_hf_tokenizer and hasattr(self.tokenizer, 'apply_chat_template'):
-            return self.tokenizer.apply_chat_template(messages, tokenize=tokenize, add_generation_prompt=True)
+            result = self.tokenizer.apply_chat_template(messages, tokenize=tokenize, add_generation_prompt=True)
+            # Handle dict / BatchEncoding / Encoding objects
+            if isinstance(result, dict):
+                # Dictionary with 'input_ids' key
+                return result['input_ids']
+            elif hasattr(result, 'input_ids'):
+                # BatchEncoding object
+                ids = result.input_ids
+                return ids.tolist() if hasattr(ids, 'tolist') else ids
+            elif hasattr(result, 'ids'):
+                # Encoding object
+                return result.ids
+            return result
         else:
             text = ""
             for msg in messages:
@@ -142,7 +152,7 @@ class TokenizerWrapper:
 
 class ChatConfig:
     """对话配置"""
-    def __init__(self):
+    def __init__(self, block_size: int = 10):
         self.max_new_tokens: int = 100
         self.temperature: float = 0.8
         self.top_k: int = 50
@@ -151,19 +161,21 @@ class ChatConfig:
         self.num_iterations: int = 10
         self.use_diffusion: bool = True
         self.use_chat_template: bool = True
+        self.block_size: int = block_size  # Diffusion block size (model-specific)
     
     def to_diffusion_config(self) -> DiffusionGenerationConfig:
         return DiffusionGenerationConfig(
             max_new_tokens=self.max_new_tokens,
             num_iterations=self.num_iterations,
+            block_size=self.block_size,
             temperature=self.temperature,
             top_k=self.top_k,
             top_p=self.top_p,
             confidence_threshold=self.confidence_threshold,
         )
     
-    def to_generation_config(self) -> GenerationConfig:
-        return GenerationConfig(
+    def to_generation_config(self) -> DiffusionGenerationConfig:
+        return DiffusionGenerationConfig(
             max_new_tokens=self.max_new_tokens,
             temperature=self.temperature,
             top_k=self.top_k,
@@ -312,17 +324,37 @@ def create_model(model_type: str, vocab_size: int = 130000):
 # Model Loading
 # ============================================================================
 
-def load_model(model_path: Optional[str], pte_path: Optional[str], model_type: str = "fast_dllm"):
-    """加载模型"""
+def load_model(model_path: Optional[str], pte_path: Optional[str], model_type: str = "fast_dllm", max_seq_len: int = 32):
+    """加载模型，返回 (engine, is_diffusion, vocab_size, diffusion_block_size)"""
     if pte_path:
         print(f"加载PTE模型: {pte_path}")
         try:
-            engine = DiffusionEngine.from_pte(pte_path)
-            return engine, True, 130000
+            # Load metadata if exists
+            import json
+            metadata_path = Path(pte_path).with_suffix('.json')
+            metadata = {}
+            if metadata_path.exists():
+                with open(metadata_path) as f:
+                    metadata = json.load(f)
+                print(f"  元数据: {metadata_path}")
+            
+            # Get model type and block size from metadata
+            pte_model_type = metadata.get('model_type', model_type)
+            internal_model_type = pte_model_type.replace('fast_dllm', 'fast_dllm_v2')
+            diffusion_block_size = metadata.get('diffusion_block_size', 
+                                                4 if pte_model_type == 'sdar' else 32)
+            vocab_size = metadata.get('vocab_size', 151936)
+            
+            print(f"  模型类型: {pte_model_type}, block_size: {diffusion_block_size}")
+            
+            # PTE models exported with static shapes need max_seq_len
+            engine = DiffusionEngine.from_pte(pte_path, model_type=internal_model_type, max_seq_len=max_seq_len)
+            return engine, True, vocab_size, diffusion_block_size
         except Exception as e:
             print(f"加载PTE失败: {e}")
-            engine = InferenceEngine.from_pte(pte_path)
-            return engine, False, 130000
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
     
     elif model_path:
         print(f"加载模型: {model_path}")
@@ -333,14 +365,18 @@ def load_model(model_path: Optional[str], pte_path: Optional[str], model_type: s
         # Map CLI model type to internal model type
         internal_model_type = model_type.replace("fast_dllm", "fast_dllm_v2")
         engine = DiffusionEngine.from_model(model, model_type=internal_model_type)
-        return engine, is_diffusion, vocab_size
+        # Default block size based on model type
+        diffusion_block_size = 4 if model_type == 'sdar' else 32
+        return engine, is_diffusion, vocab_size, diffusion_block_size
     
     else:
         # 创建演示模型
         print(f"创建演示模型: {model_type}")
         model, is_diffusion, vocab_size = create_model(model_type)
         engine = DiffusionEngine.from_model(model)
-        return engine, is_diffusion, vocab_size
+        # Default block size based on model type
+        diffusion_block_size = 4 if model_type == 'sdar' else 32
+        return engine, is_diffusion, vocab_size, diffusion_block_size
 
 
 def find_tokenizer_path(model_path: Optional[str]) -> Optional[str]:
@@ -416,6 +452,7 @@ def main():
                         choices=["fast_dllm", "dream", "llada", "sdar"],
                         help="模型类型 (默认: fast_dllm)")
     parser.add_argument("--tokenizer", type=str, help="Tokenizer路径或HuggingFace模型名称")
+    parser.add_argument("--max-seq-len", type=int, default=32, help="PTE模型固定序列长度 (默认: 32)")
     parser.add_argument("--max-tokens", type=int, default=100, help="最大生成token数")
     parser.add_argument("--temperature", type=float, default=0.8, help="采样温度")
     parser.add_argument("--top-k", type=int, default=50, help="Top-K采样")
@@ -436,8 +473,9 @@ def main():
     
     # 加载模型
     try:
-        engine, is_diffusion, vocab_size = load_model(
-            args.model_path, args.pte_path, args.model_type
+        engine, is_diffusion, vocab_size, diffusion_block_size = load_model(
+            args.model_path, args.pte_path, args.model_type, 
+            max_seq_len=args.max_seq_len
         )
     except Exception as e:
         print(f"模型加载失败: {e}")
@@ -454,8 +492,8 @@ def main():
     
     tokenizer = TokenizerWrapper(tokenizer_path, vocab_size=vocab_size)
     
-    # 初始化配置
-    chat_config = ChatConfig()
+    # 初始化配置 (使用模型指定的block_size)
+    chat_config = ChatConfig(block_size=diffusion_block_size)
     chat_config.max_new_tokens = args.max_tokens
     chat_config.temperature = args.temperature
     chat_config.top_k = args.top_k

@@ -1,41 +1,39 @@
-"""Dream sampler aligned with diffulex implementation."""
+"""Dream sampler with block confirmation mechanism.
+
+Key differences from SDAR:
+- Uses shifted logits (like SDAR)
+- Per-block threshold (not global)
+- pre_block_complete logic
+- Mask is "fully visible" (can attend to all confirmed blocks)
+
+Key differences from LLaDA:
+- Uses shifted logits (LLaDA doesn't)
+"""
 
 import torch
-from typing import Dict, List
+from typing import List
 from dataclasses import dataclass, field
 
 from diffulex_edge.runtime.sampler.base import sample_tokens
 from diffulex_edge.runtime.sampler.shift import ShiftLogitsSampler
-from diffulex_edge.runtime.block import DiffusionBlockManager
+from diffulex_edge.runtime.block import DiffusionBlockManager, BlockStatus
 
 
 @dataclass
 class DreamSampleOutput:
-    """
-    Align with: diffulex.sampler.dream.DreamSampleOutputForDiffusionLM
-    """
-    true_local_ids_map: Dict[str, Dict[str, List[int]]] = field(default_factory=dict)
-    accepted_ids_map: Dict[str, Dict[str, List[int]]] = field(default_factory=dict)
-    sampled_tokens_map: Dict[str, Dict[str, List[int]]] = field(default_factory=dict)
+    """Output from Dream sampling."""
+    accepted_local_positions: List[int] = field(default_factory=list)
+    accepted_tokens: List[int] = field(default_factory=list)
+    block_confirmed: bool = False
 
 
 class DreamSampler:
-    """
-    Align with: diffulex.sampler.dream.DreamSamplerForDiffusionLM
+    """Dream sampler with block confirmation.
     
     Key characteristics:
-    1. Uses ShiftLogitsSampler (like FastdLLM V2)
-    2. Per-block accept_threshold (like LLaDA)
-    3. pre_block_complete logic (like LLaDA)
-    
-    Dream combines aspects of both FastdLLM V2 and LLaDA:
-    - Uses shifted logits for autoregressive dependency
-    - Has per-block thresholds
-    - Has pre_block_complete conditional acceptance
-    
-    The pre_block_complete logic is identical to LLaDA:
-    - If previous block is complete and no high-confidence tokens: transfer 1
-    - Otherwise: accept only high-confidence tokens
+    - Uses shifted logits (like SDAR, unlike LLaDA)
+    - Per-block threshold
+    - pre_block_complete: if previous block confirmed, must accept at least 1
     """
     
     def __init__(
@@ -53,110 +51,77 @@ class DreamSampler:
         self.top_p = top_p
         self.margin_confidence = margin_confidence
         self.neg_entropy = neg_entropy
-        
-        # Dream uses shifted logits
         self.shift_sampler = ShiftLogitsSampler()
     
-    def sample(
-        self,
-        block_manager: DiffusionBlockManager,
-        logits: torch.Tensor,
-    ) -> DreamSampleOutput:
-        """
-        Sample tokens for all active blocks.
+    def sample(self, block_manager: DiffusionBlockManager, logits: torch.Tensor) -> DreamSampleOutput:
+        """Sample tokens for the ACTIVE block.
         
-        Align with: DreamSamplerForDiffusionLM.forward
+        Dream uses shifted logits + per-block threshold + pre_block_complete logic.
         """
-        # Fetch and shift logits (like FastdLLM V2)
+        active_block = block_manager.get_active_block()
+        if active_block is None:
+            return DreamSampleOutput(block_confirmed=True)
+        
+        mask_positions = active_block.get_local_mask_positions()
+        if not mask_positions:
+            return DreamSampleOutput(block_confirmed=True)
+        
+        # Shift logits (key difference from LLaDA)
         last_logits = self.shift_sampler.fetch_last_logits(logits)
         shifted_logits = self.shift_sampler.shift(logits, last_logits)
         
-        # Initialize output maps
-        true_local_ids_map: Dict[str, Dict[str, List[int]]] = {}
-        accepted_ids_map: Dict[str, Dict[str, List[int]]] = {}
-        sampled_tokens_map: Dict[str, Dict[str, List[int]]] = {}
+        block_logits = shifted_logits[mask_positions]
         
-        seq_idx = "0"
-        true_local_ids_sub_map: Dict[str, List[int]] = {}
-        accepted_ids_sub_map: Dict[str, List[int]] = {}
-        sampled_tokens_sub_map: Dict[str, List[int]] = {}
+        confidence, sampled_tokens, initial_confidence = sample_tokens(
+            block_logits,
+            temperature=self.temperature,
+            top_p=self.top_p if self.top_p < 1.0 else None,
+            top_k=self.top_k if self.top_k > 0 else None,
+            margin_confidence=self.margin_confidence,
+            neg_entropy=self.neg_entropy,
+        )
         
-        # Process each active block
-        for block_id, block in block_manager.get_active_blocks():
-            if not block.is_active or block.is_complete:
-                continue
-            
-            mask_positions = block.global_mask_token_ids
-            if not mask_positions:
-                continue
-            
-            # Use shifted logits (Dream uses shift like FastdLLM V2)
-            mask_token_logits = shifted_logits[mask_positions]
-            
-            # Sample tokens
-            confidence, sampled_tokens, initial_confidence = sample_tokens(
-                mask_token_logits,
-                temperature=self.temperature,
-                top_p=self.top_p if self.top_p < 1.0 else None,
-                top_k=self.top_k if self.top_k > 0 else None,
-                margin_confidence=self.margin_confidence,
-                neg_entropy=self.neg_entropy,
-            )
-            
-            # Get per-block parameters (like LLaDA)
-            block_threshold = getattr(block, 'accept_threshold', 0.95)
-            pre_block_complete = getattr(block, 'pre_block_complete', False)
-            
-            # pre_block_complete logic (like LLaDA)
-            if pre_block_complete:
-                high_conf_indices = torch.where(
-                    initial_confidence > block_threshold
-                )[0]
-                
-                if len(high_conf_indices) == 0:
-                    number_transfer_tokens = 1
-                    _, transfer_index = torch.topk(
-                        confidence, number_transfer_tokens
-                    )
-                else:
-                    transfer_index = torch.tensor(
-                        [], device=sampled_tokens.device, dtype=torch.long
-                    )
-                
-                accepted_ids = torch.unique(
-                    torch.cat([transfer_index, high_conf_indices])
-                )
+        # Per-block threshold
+        threshold = active_block.accept_threshold
+        high_conf_indices = torch.where(initial_confidence > threshold)[0]
+        
+        # Check if previous block is confirmed (pre_block_complete logic)
+        prev_block_confirmed = True  # First block always "complete"
+        if active_block.block_id > 0:
+            for block in block_manager.blocks:
+                if block.block_id == active_block.block_id - 1:
+                    prev_block_confirmed = (block.status == BlockStatus.CONFIRMED)
+                    break
+        
+        if prev_block_confirmed:
+            # Must accept at least one token
+            if len(high_conf_indices) == 0:
+                _, top_indices = torch.topk(confidence, 1)
+                accepted_relative_indices = top_indices.cpu().tolist()
             else:
-                high_conf_indices = torch.where(
-                    initial_confidence > block_threshold
-                )[0]
-                accepted_ids = high_conf_indices
-            
-            # Record results
-            accepted_ids_list = accepted_ids.cpu().tolist()
-            true_local_ids_sub_map[str(block_id)] = [
-                mask_positions[i] for i in accepted_ids_list
-            ]
-            accepted_ids_sub_map[str(block_id)] = accepted_ids_list
-            sampled_tokens_sub_map[str(block_id)] = sampled_tokens.cpu().tolist()
-            
-            # Update block
-            for idx in accepted_ids_list:
-                global_pos = mask_positions[idx]
-                local_pos = global_pos - block.start_pos
-                token_id = sampled_tokens[idx].item()
-                block.accept_token(local_pos, token_id)
+                accepted_relative_indices = high_conf_indices.cpu().tolist()
+        else:
+            # Only accept high confidence tokens
+            if len(high_conf_indices) == 0:
+                accepted_relative_indices = []
+            else:
+                accepted_relative_indices = high_conf_indices.cpu().tolist()
         
-        true_local_ids_map[seq_idx] = true_local_ids_sub_map
-        accepted_ids_map[seq_idx] = accepted_ids_sub_map
-        sampled_tokens_map[seq_idx] = sampled_tokens_sub_map
+        accepted_local_positions = []
+        accepted_tokens = []
+        
+        for rel_idx in accepted_relative_indices:
+            local_pos = mask_positions[rel_idx]
+            token_id = sampled_tokens[rel_idx].item()
+            active_block.confirm_token(local_pos, token_id)
+            accepted_local_positions.append(local_pos)
+            accepted_tokens.append(token_id)
         
         return DreamSampleOutput(
-            true_local_ids_map=true_local_ids_map,
-            accepted_ids_map=accepted_ids_map,
-            sampled_tokens_map=sampled_tokens_map,
+            accepted_local_positions=accepted_local_positions,
+            accepted_tokens=accepted_tokens,
+            block_confirmed=active_block.is_confirmed,
         )
     
     def reset(self) -> None:
-        """Reset sampler state."""
         self.shift_sampler.reset_cache()

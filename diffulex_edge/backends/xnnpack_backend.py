@@ -95,8 +95,13 @@ class XNNPACKBackend(EdgeBackend):
             
             logger.info(f"Starting XNNPACK export with config: {self.config}")
             
-            # 1. 确保模型处于评估模式
+            # 1. 确保模型处于评估模式，禁用所有梯度
             model.eval()
+            torch.set_grad_enabled(False)
+            
+            # 确保所有参数不需要梯度
+            for param in model.parameters():
+                param.requires_grad = False
             
             # 2. 导出为 ExportedProgram
             logger.info("Exporting to ExportedProgram...")
@@ -123,25 +128,8 @@ class XNNPACKBackend(EdgeBackend):
             # 4. 生成 .pte 文件
             logger.info("Generating ExecuTorch program...")
             
-            # 内存规划配置
-            # memory_planning_algo 需要是一个 callable，而不是字符串
-            from executorch.exir.memory_planning import greedy, MemoryPlanningAlgorithmSuite
-            
-            if self.config.memory_planning == "greedy":
-                algo = greedy
-            else:
-                # 使用默认的算法 suite
-                algo = MemoryPlanningAlgorithmSuite()
-            
-            memory_planning_pass = MemoryPlanningPass(
-                memory_planning_algo=algo,
-                alloc_graph_input=False,  # 避免 Misallocate graph input 错误
-                alloc_graph_output=False,  # 避免 Misallocate graph output 错误
-            )
-            
-            exec_config = ExecutorchBackendConfig(
-                memory_planning_pass=memory_planning_pass,
-            )
+            # Use default ExecuTorch backend config
+            exec_config = ExecutorchBackendConfig()
             
             exec_prog = edge.to_executorch(exec_config)
             buffer = exec_prog.buffer

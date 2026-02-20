@@ -1,23 +1,28 @@
-"""Enhanced DiffusionEngine with model-specific samplers.
+"""Unified DiffusionEngine with optional KV cache support.
 
-This module provides an upgraded DiffusionEngine that supports
-all four model types: FastdLLM V2, LLaDA, Dream, and SDAR.
+Supports both PyTorch models and ExecuTorch PTE models:
+- PyTorch models: Can use KV cache for efficient inference
+- PTE models: Full-sequence inference (KV cache managed by model or disabled)
+
+Usage:
+    # PyTorch model with KV cache
+    engine = DiffusionEngine.from_model(model, model_type="sdar")
+    
+    # PyTorch model without KV cache
+    engine = DiffusionEngine.from_model(model, model_type="sdar", use_kv_cache=False)
+    
+    # ExecuTorch PTE model
+    engine = DiffusionEngine.from_pte("model.pte", model_type="sdar", max_seq_len=2048)
 """
 
 import logging
 from pathlib import Path
-from typing import List, Optional, Union, Any
+from typing import List, Optional, Union, Any, Tuple
 
 import torch
 
-from diffulex_edge.runtime.block import DiffusionBlockManager
-from diffulex_edge.runtime.sampler.models import (
-    SAMPLER_REGISTRY,
-    FastdLLMV2SampleOutput,
-    LLaDASampleOutput,
-    DreamSampleOutput,
-    SDARSampleOutput,
-)
+from diffulex_edge.runtime.block import DiffusionBlockManager, BlockStatus
+from diffulex_edge.runtime.sampler.models import SAMPLER_REGISTRY
 
 logger = logging.getLogger(__name__)
 
@@ -26,31 +31,31 @@ class DiffusionGenerationConfig:
     """Configuration for diffusion-based generation.
     
     Attributes:
-        max_new_tokens: Maximum tokens to generate
-        num_iterations: Number of diffusion iterations (denoising steps)
-        block_size: Size of each diffusion block
-        confidence_threshold: Threshold for accepting tokens
+        max_new_tokens: Maximum number of new tokens to generate
+        num_iterations: Maximum iterations per block
+        block_size: Size of each generation block
+        confidence_threshold: Confidence threshold for accepting tokens
         temperature: Sampling temperature
-        top_k: Top-k sampling parameter
-        top_p: Top-p sampling parameter
-        mask_token_id: Token ID for masking
+        top_k: Top-k sampling parameter (0 to disable)
+        top_p: Top-p (nucleus) sampling parameter (1.0 to disable)
+        mask_token_id: Token ID for masked positions
         eos_token_id: End-of-sequence token ID
-        early_stop: Whether to stop when all blocks complete
-        model_type: Model type ("fast_dllm_v2", "llada", "dream", "sdar")
+        model_type: Model type for sampler selection
+        margin_confidence: Use margin confidence (top1 - top2)
+        neg_entropy: Use negative entropy as confidence
     """
     
     def __init__(
         self,
         max_new_tokens: int = 100,
         num_iterations: int = 10,
-        block_size: int = 10,
+        block_size: int = 4,
         confidence_threshold: float = 0.95,
         temperature: float = 1.0,
         top_k: int = 0,
         top_p: float = 1.0,
         mask_token_id: int = 126336,
         eos_token_id: int = 2,
-        early_stop: bool = True,
         model_type: str = "fast_dllm_v2",
         margin_confidence: bool = False,
         neg_entropy: bool = False,
@@ -64,28 +69,28 @@ class DiffusionGenerationConfig:
         self.top_p = top_p
         self.mask_token_id = mask_token_id
         self.eos_token_id = eos_token_id
-        self.early_stop = early_stop
         self.model_type = model_type
         self.margin_confidence = margin_confidence
         self.neg_entropy = neg_entropy
 
 
 class DiffusionEngine:
-    """Enhanced inference engine supporting all model types.
+    """Unified inference engine for diffusion models.
     
-    Supports:
-    - FastdLLM V2: Shift logits, global threshold, always accept 1
-    - LLaDA: No shift, per-block threshold, pre_block_complete logic
-    - Dream: Shift logits, per-block threshold, pre_block_complete logic
-    - SDAR: Shift logits, global threshold, always accept 1
+    Supports both KV cache mode (efficient for PyTorch) and full-sequence mode
+    (for PTE compatibility).
     
-    Usage:
-        # Load with specific model type
-        engine = DiffusionEngine.from_pte("model.pte", model_type="llada")
-        
-        # Generate with model-specific sampling
-        config = DiffusionGenerationConfig(model_type="llada")
-        tokens = engine.generate(prompt_tokens, config)
+    Args:
+        model: PyTorch model (optional)
+        pte_path: Path to ExecuTorch .pte file (optional)
+        device: Device to run on ("cpu", "cuda", etc.)
+        model_type: Model type for sampler selection
+        max_seq_len: Maximum sequence length (required for PTE models)
+        use_kv_cache: Whether to use KV cache (PyTorch models only)
+    
+    Raises:
+        ValueError: If both model and pte_path are provided, or if model_type is unknown
+        FileNotFoundError: If pte_path does not exist
     """
     
     def __init__(
@@ -94,55 +99,43 @@ class DiffusionEngine:
         pte_path: Optional[Union[str, Path]] = None,
         device: str = "cpu",
         model_type: str = "fast_dllm_v2",
+        max_seq_len: Optional[int] = None,
+        use_kv_cache: bool = True,
     ):
-        """Initialize diffusion engine.
-        
-        Args:
-            model: PyTorch model for inference
-            pte_path: Path to .pte file (if loading ExecuTorch model)
-            device: Device to run on
-            model_type: Model type for sampler selection
-            
-        Raises:
-            ValueError: If model_type is invalid
-        """
         if model_type not in SAMPLER_REGISTRY:
-            raise ValueError(
-                f"Unknown model_type: {model_type}. "
-                f"Available: {list(SAMPLER_REGISTRY.keys())}"
-            )
+            raise ValueError(f"Unknown model_type: {model_type}. "
+                           f"Available: {list(SAMPLER_REGISTRY.keys())}")
         
         if model is not None and pte_path is not None:
-            raise ValueError(
-                "Cannot provide both 'model' and 'pte_path'. "
-                "Use from_model() or from_pte() for clarity."
-            )
+            raise ValueError("Cannot provide both 'model' and 'pte_path'")
+        
+        if model is None and pte_path is None:
+            raise ValueError("Must provide either 'model' or 'pte_path'")
         
         self.model = model
         self.pte_path = Path(pte_path) if pte_path is not None else None
         self.device = device
         self.model_type = model_type
+        self.max_seq_len = max_seq_len
+        self.use_kv_cache = use_kv_cache and (model is not None)  # KV cache only for PyTorch
+        
         self.block_manager = DiffusionBlockManager()
-        self.sampler = None  # Will be created in generate()
+        self.sampler: Optional[Any] = None
         
         # PTE state
         self._is_pte: bool = self.pte_path is not None
-        self._pte_module: Any = None
-        self._pte_program: Any = None
+        self._pte_module: Optional[Any] = None
         
-        # Load model if provided
         if model is not None:
             self.model.eval()
             self.model.to(device)
-            logger.debug(f"Loaded PyTorch model on {device}")
+            logger.info(f"Loaded PyTorch model on {device}, KV cache: {self.use_kv_cache}")
         elif self.pte_path is not None:
             self._load_pte_model()
+            self.use_kv_cache = False  # PTE models don't use Python-level KV cache
     
     def _load_pte_model(self) -> None:
-        """Load ExecuTorch model from pte_path."""
-        if self.pte_path is None:
-            raise RuntimeError("pte_path is None - cannot load PTE model")
-        
+        """Load ExecuTorch model."""
         if not self.pte_path.exists():
             raise FileNotFoundError(f"PTE file not found: {self.pte_path}")
         
@@ -157,43 +150,28 @@ class DiffusionEngine:
             self._pte_module = self._pte_program.load_method("forward")
             logger.info(f"Loaded ExecuTorch model from {self.pte_path}")
         except ImportError as e:
-            raise ImportError(
-                "ExecuTorch runtime not available. "
-                "Install with: pip install executorch"
-            ) from e
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to load PTE model from {self.pte_path}: {e}"
-            ) from e
+            raise ImportError("ExecuTorch runtime not available. "
+                            "Install with: pip install executorch") from e
     
-    def _create_sampler(self, config: DiffusionGenerationConfig):
+    def _create_sampler(self, config: DiffusionGenerationConfig) -> Any:
         """Create model-specific sampler."""
         sampler_cls = SAMPLER_REGISTRY.get(self.model_type)
         if sampler_cls is None:
             raise ValueError(f"Unknown model_type: {self.model_type}")
         
-        # Different samplers have different parameters
+        common_kwargs = {
+            "mask_token_id": config.mask_token_id,
+            "temperature": config.temperature,
+            "top_k": config.top_k,
+            "top_p": config.top_p,
+            "margin_confidence": config.margin_confidence,
+            "neg_entropy": config.neg_entropy,
+        }
+        
         if self.model_type in ["fast_dllm_v2", "sdar"]:
-            # Global threshold
-            return sampler_cls(
-                mask_token_id=config.mask_token_id,
-                threshold=config.confidence_threshold,
-                temperature=config.temperature,
-                top_k=config.top_k,
-                top_p=config.top_p,
-                margin_confidence=config.margin_confidence,
-                neg_entropy=config.neg_entropy,
-            )
-        else:  # llada, dream
-            # Per-block threshold
-            return sampler_cls(
-                mask_token_id=config.mask_token_id,
-                temperature=config.temperature,
-                top_k=config.top_k,
-                top_p=config.top_p,
-                margin_confidence=config.margin_confidence,
-                neg_entropy=config.neg_entropy,
-            )
+            common_kwargs["threshold"] = config.confidence_threshold
+        
+        return sampler_cls(**common_kwargs)
     
     @classmethod
     def from_model(
@@ -201,6 +179,7 @@ class DiffusionEngine:
         model: torch.nn.Module,
         device: str = "cpu",
         model_type: str = "fast_dllm_v2",
+        use_kv_cache: bool = True,
     ) -> "DiffusionEngine":
         """Create engine from PyTorch model.
         
@@ -208,14 +187,14 @@ class DiffusionEngine:
             model: PyTorch model
             device: Device to run on
             model_type: Model type for sampler selection
+            use_kv_cache: Whether to use KV cache
             
         Returns:
             Configured DiffusionEngine
         """
         model.eval()
         model.to(device)
-        logger.debug(f"Creating DiffusionEngine from PyTorch model on {device}")
-        return cls(model=model, device=device, model_type=model_type)
+        return cls(model=model, device=device, model_type=model_type, use_kv_cache=use_kv_cache)
     
     @classmethod
     def from_pte(
@@ -223,147 +202,354 @@ class DiffusionEngine:
         pte_path: Union[str, Path],
         device: str = "cpu",
         model_type: str = "fast_dllm_v2",
+        max_seq_len: Optional[int] = None,
     ) -> "DiffusionEngine":
-        """Create engine from .pte file.
+        """Create engine from ExecuTorch .pte file.
         
         Args:
             pte_path: Path to .pte file
-            device: Device to run on
+            device: Device to run on (usually "cpu" for ExecuTorch)
             model_type: Model type for sampler selection
+            max_seq_len: Maximum sequence length (required for padding)
             
         Returns:
             Configured DiffusionEngine
         """
-        logger.debug(f"Creating DiffusionEngine from PTE: {pte_path}")
-        return cls(pte_path=Path(pte_path), device=device, model_type=model_type)
+        return cls(
+            pte_path=Path(pte_path),
+            device=device,
+            model_type=model_type,
+            max_seq_len=max_seq_len,
+            use_kv_cache=False,
+        )
     
     def generate(
         self,
         prompt_tokens: List[int],
         config: Optional[DiffusionGenerationConfig] = None,
     ) -> List[int]:
-        """Generate tokens using diffusion sampling.
+        """Generate tokens using diffusion-based block confirmation.
         
-        Uses model-specific sampler based on model_type.
+        Uses iterative block refinement where each block is processed
+        multiple times until confidence threshold is met or max iterations.
         
         Args:
-            prompt_tokens: List of prompt token IDs
-            config: Generation configuration
+            prompt_tokens: Initial prompt token IDs
+            config: Generation configuration (uses defaults if None)
             
         Returns:
-            Generated token IDs (including prompt)
+            List of token IDs (prompt + generated)
         """
         if config is None:
             config = DiffusionGenerationConfig(model_type=self.model_type)
         else:
-            # Ensure model_type matches
             config.model_type = self.model_type
         
-        # Create model-specific sampler
         self.sampler = self._create_sampler(config)
-        
-        # Reset state
         self.block_manager.reset()
         if hasattr(self.sampler, 'reset'):
             self.sampler.reset()
         
-        # Initialize sequence with prompt
-        sequence = list(prompt_tokens)
         prompt_len = len(prompt_tokens)
         
-        # Create initial mask tokens
-        num_blocks = (config.max_new_tokens + config.block_size - 1) // config.block_size
-        
-        for i in range(num_blocks):
-            start_pos = prompt_len + i * config.block_size
-            remaining = config.max_new_tokens - i * config.block_size
-            block_len = min(config.block_size, remaining)
-            
-            # Create block with appropriate threshold
-            self.block_manager.create_block(
-                start_pos=start_pos,
-                length=block_len,
-                accept_threshold=config.confidence_threshold,
-            )
-            
-            # Add mask tokens to sequence
-            sequence.extend([config.mask_token_id] * block_len)
-        
-        logger.debug(
-            f"Starting generation: model_type={self.model_type}, "
-            f"prompt_len={prompt_len}, num_blocks={num_blocks}"
+        # Initialize blocks
+        self.block_manager.create_blocks(
+            prompt_len=prompt_len,
+            max_new_tokens=config.max_new_tokens,
+            block_size=config.block_size,
+            accept_threshold=config.confidence_threshold,
         )
         
-        # Iterative denoising
-        for iteration in range(config.num_iterations):
-            if config.early_stop and not self.block_manager.has_active_blocks():
-                logger.debug(f"Early stop at iteration {iteration}")
-                break
-            
-            # Prepare input
-            input_ids = torch.tensor([sequence], dtype=torch.long, device=self.device)
-            
-            # Forward pass
-            logits = self._forward(input_ids)  # [1, seq_len, vocab_size]
-            logits = logits[0]  # [seq_len, vocab_size]
-            
-            # Sample using model-specific sampler
-            output = self.sampler.sample(self.block_manager, logits)
-            
-            # Extract accepted tokens from output
-            accepted_tokens = {}
-            for seq_id, block_map in output.accepted_ids_map.items():
-                for block_id, indices in block_map.items():
-                    # Get the actual tokens
-                    block_tokens = output.sampled_tokens_map[seq_id][block_id]
-                    for i, idx in enumerate(indices):
-                        # Find global position from local index
-                        block = self.block_manager.blocks[int(block_id)]
-                        if idx < len(block_tokens):
-                            global_pos = block.start_pos + idx
-                            accepted_tokens[global_pos] = block_tokens[idx]
-            
-            # Update sequence with accepted tokens
-            for pos, token_id in accepted_tokens.items():
-                sequence[pos] = token_id
-            
-            num_accepted = len(accepted_tokens)
-            logger.debug(f"Iteration {iteration}: accepted {num_accepted} tokens")
+        logger.info(f"Generation: model={self.model_type}, prompt={prompt_len}, "
+                   f"blocks={len(self.block_manager)}, kv_cache={self.use_kv_cache}")
         
-        logger.debug(f"Generation complete: sequence length={len(sequence)}")
+        # Choose generation strategy
+        if self.use_kv_cache:
+            return self._generate_with_kv_cache(prompt_tokens, config)
+        else:
+            return self._generate_full_sequence(prompt_tokens, config)
+    
+    def _generate_with_kv_cache(
+        self,
+        prompt_tokens: List[int],
+        config: DiffusionGenerationConfig,
+    ) -> List[int]:
+        """Generate using KV cache for efficient incremental inference."""
+        prompt_len = len(prompt_tokens)
+        kv_cache = None
+        cached_len = 0
+        
+        # Step 1: Prefill - process prompt
+        if prompt_len > 0:
+            prompt_ids = torch.tensor([prompt_tokens], dtype=torch.long, device=self.device)
+            prompt_positions = torch.arange(prompt_len, device=self.device).unsqueeze(0)
+            
+            # For diffusion models, use non-causal mask (full attention)
+            prompt_mask = self._create_diffusion_mask(prompt_len, prompt_len)
+            
+            _, kv_cache = self._forward(
+                input_ids=prompt_ids,
+                positions=prompt_positions,
+                mask=prompt_mask,
+                kv_cache=kv_cache
+            )
+            cached_len = prompt_len
+            logger.debug(f"Prefill complete: cached {cached_len} tokens")
+        
+        # Step 2: Generate blocks incrementally
+        total_iterations = 0
+        confirmed_blocks = 0
+        
+        while self.block_manager.has_active_block():
+            active_block = self.block_manager.get_active_block()
+            block_len = active_block.length
+            
+            block_confirmed = False
+            final_kv_cache = None
+            
+            for iteration in range(config.num_iterations):
+                total_iterations += 1
+                
+                # Build input for this block
+                block_tokens = active_block.get_sequence_tokens()
+                block_ids = torch.tensor([block_tokens], dtype=torch.long, device=self.device)
+                block_positions = torch.arange(
+                    cached_len, cached_len + block_len,
+                    device=self.device
+                ).unsqueeze(0)
+                
+                # Diffusion mask: block can see all cached + itself
+                block_mask = self._create_diffusion_mask(block_len, cached_len + block_len)
+                
+                # Truncate KV cache to cached_len before each iteration
+                truncated_kv_cache = self._truncate_kv_cache(kv_cache, cached_len)
+                
+                # Forward
+                logits, new_kv_cache = self._forward(
+                    input_ids=block_ids,
+                    positions=block_positions,
+                    mask=block_mask,
+                    kv_cache=truncated_kv_cache
+                )
+                
+                final_kv_cache = new_kv_cache
+                
+                # Sample
+                output = self.sampler.sample(self.block_manager, logits[0])
+                
+                if output.block_confirmed:
+                    block_confirmed = True
+                    break
+            
+            confirmed_blocks += 1 if block_confirmed else 0
+            
+            # Update KV cache with final state
+            if final_kv_cache is not None:
+                kv_cache = final_kv_cache
+            
+            cached_len += block_len
+            
+            # Advance block
+            has_more = self.block_manager.confirm_current_block()
+            if not has_more:
+                break
+        
+        # Build final sequence
+        final_sequence = self.block_manager.build_sequence(prompt_tokens)
+        
+        logger.info(f"Done: {confirmed_blocks}/{len(self.block_manager)} blocks confirmed, "
+                   f"{total_iterations} total iterations")
+        return final_sequence
+    
+    def _generate_full_sequence(
+        self,
+        prompt_tokens: List[int],
+        config: DiffusionGenerationConfig,
+    ) -> List[int]:
+        """Generate using full-sequence inference (no KV cache).
+        
+        Used for PTE models or when KV cache is disabled.
+        """
+        confirmed_tokens = list(prompt_tokens)
+        total_iterations = 0
+        confirmed_blocks = 0
+        
+        while self.block_manager.has_active_block():
+            active_block = self.block_manager.get_active_block()
+            
+            # Build full sequence: confirmed + active masks
+            sequence = self._build_sequence(confirmed_tokens, active_block, config.mask_token_id)
+            
+            block_confirmed = False
+            for iteration in range(config.num_iterations):
+                total_iterations += 1
+                
+                # Forward pass
+                logits = self._forward_full_sequence(sequence)
+                
+                # Get logits for active block only
+                active_start = len(confirmed_tokens)
+                active_end = active_start + active_block.length
+                active_logits = logits[active_start:active_end]
+                
+                # Sample
+                output = self.sampler.sample(self.block_manager, active_logits)
+                
+                if output.block_confirmed:
+                    block_confirmed = True
+                    break
+            
+            confirmed_blocks += 1 if block_confirmed else 0
+            
+            # Get confirmed tokens for this block
+            block_tokens = active_block.get_sequence_tokens()
+            confirmed_tokens.extend(block_tokens)
+            
+            # Advance
+            has_more = self.block_manager.confirm_current_block()
+            if not has_more:
+                break
+        
+        logger.info(f"Done: {confirmed_blocks}/{len(self.block_manager)} blocks confirmed, "
+                   f"{total_iterations} total iterations")
+        return confirmed_tokens
+    
+    def _build_sequence(
+        self,
+        confirmed_tokens: List[int],
+        active_block: Any,
+        mask_token_id: int
+    ) -> List[int]:
+        """Build sequence: confirmed + active masks + padding."""
+        sequence = list(confirmed_tokens)
+        sequence.extend([mask_token_id] * active_block.length)
+        
+        # Pad to max_seq_len for PTE
+        if self._is_pte and self.max_seq_len is not None:
+            while len(sequence) < self.max_seq_len:
+                sequence.append(mask_token_id)
+        
         return sequence
     
-    def _forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Run forward pass through model."""
-        if self._is_pte:
-            return self._forward_pte(input_ids)
-        else:
-            return self._forward_torch(input_ids)
+    def _truncate_kv_cache(
+        self,
+        kv_cache: Optional[List[Tuple[torch.Tensor, torch.Tensor]]],
+        length: int
+    ) -> Optional[List[Tuple[torch.Tensor, torch.Tensor]]]:
+        """Truncate KV cache to specified length.
+        
+        Creates independent copies (not views) to avoid modifying original.
+        """
+        if kv_cache is None:
+            return None
+        
+        truncated = []
+        for k_cache, v_cache in kv_cache:
+            truncated_k = k_cache[:, :, :length, :].clone()
+            truncated_v = v_cache[:, :, :length, :].clone()
+            truncated.append((truncated_k, truncated_v))
+        return truncated
     
-    def _forward_torch(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Forward pass using PyTorch model."""
+    def _create_diffusion_mask(
+        self,
+        query_len: int,
+        kv_len: int
+    ) -> torch.Tensor:
+        """Create diffusion mask: query can see all KV (non-causal).
+        
+        For diffusion models, all positions can attend to all other positions.
+        
+        Args:
+            query_len: Length of query (current positions)
+            kv_len: Length of key/value (cached + current)
+            
+        Returns:
+            Mask tensor [1, 1, query_len, kv_len] with all zeros (all visible)
+        """
+        # For diffusion: all positions can see all positions
+        mask = torch.zeros(query_len, kv_len, device=self.device)
+        return mask.unsqueeze(0).unsqueeze(0)
+    
+    def _forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        mask: torch.Tensor,
+        kv_cache: Optional[List[Tuple[torch.Tensor, torch.Tensor]]],
+    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
+        """Forward pass (PyTorch with KV cache)."""
         if self.model is None:
             raise RuntimeError("No model loaded")
         
         with torch.no_grad():
-            return self.model(input_ids)[0]
+            return self.model(input_ids, positions, mask, kv_cache)
     
-    def _forward_pte(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Forward pass using ExecuTorch model."""
+    def _forward_full_sequence(
+        self,
+        sequence: List[int]
+    ) -> torch.Tensor:
+        """Forward pass for full sequence (no KV cache).
+        
+        Used for PTE models or when KV cache is disabled.
+        """
+        input_ids = torch.tensor([sequence], dtype=torch.long, device=self.device)
+        
+        if self._is_pte:
+            return self._forward_pte(input_ids)
+        else:
+            return self._forward_torch_full(input_ids)
+    
+    def _forward_torch_full(
+        self,
+        input_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Forward using PyTorch model (full sequence, no KV cache)."""
+        if self.model is None:
+            raise RuntimeError("No model loaded")
+        
+        batch_size, seq_len = input_ids.shape
+        positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+        
+        # Non-causal mask (all zeros)
+        mask = torch.zeros(1, 1, seq_len, seq_len, device=input_ids.device)
+        
+        with torch.no_grad():
+            logits, _ = self.model(input_ids, positions, mask, None)
+        
+        return logits[0] if logits.dim() == 3 else logits
+    
+    def _forward_pte(
+        self,
+        input_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Forward using ExecuTorch model."""
         if self._pte_module is None:
             raise RuntimeError("No PTE model loaded")
         
-        input_list = input_ids.tolist()
-        result = self._pte_module.forward(input_list)
+        result = self._pte_module.execute([input_ids])
         
-        if isinstance(result, (list, tuple)):
-            logits = torch.tensor(result[0])
+        # Unwrap result
+        if hasattr(result, '__iter__') and not isinstance(result, torch.Tensor):
+            result = list(result)[0]
+            if hasattr(result, 'to_torch'):
+                result = result.to_torch()
+        
+        if not isinstance(result, torch.Tensor):
+            result = torch.tensor(result)
+        
+        if result.dim() == 2:
+            result = result.unsqueeze(0)
+        
+        # Truncate to actual length
+        actual_len = input_ids.shape[1]
+        if self.max_seq_len is not None and actual_len < self.max_seq_len:
+            result = result[0, :actual_len, :]
         else:
-            logits = torch.tensor(result)
+            result = result[0]
         
-        if logits.dim() == 2:
-            logits = logits.unsqueeze(0)
-        elif logits.dim() == 1:
-            logits = logits.unsqueeze(0).unsqueeze(0)
-        
-        return logits
+        return result
+
+
+# Backward compatibility aliases
+InferenceEngine = DiffusionEngine
+GenerationConfig = DiffusionGenerationConfig

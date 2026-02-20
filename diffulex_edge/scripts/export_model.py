@@ -177,7 +177,31 @@ def main():
     print(f"      Output: {output_path}")
     
     vocab_size = config.vocab_size
-    example_inputs = (torch.randint(0, vocab_size, (args.batch_size, args.seq_len)),)
+    
+    # Check if model uses forward_export (SDAREdge style with KV cache)
+    if hasattr(model, 'forward_export'):
+        # SDAREdge style: forward_export(input_ids, positions, kv_cache)
+        print(f"      Detected forward_export method, using 3-input format")
+        
+        # Get config from model
+        model_config = model.config
+        batch_size = args.batch_size
+        block_size = getattr(model_config, 'diffusion_block_size', 4)
+        max_seq_len = args.max_seq_len
+        num_kv_heads = getattr(model_config, 'num_key_value_heads', 8)
+        head_dim = getattr(model_config, 'head_dim', None) or (model_config.hidden_size // model_config.num_attention_heads)
+        num_layers = model_config.num_hidden_layers
+        
+        # Create example inputs for forward_export
+        input_ids = torch.zeros(batch_size, block_size, dtype=torch.long)
+        positions = torch.arange(block_size, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+        kv_cache = torch.zeros(num_layers, 2, batch_size, num_kv_heads, max_seq_len, head_dim, dtype=torch.float32)
+        
+        example_inputs = (input_ids, positions, kv_cache)
+        print(f"      Input shapes: input_ids={input_ids.shape}, positions={positions.shape}, kv_cache={kv_cache.shape}")
+    else:
+        # Standard format: forward(input_ids)
+        example_inputs = (torch.randint(0, vocab_size, (args.batch_size, args.seq_len)),)
     
     export_config = ExportConfig(
         output_path=output_path,

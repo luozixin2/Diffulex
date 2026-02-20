@@ -7,6 +7,8 @@ Each sampler is implemented independently to match the original behavior:
 - SDARSampler: Uses ShiftLogits, similar to FastdLLM V2
 """
 
+from typing import Dict, Type
+
 from diffulex_edge.runtime.sampler.models.fast_dllm_v2 import (
     FastdLLMV2Sampler,
     FastdLLMV2SampleOutput,
@@ -33,10 +35,17 @@ __all__ = [
     "DreamSampleOutput",
     "SDARSampler",
     "SDARSampleOutput",
+    "SAMPLER_REGISTRY",
+    "get_sampler_class",
+]
+
+# Type variable for sampler classes
+SamplerClass = Type[
+    FastdLLMV2Sampler | LLaDASampler | DreamSampler | SDARSampler
 ]
 
 # Registry for model type lookup
-SAMPLER_REGISTRY = {
+SAMPLER_REGISTRY: Dict[str, SamplerClass] = {
     "fast_dllm_v2": FastdLLMV2Sampler,
     "llada": LLaDASampler,
     "dream": DreamSampler,
@@ -44,7 +53,7 @@ SAMPLER_REGISTRY = {
 }
 
 
-def get_sampler_class(model_type: str):
+def get_sampler_class(model_type: str) -> SamplerClass:
     """Get sampler class by model type.
     
     Args:

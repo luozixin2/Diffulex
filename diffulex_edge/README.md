@@ -111,10 +111,13 @@ pytest --cov=diffulex_edge --cov-report=html
 
 ## Documentation
 
-- [Architecture Details](docs/ARCHITECTURE.md)
-- [Test Plan](docs/TEST_PLAN.md)
-- [Export Guide](docs/EXPORT.md)
-- [Agent Guide](AGENTS.md)
+- [Architecture Details](docs/ARCHITECTURE.md) - System architecture and design
+- [Implementation Notes](docs/IMPLEMENTATION.md) - Block diffusion and KV cache details
+- [Export Guide](docs/EXPORT.md) - Model export to ExecuTorch
+- [Test Plan](docs/TEST_PLAN.md) - Testing strategy and coverage
+
+**Planning Documents:**
+- [Quantization Plan](docs/planning/QUANTIZATION_PLAN.md) - FP16/INT4 quantization roadmap
 
 ## Known Limitations
 

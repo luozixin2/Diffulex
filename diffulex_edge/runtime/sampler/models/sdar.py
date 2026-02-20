@@ -1,4 +1,10 @@
-"""SDAR sampler aligned with diffulex implementation."""
+"""SDAR sampler with block confirmation mechanism.
+
+Aligned with diffulex behavior:
+1. Only sample tokens in the ACTIVE block
+2. Use shifted logits (like FastdLLM V2)
+3. Global threshold with "accept at least one" policy
+"""
 
 import torch
 from typing import Dict, List
@@ -6,34 +12,24 @@ from dataclasses import dataclass, field
 
 from diffulex_edge.runtime.sampler.base import sample_tokens
 from diffulex_edge.runtime.sampler.shift import ShiftLogitsSampler
-from diffulex_edge.runtime.block import DiffusionBlockManager
+from diffulex_edge.runtime.block import DiffusionBlockManager, BlockStatus
 
 
 @dataclass
 class SDARSampleOutput:
-    """
-    Align with: diffulex.sampler.sdar.SDARSampleOutputForDiffusionLM
-    """
-    true_local_ids_map: Dict[str, Dict[str, List[int]]] = field(default_factory=dict)
-    accepted_ids_map: Dict[str, Dict[str, List[int]]] = field(default_factory=dict)
-    sampled_tokens_map: Dict[str, Dict[str, List[int]]] = field(default_factory=dict)
+    """Output from SDAR sampling."""
+    accepted_local_positions: List[int] = field(default_factory=list)  # Positions within active block
+    accepted_tokens: List[int] = field(default_factory=list)  # Token IDs
+    block_confirmed: bool = False  # Whether this block is now fully confirmed
 
 
 class SDARSampler:
-    """
-    Align with: diffulex.sampler.sdar.SDARSamplerForDiffusionLM
+    """SDAR sampler with block confirmation.
     
-    Key characteristics:
-    1. Uses ShiftLogitsSampler (like FastdLLM V2)
-    2. Global threshold parameter (like FastdLLM V2)
-    3. Always accepts at least one token (like FastdLLM V2)
-    
-    SDAR is very similar to FastdLLM V2 in its sampling behavior:
-    - Uses shifted logits
-    - Uses global threshold
-    - Always accepts at least one token
-    
-    The main difference is in the model architecture, not the sampler.
+    Key changes from original:
+    1. Only samples ACTIVE block (not all blocks)
+    2. Returns which positions were accepted
+    3. Tracks block confirmation status
     """
     
     def __init__(
@@ -62,81 +58,74 @@ class SDARSampler:
         block_manager: DiffusionBlockManager,
         logits: torch.Tensor,
     ) -> SDARSampleOutput:
+        """Sample tokens for the ACTIVE block only.
+        
+        Args:
+            block_manager: Block manager with active block
+            logits: Logits for active block [block_len, vocab_size]
+            
+        Returns:
+            SDARSampleOutput with accepted positions and tokens
         """
-        Sample tokens for all active blocks.
+        active_block = block_manager.get_active_block()
+        if active_block is None:
+            return SDARSampleOutput(block_confirmed=True)
         
-        Align with: SDARSamplerForDiffusionLM.forward
-        """
-        # Fetch and shift logits
-        last_logits = self.shift_sampler.fetch_last_logits(logits)
-        shifted_logits = self.shift_sampler.shift(logits, last_logits)
+        # Get mask positions within the active block
+        mask_positions = active_block.get_local_mask_positions()
+        if not mask_positions:
+            # Block already complete
+            return SDARSampleOutput(block_confirmed=True)
         
-        # Initialize output maps
-        true_local_ids_map: Dict[str, Dict[str, List[int]]] = {}
-        accepted_ids_map: Dict[str, Dict[str, List[int]]] = {}
-        sampled_tokens_map: Dict[str, Dict[str, List[int]]] = {}
+        # Logits correspond to active block positions directly
+        # Get logits for mask positions only
+        block_logits = logits[mask_positions]  # [num_masks, vocab_size]
         
-        seq_idx = "0"
-        true_local_ids_sub_map: Dict[str, List[int]] = {}
-        accepted_ids_sub_map: Dict[str, List[int]] = {}
-        sampled_tokens_sub_map: Dict[str, List[int]] = {}
+        # Sample tokens
+        confidence, sampled_tokens, initial_confidence = sample_tokens(
+            block_logits,
+            temperature=self.temperature,
+            top_p=self.top_p if self.top_p < 1.0 else None,
+            top_k=self.top_k if self.top_k > 0 else None,
+            margin_confidence=self.margin_confidence,
+            neg_entropy=self.neg_entropy,
+        )
         
-        # Process each active block
-        for block_id, block in block_manager.get_active_blocks():
-            if not block.is_active or block.is_complete:
-                continue
-            
-            mask_positions = block.global_mask_token_ids
-            if not mask_positions:
-                continue
-            
-            # Use shifted logits
-            mask_token_logits = shifted_logits[mask_positions]
-            
-            # Sample tokens
-            confidence, sampled_tokens, initial_confidence = sample_tokens(
-                mask_token_logits,
-                temperature=self.temperature,
-                top_p=self.top_p if self.top_p < 1.0 else None,
-                top_k=self.top_k if self.top_k > 0 else None,
-                margin_confidence=self.margin_confidence,
-                neg_entropy=self.neg_entropy,
-            )
-            
-            # Accept tokens above threshold (SDAR logic, same as FastdLLM V2)
-            high_conf_indices = torch.where(initial_confidence > self.threshold)[0]
-            
-            # Always accept at least one token
-            if len(high_conf_indices) == 0:
-                max_prob_idx = initial_confidence.argmax().view(1)
-                accepted_ids = max_prob_idx
-            else:
-                max_prob_idx = initial_confidence.argmax().view(1)
-                accepted_ids = torch.unique(torch.cat([high_conf_indices, max_prob_idx]))
-            
-            # Record results
-            accepted_ids_list = accepted_ids.cpu().tolist()
-            true_local_ids_sub_map[str(block_id)] = [
-                mask_positions[i] for i in accepted_ids_list
-            ]
-            accepted_ids_sub_map[str(block_id)] = accepted_ids_list
-            sampled_tokens_sub_map[str(block_id)] = sampled_tokens.cpu().tolist()
-            
-            # Update block
-            for idx in accepted_ids_list:
-                global_pos = mask_positions[idx]
-                local_pos = global_pos - block.start_pos
-                token_id = sampled_tokens[idx].item()
-                block.accept_token(local_pos, token_id)
+        # Accept tokens above threshold (SDAR logic: always accept at least one)
+        high_conf_indices = torch.where(initial_confidence > self.threshold)[0]
         
-        true_local_ids_map[seq_idx] = true_local_ids_sub_map
-        accepted_ids_map[seq_idx] = accepted_ids_sub_map
-        sampled_tokens_map[seq_idx] = sampled_tokens_sub_map
+        if len(high_conf_indices) == 0:
+            # Always accept at least one (highest confidence)
+            max_prob_idx = initial_confidence.argmax().item()
+            accepted_relative_indices = [max_prob_idx]
+        else:
+            # Accept all high confidence + at least one
+            max_prob_idx = initial_confidence.argmax().item()
+            accepted_relative_indices = torch.unique(
+                torch.cat([high_conf_indices, torch.tensor([max_prob_idx], device=high_conf_indices.device)])
+            ).cpu().tolist()
+        
+        # Convert to local positions and tokens
+        accepted_local_positions = []
+        accepted_tokens = []
+        
+        for rel_idx in accepted_relative_indices:
+            local_pos = mask_positions[rel_idx]
+            token_id = sampled_tokens[rel_idx].item()
+            
+            # Confirm token in block
+            is_last = active_block.confirm_token(local_pos, token_id)
+            
+            accepted_local_positions.append(local_pos)
+            accepted_tokens.append(token_id)
+        
+        # Check if block is now confirmed
+        block_confirmed = active_block.is_confirmed
         
         return SDARSampleOutput(
-            true_local_ids_map=true_local_ids_map,
-            accepted_ids_map=accepted_ids_map,
-            sampled_tokens_map=sampled_tokens_map,
+            accepted_local_positions=accepted_local_positions,
+            accepted_tokens=accepted_tokens,
+            block_confirmed=block_confirmed,
         )
     
     def reset(self) -> None:
