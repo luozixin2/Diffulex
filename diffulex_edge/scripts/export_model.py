@@ -196,9 +196,10 @@ def main():
         input_ids = torch.zeros(batch_size, block_size, dtype=torch.long)
         positions = torch.arange(block_size, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
         kv_cache = torch.zeros(num_layers, 2, batch_size, num_kv_heads, max_seq_len, head_dim, dtype=torch.float32)
+        cache_len = torch.tensor(0, dtype=torch.long)  # Scalar tensor for cache length
         
-        example_inputs = (input_ids, positions, kv_cache)
-        print(f"      Input shapes: input_ids={input_ids.shape}, positions={positions.shape}, kv_cache={kv_cache.shape}")
+        example_inputs = (input_ids, positions, kv_cache, cache_len)
+        print(f"      Input shapes: input_ids={input_ids.shape}, positions={positions.shape}, kv_cache={kv_cache.shape}, cache_len=scalar(0)")
     else:
         # Standard format: forward(input_ids)
         example_inputs = (torch.randint(0, vocab_size, (args.batch_size, args.seq_len)),)

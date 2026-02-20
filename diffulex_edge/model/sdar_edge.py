@@ -315,7 +315,7 @@ class SDAREdge(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         kv_cache: torch.Tensor,
-        cache_len: int = 0,
+        cache_len: torch.Tensor,  # Scalar tensor for ExecuTorch compatibility
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward with fixed-shape KV cache (for ExecuTorch export).
         
@@ -323,7 +323,7 @@ class SDAREdge(nn.Module):
             input_ids: [batch, block_size]
             positions: [batch, block_size]
             kv_cache: [num_layers, 2, batch, num_kv_heads, max_seq_len, head_dim]
-            cache_len: number of valid tokens in kv_cache (0 means empty cache)
+            cache_len: scalar tensor, number of valid tokens in kv_cache (0 means empty cache)
             
         Returns:
             logits: [batch, block_size, vocab_size]
@@ -334,13 +334,16 @@ class SDAREdge(nn.Module):
         updated_kv_cache = torch.zeros_like(kv_cache)
         _, _, max_seq_len, head_dim = kv_cache.shape[2:]
         
+        # Convert scalar tensor to int
+        cache_len_int = int(cache_len.item())
+        
         for i in range(num_layers):
             layer = self.layers[i]
             k_cache = kv_cache[i, 0]  # [batch, num_kv_heads, max_seq_len, head_dim]
             v_cache = kv_cache[i, 1]
             
             # Use layer's forward with cache_len and max_cache_len
-            hidden_states, new_k, new_v = layer(positions, hidden_states, k_cache, v_cache, cache_len, max_seq_len)
+            hidden_states, new_k, new_v = layer(positions, hidden_states, k_cache, v_cache, cache_len_int, max_seq_len)
             
             # new_k/new_v shape: [batch, num_kv_heads, total_seq_len, head_dim]
             # Store at the beginning to match reading pattern [:cache_len]
