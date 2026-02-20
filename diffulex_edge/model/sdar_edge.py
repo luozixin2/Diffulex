@@ -136,22 +136,27 @@ class SDARAttention(nn.Module):
         hidden_states: torch.Tensor,
         k_cache: Optional[torch.Tensor] = None,
         v_cache: Optional[torch.Tensor] = None,
+        cache_len: int = 0,
+        max_cache_len: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward with KV cache.
         
         Args:
             positions: [batch, seq_len]
             hidden_states: [batch, seq_len, hidden]
-            k_cache: [batch, num_kv_heads, max_seq_len, head_dim] - fixed shape, may contain padding
-            v_cache: [batch, num_kv_heads, max_seq_len, head_dim] - fixed shape, may contain padding
+            k_cache: [batch, num_kv_heads, max_cache_len, head_dim] - fixed shape, may contain padding
+            v_cache: [batch, num_kv_heads, max_cache_len, head_dim] - fixed shape, may contain padding
+            cache_len: number of valid tokens in k_cache/v_cache (0 means no cache)
+            max_cache_len: maximum cache length (if None, infer from k_cache or use seq_len)
             
         Returns:
             output: [batch, seq_len, hidden]
-            new_k: [batch, num_kv_heads, max_seq_len, head_dim] - updated cache
-            new_v: [batch, num_kv_heads, max_seq_len, head_dim] - updated cache
+            new_k: [batch, num_kv_heads, ..., head_dim] - updated cache
+            new_v: [batch, num_kv_heads, ..., head_dim] - updated cache
         """
         batch_size, seq_len, _ = hidden_states.shape
-        max_seq_len = k_cache.shape[2] if k_cache is not None else seq_len
+        if max_cache_len is None:
+            max_cache_len = k_cache.shape[2] if k_cache is not None else seq_len
         
         q = self.q_proj(hidden_states).view(batch_size, seq_len, self.num_heads, self.head_dim)
         k = self.k_proj(hidden_states).view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
@@ -171,17 +176,19 @@ class SDARAttention(nn.Module):
         
         q, k = self.rotary_emb(positions, q, k)
         
-        # Concatenate with cache
-        if k_cache is not None and v_cache is not None:
-            k = torch.cat([k_cache.to(target_dtype), k], dim=2)
-            v = torch.cat([v_cache.to(target_dtype), v], dim=2)
+        # Concatenate with cache (only use valid portion based on cache_len)
+        if k_cache is not None and v_cache is not None and cache_len > 0:
+            k_valid = k_cache[:, :, :cache_len, :].to(target_dtype)
+            v_valid = v_cache[:, :, :cache_len, :].to(target_dtype)
+            k = torch.cat([k_valid, k], dim=2)
+            v = torch.cat([v_valid, v], dim=2)
         
-        # Keep last max_seq_len for fixed output shape (new tokens are at the end)
-        if k.shape[2] > max_seq_len:
-            k = k[:, :, -max_seq_len:, :]
-            v = v[:, :, -max_seq_len:, :]
+        # Keep last max_cache_len for fixed output shape (new tokens are at the end)
+        if k.shape[2] > max_cache_len:
+            k = k[:, :, -max_cache_len:, :]
+            v = v[:, :, -max_cache_len:, :]
         
-        new_k, new_v = k, v
+        new_k, new_v = k.contiguous(), v.contiguous()
         
         # Attention
         if self.num_kv_heads != self.num_heads:
@@ -226,11 +233,13 @@ class SDARDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         k_cache: Optional[torch.Tensor] = None,
         v_cache: Optional[torch.Tensor] = None,
+        cache_len: int = 0,
+        max_cache_len: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward with KV cache."""
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states, new_k, new_v = self.self_attn(positions, hidden_states, k_cache, v_cache)
+        hidden_states, new_k, new_v = self.self_attn(positions, hidden_states, k_cache, v_cache, cache_len, max_cache_len)
         hidden_states = residual + hidden_states
         
         residual = hidden_states
@@ -262,6 +271,7 @@ class SDAREdge(nn.Module):
         positions: torch.Tensor,
         mask: Optional[torch.Tensor] = None,  # Ignored for SDAR (non-causal)
         kv_cache: Optional[list] = None,  # Dynamic KV cache for Python inference
+        max_seq_len: Optional[int] = None,  # Max cache length (for consistency with forward_export)
     ) -> Tuple[torch.Tensor, list]:
         """Forward with dynamic KV cache (for DiffusionEngine).
         
@@ -270,22 +280,29 @@ class SDAREdge(nn.Module):
             positions: [batch, seq_len]
             mask: Ignored for SDAR
             kv_cache: List of (k, v) tuples per layer, or None
+            max_seq_len: Maximum cache length (defaults to config.max_position_embeddings)
             
         Returns:
             logits: [batch, seq_len, vocab_size]
             new_kv_cache: List of (k, v) tuples per layer
         """
+        if max_seq_len is None:
+            max_seq_len = self.config.max_position_embeddings
+        
         hidden_states = self.embed_tokens(input_ids)
         
         new_kv_cache = []
         
         for i, layer in enumerate(self.layers):
             k_cache, v_cache = None, None
+            cache_len = 0
             if kv_cache is not None and i < len(kv_cache):
                 k_cache, v_cache = kv_cache[i]
+                cache_len = k_cache.shape[2] if k_cache is not None else 0
             
-            # Use layer's forward which has correct residual order
-            hidden_states, new_k, new_v = layer(positions, hidden_states, k_cache, v_cache)
+            # Use layer's forward with max_cache_len for consistent cache truncation
+            hidden_states, new_k, new_v = layer(positions, hidden_states, k_cache, v_cache, cache_len, max_seq_len)
+            
             new_kv_cache.append((new_k, new_v))
         
         hidden_states = self.norm(hidden_states)
@@ -298,6 +315,7 @@ class SDAREdge(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         kv_cache: torch.Tensor,
+        cache_len: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward with fixed-shape KV cache (for ExecuTorch export).
         
@@ -305,6 +323,7 @@ class SDAREdge(nn.Module):
             input_ids: [batch, block_size]
             positions: [batch, block_size]
             kv_cache: [num_layers, 2, batch, num_kv_heads, max_seq_len, head_dim]
+            cache_len: number of valid tokens in kv_cache (0 means empty cache)
             
         Returns:
             logits: [batch, block_size, vocab_size]
@@ -313,17 +332,21 @@ class SDAREdge(nn.Module):
         hidden_states = self.embed_tokens(input_ids)
         num_layers = len(self.layers)
         updated_kv_cache = torch.zeros_like(kv_cache)
+        _, _, max_seq_len, head_dim = kv_cache.shape[2:]
         
         for i in range(num_layers):
             layer = self.layers[i]
             k_cache = kv_cache[i, 0]  # [batch, num_kv_heads, max_seq_len, head_dim]
             v_cache = kv_cache[i, 1]
             
-            # Use layer's forward which has correct Pre-LN residual order
-            hidden_states, new_k, new_v = layer(positions, hidden_states, k_cache, v_cache)
+            # Use layer's forward with cache_len and max_cache_len
+            hidden_states, new_k, new_v = layer(positions, hidden_states, k_cache, v_cache, cache_len, max_seq_len)
             
-            updated_kv_cache[i, 0] = new_k
-            updated_kv_cache[i, 1] = new_v
+            # new_k/new_v shape: [batch, num_kv_heads, total_seq_len, head_dim]
+            # Store at the beginning to match reading pattern [:cache_len]
+            actual_len = min(new_k.shape[2], max_seq_len)
+            updated_kv_cache[i, 0, :, :, :actual_len, :] = new_k[:, :, :actual_len, :]
+            updated_kv_cache[i, 1, :, :, :actual_len, :] = new_v[:, :, :actual_len, :]
         
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
