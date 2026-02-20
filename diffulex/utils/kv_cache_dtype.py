@@ -1,11 +1,5 @@
-"""
-KV Cache dtype utilities.
+"""KV Cache dtype utilities (re-export from quantization module)."""
 
-This module has been moved to diffulex.utils.quantization.kv_cache_dtype.
-This file is kept for backward compatibility and re-exports from the new location.
-"""
-
-# Re-export everything from the new location for backward compatibility
 from diffulex.utils.quantization.kv_cache_dtype import (
     KvCacheDType,
     KvCacheDTypeSpec,

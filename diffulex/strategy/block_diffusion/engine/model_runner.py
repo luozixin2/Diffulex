@@ -192,8 +192,8 @@ class BDModelRunner(ModelRunnerBase):
         try:
             from diffulex.layer.linear import LinearBase
             for m in self.model.modules():
-                if isinstance(m, LinearBase):
-                    m.enable_forward_plan(True)
+                if isinstance(m, LinearBase) and m.has_delegate():
+                    m.get_delegate().enable_forward_plan(True)
         except Exception:
             pass
 

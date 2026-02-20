@@ -1,3 +1,5 @@
+"""KV Cache dtype utilities."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,9 +9,8 @@ from typing import Any
 import torch
 
 try:
-    # vLLM provides a platform-specific fp8 dtype (can be e4m3fn / e4m3fnuz, etc.)
-    from vllm.platforms import current_platform  # type: ignore
-except Exception:  # pragma: no cover
+    from vllm.platforms import current_platform
+except Exception:
     current_platform = None
 
 
@@ -31,6 +32,7 @@ class KvCacheDTypeSpec:
 
 
 def _normalize_kv_cache_dtype(kv_cache_dtype: str) -> str:
+    """Normalize dtype string to standard format."""
     s = (kv_cache_dtype or "").strip().lower()
     aliases = {
         "bf16": "bf16",
@@ -54,24 +56,25 @@ def _normalize_kv_cache_dtype(kv_cache_dtype: str) -> str:
 
 
 def _get_fp8_e4m3_dtype() -> torch.dtype:
+    """Get FP8 E4M3 dtype (platform-specific)."""
     if current_platform is None:
         if hasattr(torch, "float8_e4m3fn"):
-            return torch.float8_e4m3fn  # type: ignore[attr-defined]
+            return torch.float8_e4m3fn
         raise RuntimeError("FP8 requested but vLLM current_platform is unavailable.")
     return current_platform.fp8_dtype()
 
 
 def _get_fp8_e5m2_dtype() -> torch.dtype:
+    """Get FP8 E5M2 dtype."""
     if hasattr(torch, "float8_e5m2"):
-        return torch.float8_e5m2  # type: ignore[attr-defined]
+        return torch.float8_e5m2
     if hasattr(torch, "float8_e5m2fnuz"):
-        return torch.float8_e5m2fnuz  # type: ignore[attr-defined]
-    raise RuntimeError(
-        "FP8 E5M2 requested but this torch build does not expose float8_e5m2 dtype."
-    )
+        return torch.float8_e5m2fnuz
+    raise RuntimeError("FP8 E5M2 dtype not available in this torch build.")
 
 
 def parse_kv_cache_dtype(kv_cache_dtype: str) -> KvCacheDTypeSpec:
+    """Parse kv_cache_dtype string into a spec."""
     norm = _normalize_kv_cache_dtype(kv_cache_dtype)
     if norm == "bf16":
         return KvCacheDTypeSpec(KvCacheDType.BF16, False, None, None, None)
@@ -86,7 +89,7 @@ def parse_kv_cache_dtype(kv_cache_dtype: str) -> KvCacheDTypeSpec:
     elif norm == "fp8_e5m2":
         fp8 = _get_fp8_e5m2_dtype()
         enum = KvCacheDType.FP8_E5M2
-    else:  # pragma: no cover
+    else:
         raise AssertionError(norm)
 
     info = torch.finfo(fp8)
@@ -106,11 +109,7 @@ def ensure_scale_tensor(
     device: torch.device,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """
-    Returns a CUDA tensor suitable for Triton:
-    - shape [num_kv_heads] (per-head)
-    - dtype float32 by default
-    """
+    """Convert scale to tensor with shape [num_kv_heads]."""
     if scale is None:
         return torch.ones((num_kv_heads,), device=device, dtype=dtype)
     if isinstance(scale, (float, int)):
@@ -127,10 +126,7 @@ def ensure_scale_tensor(
 
 
 def view_fp8_cache(cache: torch.Tensor, kv_cache_dtype: str) -> torch.Tensor:
-    """
-    FP8 KV cache uses uint8 as storage for compatibility. This returns a view tensor
-    whose dtype is fp8, so Triton will see the correct element type.
-    """
+    """Return FP8 cache view with correct dtype."""
     spec = parse_kv_cache_dtype(kv_cache_dtype)
     if not spec.is_fp8:
         return cache
@@ -142,5 +138,3 @@ def view_fp8_cache(cache: torch.Tensor, kv_cache_dtype: str) -> torch.Tensor:
     raise AssertionError(
         f"FP8 cache must be torch.uint8 (storage) or {spec.fp8_view_dtype}, got {cache.dtype}"
     )
-
-

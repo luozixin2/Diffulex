@@ -48,32 +48,41 @@ def list_quantized_layers(model, format_name: str):
     other_count = 0
     no_quant_count = 0
     
+    from diffulex.layer.linear_clean import LinearBase
+    from diffulex.utils.quantization import QuantizedLinearDelegate
+    
     for name, module in model.named_modules():
-        if hasattr(module, "has_offline_quantized_weight"):
-            if module.has_offline_quantized_weight():
-                format_val = int(module._offline_quant_format.item()) if module._offline_quant_format.numel() > 0 else 0
-                if format_val == 1:
-                    quant_status = "GPTQ (离线)"
-                    gptq_count += 1
-                elif format_val == 2:
-                    quant_status = "AWQ (离线)"
-                    awq_count += 1
-                else:
-                    quant_status = "未知"
-                    other_count += 1
-                module_type = module.__class__.__name__
-                print(f"{name:<50} {module_type:<15} {quant_status:<15}")
-            elif hasattr(module, "has_quantized_weight") and module.has_quantized_weight():
-                quant_status = "运行时量化"
-                module_type = module.__class__.__name__
-                print(f"{name:<50} {module_type:<15} {quant_status:<15}")
-                other_count += 1
-            elif hasattr(module, "weight") and module.weight is not None:
-                quant_status = "未量化"
-                module_type = module.__class__.__name__
-                if "Linear" in module_type:
+        if isinstance(module, LinearBase) and module.has_delegate():
+            delegate = module.get_delegate()
+            if isinstance(delegate, QuantizedLinearDelegate):
+                if delegate.has_offline_quantized_weight():
+                    # Try to determine format from container
+                    container = delegate.get_container()
+                    format_name = "未知"
+                    if hasattr(container, 'weight_format'):
+                        format_name = str(container.weight_format)
+                    if 'GPTQ' in format_name or 'gptq' in format_name:
+                        quant_status = "GPTQ (离线)"
+                        gptq_count += 1
+                    elif 'AWQ' in format_name or 'awq' in format_name:
+                        quant_status = "AWQ (离线)"
+                        awq_count += 1
+                    else:
+                        quant_status = f"离线量化 ({format_name})"
+                        other_count += 1
+                    module_type = module.__class__.__name__
                     print(f"{name:<50} {module_type:<15} {quant_status:<15}")
-                    no_quant_count += 1
+                elif delegate.has_quantized_weight():
+                    quant_status = "运行时量化"
+                    module_type = module.__class__.__name__
+                    print(f"{name:<50} {module_type:<15} {quant_status:<15}")
+                    other_count += 1
+                elif hasattr(module, "weight") and module.weight is not None:
+                    quant_status = "未量化"
+                    module_type = module.__class__.__name__
+                    if "Linear" in module_type:
+                        print(f"{name:<50} {module_type:<15} {quant_status:<15}")
+                        no_quant_count += 1
     
     print("-" * 80)
     print(f"\n统计:")
