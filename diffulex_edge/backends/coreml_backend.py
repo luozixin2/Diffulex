@@ -95,6 +95,34 @@ class CoreMLBackend(EdgeBackend):
         
         return self._partitioner
     
+    def _prepare_model_for_export(self, model: nn.Module) -> nn.Module:
+        """准备模型用于导出.
+        
+        如果模型支持导出（有 get_export_wrapper 方法），使用包装器。
+        否则直接使用原始模型。
+        
+        Args:
+            model: 原始模型
+            
+        Returns:
+            准备好用于导出的模型
+        """
+        # Check if model provides an export wrapper
+        if hasattr(model, 'get_export_wrapper'):
+            wrapper = model.get_export_wrapper()
+            if wrapper is not None:
+                logger.info(f"Using model's export wrapper: {type(wrapper).__name__}")
+                return wrapper
+        
+        # Check for legacy forward_export (backward compatibility)
+        if hasattr(model, 'forward_export'):
+            logger.info("Detected forward_export method, using generic ExportWrapper")
+            from ..model.wrapper import ExportWrapper
+            return ExportWrapper(model)
+        
+        # Use model as-is
+        return model
+    
     def export(
         self,
         model: nn.Module,
@@ -132,14 +160,17 @@ class CoreMLBackend(EdgeBackend):
             # 1. 确保模型处于评估模式
             model.eval()
             
-            # 2. 导出为 ExportedProgram
+            # 2. 准备模型（使用包装器如果需要）
+            export_model = self._prepare_model_for_export(model)
+            
+            # 3. 导出为 ExportedProgram
             logger.info("Exporting to ExportedProgram...")
             if isinstance(example_inputs, dict):
-                ep = export(model, (), example_inputs)
+                ep = export(export_model, (), example_inputs)
             else:
                 if not isinstance(example_inputs, tuple):
                     example_inputs = (example_inputs,)
-                ep = export(model, example_inputs)
+                ep = export(export_model, example_inputs)
             
             # 3. 使用新的工作流：to_edge_transform_and_lower
             logger.info("Converting to Edge Dialect and lowering to CoreML...")

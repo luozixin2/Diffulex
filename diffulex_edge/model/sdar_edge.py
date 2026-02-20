@@ -519,6 +519,77 @@ class SDAREdge(nn.Module):
         logits = self.lm_head(hidden_states)
         
         return logits, updated_kv_cache
+    
+    def get_export_wrapper(self):
+        """Get export wrapper for SDAR model.
+        
+        Returns:
+            BlockDiffusionWrapper for ExecuTorch export
+        """
+        from .wrapper import BlockDiffusionWrapper
+        return BlockDiffusionWrapper(
+            self,
+            block_size=self.config.diffusion_block_size,
+            max_seq_len=self.config.max_position_embeddings,
+        )
+    
+    def get_export_inputs(
+        self,
+        batch_size: int = 1,
+        seq_len: int = 128,
+        device: str = "cpu",
+    ):
+        """Create example inputs for SDAR export.
+        
+        SDAR uses Block Diffusion format with special mask inputs.
+        
+        Args:
+            batch_size: Batch size
+            seq_len: Sequence length (used as max_seq_len for SDAR)
+            device: Device to create tensors on
+            
+        Returns:
+            Tuple of input tensors for forward_export
+        """
+        block_size = self.config.diffusion_block_size
+        max_seq_len = seq_len  # Use seq_len as max_seq_len
+        num_layers = self.config.num_hidden_layers
+        num_kv_heads = self.config.num_key_value_heads
+        head_dim = self.config.head_dim or (self.config.hidden_size // self.config.num_attention_heads)
+        
+        # Standard inputs
+        input_ids = torch.zeros(batch_size, block_size, dtype=torch.long, device=device)
+        positions = torch.arange(
+            block_size, dtype=torch.long, device=device
+        ).unsqueeze(0).expand(batch_size, -1)
+        
+        # KV cache
+        kv_cache = torch.zeros(
+            num_layers, 2, batch_size, num_kv_heads, max_seq_len, head_dim,
+            dtype=torch.float32, device=device
+        )
+        
+        # Block Diffusion masks (for empty cache)
+        attention_mask = torch.zeros(
+            num_layers, batch_size, 1, block_size, max_seq_len + block_size,
+            dtype=torch.float32, device=device
+        )
+        attention_mask[:, :, :, :, 0:max_seq_len] = -10000.0
+        
+        insert_matrix = torch.zeros(
+            num_layers, batch_size, 1, max_seq_len, block_size,
+            dtype=torch.float32, device=device
+        )
+        for i in range(block_size):
+            insert_matrix[:, :, :, i, i] = 1.0
+        
+        keep_mask = torch.ones(
+            num_layers, batch_size, 1, max_seq_len, 1,
+            dtype=torch.float32, device=device
+        )
+        keep_mask[:, :, :, 0:block_size, :] = 0.0
+        
+        return (input_ids, positions, kv_cache, attention_mask, insert_matrix, keep_mask)
 
 
 __all__ = ["SDAREdgeConfig", "SDAREdge"]

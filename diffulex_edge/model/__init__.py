@@ -5,7 +5,16 @@ Supported diffusion language models for edge deployment:
 - DreamEdge: Dream model architecture  
 - LLaDAEdge: LLaDA model architecture
 - SDAREdge: SDAR model architecture (with per-head Q/K norm)
+
+New Architecture (Refactored):
+- Base classes in `base.py`: ModelConfig, DiffusionModel
+- Export wrappers in `wrapper.py`: ExportWrapper, BlockDiffusionWrapper
+- Shared components in `components/`: RMSNorm, RotaryEmbedding, SwiGLUMLP
 """
+
+# Base classes (new architecture)
+from diffulex_edge.model.base import ModelConfig, DiffusionModel, KVCacheModel
+from diffulex_edge.model.wrapper import ExportWrapper, BlockDiffusionWrapper
 
 # Import all edge models
 from diffulex_edge.model.fast_dllm_v2_edge import FastdLLMV2Edge, FastdLLMV2EdgeConfig
@@ -24,6 +33,13 @@ from diffulex_edge.model.model_loader import (
 )
 
 __all__ = [
+    # Base Classes (new architecture)
+    "ModelConfig",
+    "DiffusionModel",
+    "KVCacheModel",
+    # Export Wrappers (new architecture)
+    "ExportWrapper",
+    "BlockDiffusionWrapper",
     # Models
     "FastdLLMV2Edge",
     "DreamEdge",
