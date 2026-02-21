@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from diffulex_edge.export import ExportConfig, BackendType, QuantizationType, DiffuLexExporter
 from diffulex_edge.model import load_hf_model, MODEL_REGISTRY
+from diffulex_edge.quant.real_weight_quant import get_model_size_info
 
 
 def create_demo_model(model_type: str):
@@ -55,6 +56,11 @@ def create_demo_model(model_type: str):
             "num_attention_heads": 16, "num_key_value_heads": 8,
             "intermediate_size": 6144, "max_position_embeddings": 4096,
         }),
+        "sdar_tiny": (SDAREdgeConfig, SDAREdge, {
+            "vocab_size": 1000, "hidden_size": 256, "num_hidden_layers": 4,
+            "num_attention_heads": 4, "num_key_value_heads": 2,
+            "intermediate_size": 512, "max_position_embeddings": 512,
+        }),
     }
 
     if model_type not in configs:
@@ -82,7 +88,7 @@ def main():
     )
     parser.add_argument(
         "--model-type",
-        choices=["fast_dllm_v2", "dream", "llada", "sdar"],
+        choices=["fast_dllm_v2", "dream", "llada", "sdar", "sdar_tiny"],
         help="Model type for demo export",
     )
     
@@ -103,7 +109,7 @@ def main():
     )
     parser.add_argument(
         "--quantization",
-        choices=["none", "fp16", "dynamic_int8"],
+        choices=["none", "fp16", "dynamic_int8", "static_int8", "weight_only_int8", "int4"],
         default="fp16",
         help="Quantization type (default: fp16)",
     )
@@ -176,6 +182,16 @@ def main():
     print(f"      Quantization: {args.quantization}")
     print(f"      Output: {output_path}")
     
+    # Map string to QuantizationType
+    quant_map = {
+        "none": QuantizationType.NONE,
+        "fp16": QuantizationType.FP16,
+        "dynamic_int8": QuantizationType.DYNAMIC_INT8,
+        "static_int8": QuantizationType.STATIC_INT8,
+        "weight_only_int8": QuantizationType.WEIGHT_ONLY_INT8,
+        "int4": QuantizationType.INT4,
+    }
+    
     # Create example inputs for export
     # New architecture: use model's get_export_inputs method if available
     if hasattr(model, 'get_export_inputs'):
@@ -226,7 +242,7 @@ def main():
     )
     
     # Export
-    print(f"\n[3/3] Exporting to ExecuTorch...")
+    print(f"\n[3/3] Exporting to ExecuTorch (this may take a while)...")
     exporter = DiffuLexExporter(export_config)
     result = exporter.export(model, example_inputs)
     

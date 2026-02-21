@@ -24,6 +24,7 @@ class QuantizationType(Enum):
     STATIC_INT8 = "static_int8"  # Static INT8 quantization
     WEIGHT_ONLY_INT8 = "weight_only_int8"  # Weight-only INT8
     FP16 = "fp16"                # FP16 (half precision)
+    INT4 = "int4"                # INT4 weight-only quantization (via torchao)
 
 
 @dataclasses.dataclass
