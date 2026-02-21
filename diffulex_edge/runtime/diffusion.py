@@ -32,12 +32,28 @@ class DiffusionBlock:
         is_active: Whether this block is still being processed
         accepted_token_ids: Map from local position to accepted token ID
         global_mask_token_ids: Global positions of tokens still masked
+        accept_threshold: Per-block confidence threshold (Dream-specific)
+        pre_block_complete: Whether previous blocks are complete (Dream-specific)
     """
     start_pos: int
     length: int
-    mask_token_id: int = 126336  # Default mask token for FastdLLM
+    mask_token_id: int = 151665  # Fast dLLM v2 default (aligned with diffulex)
     is_active: bool = True
     accepted_token_ids: Dict[int, int] = field(default_factory=dict)
+    accept_threshold: float = 0.9  # Aligned with diffulex Config.accept_threshold
+    pre_block_complete: bool = False  # Whether previous blocks are complete (Dream)
+    
+    @property
+    def local_mask_token_ids(self) -> List[int]:
+        """Get local positions of tokens that are still masked.
+        
+        Aligned with Diffulex block.local_mask_token_ids.
+        """
+        return [
+            i
+            for i in range(self.length)
+            if i not in self.accepted_token_ids
+        ]
     
     @property
     def global_mask_token_ids(self) -> List[int]:
@@ -92,22 +108,30 @@ class DiffusionBlockManager:
     Handles creation, tracking, and lifecycle of diffusion blocks.
     """
     
-    def __init__(self, mask_token_id: int = 126336):
+    def __init__(self, mask_token_id: int = 151665):  # Fast dLLM v2 default
         """Initialize the block manager.
         
         Args:
-            mask_token_id: Token ID used for masking
+            mask_token_id: Token ID used for masking (Fast dLLM v2: 151665, Dream: 151666)
         """
         self.mask_token_id = mask_token_id
         self.blocks: List[DiffusionBlock] = []
         self._block_id_counter = 0
     
-    def create_block(self, start_pos: int, length: int) -> int:
+    def create_block(
+        self, 
+        start_pos: int, 
+        length: int,
+        accept_threshold: Optional[float] = None,
+        pre_block_complete: bool = False,
+    ) -> int:
         """Create a new diffusion block.
         
         Args:
             start_pos: Start position in the sequence
             length: Length of the block
+            accept_threshold: Per-block confidence threshold (Dream-specific)
+            pre_block_complete: Whether previous blocks are complete (Dream-specific)
             
         Returns:
             Block ID for the created block
@@ -120,10 +144,16 @@ class DiffusionBlockManager:
         if start_pos < 0:
             raise ValueError(f"Start position must be non-negative, got {start_pos}")
         
+        # Use default threshold if not specified
+        if accept_threshold is None:
+            accept_threshold = 0.95
+        
         block = DiffusionBlock(
             start_pos=start_pos,
             length=length,
             mask_token_id=self.mask_token_id,
+            accept_threshold=accept_threshold,
+            pre_block_complete=pre_block_complete,
         )
         
         block_id = self._block_id_counter
@@ -131,6 +161,24 @@ class DiffusionBlockManager:
         self._block_id_counter += 1
         
         return block_id
+    
+    def update_pre_block_complete(self) -> None:
+        """Update pre_block_complete status for all blocks.
+        
+        For Dream: Mark block n as pre_block_complete=True if all previous
+        blocks (0 to n-1) are complete.
+        """
+        for i, block in enumerate(self.blocks):
+            if i == 0:
+                # First block is always pre-complete (nothing before it)
+                block.pre_block_complete = True
+            else:
+                # Check if all previous blocks are complete
+                all_prev_complete = all(
+                    self.blocks[j].is_complete 
+                    for j in range(i)
+                )
+                block.pre_block_complete = all_prev_complete
     
     def get_block(self, block_id: int) -> Optional[DiffusionBlock]:
         """Get a block by ID.
@@ -236,8 +284,8 @@ class DiffusionSampler:
     
     def __init__(
         self,
-        mask_token_id: int = 126336,
-        confidence_threshold: float = 0.95,
+        mask_token_id: int = 151665,  # Fast dLLM v2 default
+        confidence_threshold: float = 0.9,  # Aligned with diffulex
         temperature: float = 1.0,
         top_k: int = 0,  # 0 means disabled
         top_p: float = 1.0,  # 1.0 means disabled
@@ -247,8 +295,8 @@ class DiffusionSampler:
         """Initialize diffusion sampler.
         
         Args:
-            mask_token_id: Token ID for mask tokens
-            confidence_threshold: Threshold for accepting tokens (0-1)
+            mask_token_id: Token ID for mask tokens (Fast dLLM v2: 151665, Dream: 151666)
+            confidence_threshold: Threshold for accepting tokens (0-1), aligned with diffulex: 0.9
             temperature: Sampling temperature
             top_k: Top-k sampling parameter (0 = disabled)
             top_p: Top-p (nucleus) sampling parameter (1.0 = disabled)
@@ -467,13 +515,16 @@ class DiffusionSampler:
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
         threshold: Optional[float] = None,
+        is_prefill: bool = True,
     ) -> SampleOutput:
         """Sample tokens for all active blocks.
         
-        Aligned with Diffulex FastdLLMV2SamplerForDiffusionLM.forward:
+        Aligned with Diffulex FastdLLMV2SamplerForDiffusionLM.forward and
+        DreamSamplerForDiffusionLM.forward:
         - Samples from mask positions in each block
         - Accepts tokens based on confidence threshold
         - Always accepts at least the highest confidence token
+        - Supports Dream's pre_block_complete logic
         
         Args:
             block_manager: Manager containing active blocks
@@ -482,15 +533,19 @@ class DiffusionSampler:
             top_p: Optional override for top_p
             top_k: Optional override for top_k
             threshold: Optional override for confidence_threshold
+            is_prefill: Whether in prefill phase (affects mask position selection)
             
         Returns:
             SampleOutput with sampled tokens and acceptance info
         """
         output = SampleOutput()
         temp = temperature if temperature is not None else self.temperature
-        threshold = threshold if threshold is not None else self.confidence_threshold
+        global_threshold = threshold if threshold is not None else self.confidence_threshold
         top_p = top_p if top_p is not None else self.top_p
         top_k = top_k if top_k is not None else self.top_k
+        
+        # Update pre_block_complete status for Dream
+        block_manager.update_pre_block_complete()
         
         # Get active blocks
         active_blocks = block_manager.get_active_blocks()
@@ -500,6 +555,10 @@ class DiffusionSampler:
             if not block.is_active:
                 continue
             
+            # Check if block has mask tokens (aligned with Diffulex)
+            if sum(block.local_mask_token_ids) == 0:
+                continue
+            
             # Get mask positions for this block
             mask_positions = block.global_mask_token_ids
             
@@ -507,26 +566,43 @@ class DiffusionSampler:
                 continue
             
             # Extract logits for mask positions
-            block_logits = logits[mask_positions]  # [num_mask, vocab_size]
+            # Aligned with Diffulex: use local_mask_token_ids in decode, global in prefill
+            if is_prefill:
+                mask_token_logits = logits[mask_positions]  # [num_mask, vocab_size]
+            else:
+                local_mask_ids = block.local_mask_token_ids
+                mask_token_logits = logits[local_mask_ids]  # [num_mask, vocab_size]
             
             # Sample tokens (aligned with Diffulex)
             confidence, sampled_tokens, initial_confidence = self.sample_tokens(
-                block_logits,
+                mask_token_logits,
                 temperature=temp,
                 top_p=top_p,
                 top_k=top_k,
             )
             
-            # Determine which tokens to accept based on confidence
-            high_conf_indices = torch.where(initial_confidence > threshold)[0]
+            # Use per-block threshold if available (Dream), otherwise use global
+            block_threshold = block.accept_threshold if hasattr(block, 'accept_threshold') else global_threshold
             
-            # Always accept at least the highest confidence token (Diffulex behavior)
-            if len(high_conf_indices) == 0:
-                max_prob_idx = initial_confidence.argmax().view(1)
-                accept_indices = max_prob_idx
+            # Determine which tokens to accept based on confidence
+            # Aligned with DreamSamplerForDiffusionLM.forward
+            high_conf_indices = torch.where(initial_confidence > block_threshold)[0]
+            
+            if block.pre_block_complete:
+                # Dream logic: Previous blocks are complete
+                # Can accept all high confidence tokens
+                if len(high_conf_indices) == 0:
+                    # No high confidence tokens, accept only top-1
+                    number_transfer_tokens = 1
+                    _, transfer_index = torch.topk(confidence, number_transfer_tokens)
+                    accept_indices = transfer_index
+                else:
+                    # Accept all high confidence tokens
+                    accept_indices = high_conf_indices
             else:
-                max_prob_idx = initial_confidence.argmax().view(1)
-                accept_indices = torch.unique(torch.cat([high_conf_indices, max_prob_idx]))
+                # Dream logic: Previous blocks not complete
+                # Only accept high confidence tokens
+                accept_indices = high_conf_indices
             
             # Update output
             for i, pos in enumerate(mask_positions):
@@ -561,6 +637,7 @@ class DiffusionSampler:
                 "is_complete": block.is_complete,
                 "num_accepted": len(block.accepted_token_ids),
                 "num_masked": len(block.global_mask_token_ids),
+                "pre_block_complete": block.pre_block_complete,
             })
         
         return output
@@ -574,24 +651,28 @@ class DiffusionGenerationConfig:
         max_new_tokens: Maximum tokens to generate
         num_iterations: Number of diffusion iterations (denoising steps)
         block_size: Size of each diffusion block
-        confidence_threshold: Threshold for accepting tokens
+        confidence_threshold: Threshold for accepting tokens (aligned with diffulex: 0.9)
         temperature: Sampling temperature
         top_k: Top-k sampling parameter
         top_p: Top-p sampling parameter
-        mask_token_id: Token ID for masking
+        mask_token_id: Token ID for masking (Fast dLLM v2: 151665, Dream: 151666)
         eos_token_id: End-of-sequence token ID
         early_stop: Whether to stop when all blocks complete
+        per_block_threshold: Optional per-block thresholds (Dream-specific)
+        enable_dream_logic: Whether to enable Dream's pre_block_complete logic
     """
     max_new_tokens: int = 100
-    num_iterations: int = 10
-    block_size: int = 10
-    confidence_threshold: float = 0.95
+    num_iterations: int = 32  # Aligned with diffulex (more iterations for better quality)
+    block_size: int = 32
+    confidence_threshold: float = 0.9  # Aligned with diffulex Config.accept_threshold
     temperature: float = 1.0
     top_k: int = 0
     top_p: float = 1.0
-    mask_token_id: int = 126336
+    mask_token_id: int = 151665  # Fast dLLM v2 default
     eos_token_id: int = 2
     early_stop: bool = True
+    per_block_threshold: Optional[List[float]] = None  # Per-block thresholds for Dream
+    enable_dream_logic: bool = False  # Enable Dream's pre_block_complete logic
 
 
 class DiffusionEngine:
@@ -617,6 +698,7 @@ class DiffusionEngine:
         model: Optional[torch.nn.Module] = None,
         pte_path: Optional[Union[str, Path]] = None,
         device: str = "cpu",
+        mask_token_id: Optional[int] = None,
     ):
         """Initialize diffusion engine.
         
@@ -624,6 +706,7 @@ class DiffusionEngine:
             model: PyTorch model for inference
             pte_path: Path to .pte file (if loading ExecuTorch model)
             device: Device to run on
+            mask_token_id: Token ID for masking (auto-detected from model if not provided)
             
         Raises:
             ValueError: If both model and pte_path are provided, or neither
@@ -646,8 +729,14 @@ class DiffusionEngine:
         self.model = model
         self.pte_path = Path(pte_path) if pte_path is not None else None
         self.device = device
-        self.block_manager = DiffusionBlockManager()
-        self.sampler = DiffusionSampler()
+        
+        # Auto-detect mask_token_id from model config if not provided
+        if mask_token_id is None and model is not None:
+            mask_token_id = self._get_mask_token_id_from_model(model)
+        self.mask_token_id = mask_token_id or 151665  # Default to Fast dLLM v2
+        
+        self.block_manager = DiffusionBlockManager(mask_token_id=self.mask_token_id)
+        self.sampler = DiffusionSampler(mask_token_id=self.mask_token_id)
         
         # PTE state
         self._is_pte: bool = self.pte_path is not None
@@ -661,6 +750,25 @@ class DiffusionEngine:
             logger.debug(f"Loaded PyTorch model on {device}")
         elif self.pte_path is not None:
             self._load_pte_model()
+    
+    def _get_mask_token_id_from_model(self, model: torch.nn.Module) -> int:
+        """Extract mask_token_id from model config.
+        
+        Args:
+            model: PyTorch model
+            
+        Returns:
+            mask_token_id from model config or default
+        """
+        if hasattr(model, 'config'):
+            config = model.config
+            # Try different attribute names used by different models
+            if hasattr(config, 'mask_token_id'):
+                return config.mask_token_id
+            elif hasattr(config, 'pad_token_id'):
+                # Fallback to pad_token_id if mask_token_id not set
+                return getattr(config, 'mask_token_id', config.pad_token_id)
+        return 151665  # Fast dLLM v2 default
     
     def _load_pte_model(self) -> None:
         """Load ExecuTorch model from pte_path.
@@ -776,7 +884,20 @@ class DiffusionEngine:
             remaining = config.max_new_tokens - i * config.block_size
             block_len = min(config.block_size, remaining)
             
-            self.block_manager.create_block(start_pos, block_len)
+            # Get per-block threshold if available (Dream)
+            block_threshold = None
+            if config.per_block_threshold is not None and i < len(config.per_block_threshold):
+                block_threshold = config.per_block_threshold[i]
+            
+            # For Dream: first block always has pre_block_complete=True
+            pre_block_complete = True if i == 0 else False
+            
+            self.block_manager.create_block(
+                start_pos, 
+                block_len,
+                accept_threshold=block_threshold,
+                pre_block_complete=pre_block_complete,
+            )
             
             # Add mask tokens to sequence
             sequence.extend([config.mask_token_id] * block_len)
@@ -802,8 +923,15 @@ class DiffusionEngine:
             # Apply shift (with caching for multi-step)
             shifted_logits = self.sampler.shift_logits(logits, use_cache=True)
             
+            # Determine if prefill (first iteration) or decode
+            is_prefill = (iteration == 0)
+            
             # Sample blocks
-            output = self.sampler.sample_blocks(self.block_manager, shifted_logits)
+            output = self.sampler.sample_blocks(
+                self.block_manager, 
+                shifted_logits,
+                is_prefill=is_prefill
+            )
             
             # Update sequence with accepted tokens
             for pos, token_id in output.accepted_tokens.items():
@@ -842,7 +970,12 @@ class DiffusionEngine:
             raise RuntimeError("No model loaded")
         
         with torch.no_grad():
-            return self.model(input_ids)[0]
+            batch_size, seq_len = input_ids.shape
+            # Generate position indices
+            positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+            # Call model with positions
+            logits, _ = self.model(input_ids, positions)
+            return logits
     
     def _forward_pte(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Forward pass using ExecuTorch model.
@@ -914,7 +1047,21 @@ class DiffusionEngine:
             start_pos = prompt_len + i * config.block_size
             remaining = config.max_new_tokens - i * config.block_size
             block_len = min(config.block_size, remaining)
-            self.block_manager.create_block(start_pos, block_len)
+            
+            # Get per-block threshold if available (Dream)
+            block_threshold = None
+            if config.per_block_threshold is not None and i < len(config.per_block_threshold):
+                block_threshold = config.per_block_threshold[i]
+            
+            # For Dream: first block always has pre_block_complete=True
+            pre_block_complete = True if i == 0 else False
+            
+            self.block_manager.create_block(
+                start_pos, 
+                block_len,
+                accept_threshold=block_threshold,
+                pre_block_complete=pre_block_complete,
+            )
             sequence.extend([config.mask_token_id] * block_len)
         
         # Track already yielded positions
@@ -930,7 +1077,15 @@ class DiffusionEngine:
             logits = self._forward(input_ids)[0]
             
             shifted_logits = self.sampler.shift_logits(logits)
-            output = self.sampler.sample_blocks(self.block_manager, shifted_logits)
+            
+            # Determine if prefill (first iteration) or decode
+            is_prefill = (iteration == 0)
+            
+            output = self.sampler.sample_blocks(
+                self.block_manager, 
+                shifted_logits,
+                is_prefill=is_prefill
+            )
             
             # Update sequence and yield new accepts
             for pos, token_id in output.accepted_tokens.items():
