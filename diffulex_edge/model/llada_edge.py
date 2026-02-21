@@ -1,12 +1,15 @@
 """LLaDA model for DiffuLex Edge.
 
 Edge-optimized version without tensor parallelism.
+Uses shared components from components/ module.
 """
 
 import torch
 import torch.nn as nn
 from dataclasses import dataclass
 from typing import Optional, Tuple
+
+from ..components import RMSNorm, RotaryEmbedding, SwiGLUMLP
 
 
 @dataclass
@@ -30,70 +33,6 @@ class LLaDAEdgeConfig:
     confidence_threshold: float = 0.9
 
 
-class LLaDARMSNorm(nn.Module):
-    """RMS Norm for LLaDA."""
-    
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.eps = eps
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        return self.weight * x
-
-
-class LLaDARotaryEmbedding(nn.Module):
-    """Rotary positional embedding (RoPE) for LLaDA."""
-    
-    def __init__(
-        self,
-        head_dim: int,
-        max_position: int = 4096,
-        base: float = 10000.0,
-    ):
-        super().__init__()
-        self.head_dim = head_dim
-        self.max_position = max_position
-        self.base = base
-        
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, head_dim, 2).float() / head_dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        
-        t = torch.arange(max_position, dtype=torch.float32)
-        freqs = torch.outer(t, self.inv_freq)
-        emb = torch.cat([freqs, freqs], dim=-1)
-        self.register_buffer("cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("sin_cached", emb.sin(), persistent=False)
-    
-    def forward(
-        self,
-        positions: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Apply rotary embedding to q and k."""
-        cos = self.cos_cached[positions].unsqueeze(1)  # [B, 1, S, D]
-        sin = self.sin_cached[positions].unsqueeze(1)  # [B, 1, S, D]
-        
-        q_embed = self._rotate_half(q, cos, sin)
-        k_embed = self._rotate_half(k, cos, sin)
-        
-        return q_embed, k_embed
-    
-    def _rotate_half(
-        self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> torch.Tensor:
-        """Rotate half the hidden dims."""
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return torch.cat([-x2, x1], dim=-1) * sin + x * cos
-
-
 class LLaDAAttention(nn.Module):
     """LLaDA attention mechanism (Edge version without tensor parallelism)."""
     
@@ -110,9 +49,9 @@ class LLaDAAttention(nn.Module):
         self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=False)
         
-        self.rotary_emb = LLaDARotaryEmbedding(
+        self.rotary_emb = RotaryEmbedding(
             self.head_dim,
-            max_position=config.max_position_embeddings,
+            max_position_embeddings=config.max_position_embeddings,
             base=config.rope_theta,
         )
     
@@ -160,31 +99,15 @@ class LLaDAAttention(nn.Module):
         return torch.matmul(attn_weights, v)
 
 
-class LLaDAMLP(nn.Module):
-    """LLaDA MLP with SiLU activation."""
-    
-    def __init__(self, config: LLaDAEdgeConfig):
-        super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
-        self.act_fn = nn.SiLU()
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate = self.act_fn(self.gate_proj(x))
-        up = self.up_proj(x)
-        return self.down_proj(gate * up)
-
-
 class LLaDADecoderLayer(nn.Module):
     """LLaDA transformer decoder layer."""
     
     def __init__(self, config: LLaDAEdgeConfig):
         super().__init__()
         self.self_attn = LLaDAAttention(config)
-        self.mlp = LLaDAMLP(config)
-        self.input_layernorm = LLaDARMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LLaDARMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = SwiGLUMLP(config.hidden_size, config.intermediate_size)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
     
     def forward(
         self,
@@ -216,7 +139,7 @@ class LLaDAEdge(nn.Module):
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([LLaDADecoderLayer(config) for _ in range(config.num_hidden_layers)])
-        self.norm = LLaDARMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         
         if config.tie_word_embeddings:

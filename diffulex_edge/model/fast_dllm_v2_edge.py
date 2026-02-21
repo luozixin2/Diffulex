@@ -31,6 +31,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..components import RMSNorm, RotaryEmbedding, SwiGLUMLP
+
 
 @dataclass
 class FastdLLMV2EdgeConfig:
@@ -54,109 +56,6 @@ class FastdLLMV2EdgeConfig:
     def __post_init__(self):
         if self.head_dim is None:
             self.head_dim = self.hidden_size // self.num_attention_heads
-
-
-class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization.
-    
-    Simplified version without torch.compile for better compatibility.
-    """
-    
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.eps = eps
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply RMS normalization.
-        
-        Args:
-            x: Input tensor of shape [..., hidden_size]
-            
-        Returns:
-            Normalized tensor of same shape
-        """
-        # Compute RMS
-        original_dtype = x.dtype
-        x_float32 = x.to(torch.float32)
-        variance = x_float32.pow(2).mean(dim=-1, keepdim=True)
-        x_normalized = x_float32 * torch.rsqrt(variance + self.eps)
-        # Cast back and apply weight
-        return (x_normalized * self.weight).to(original_dtype)
-
-
-class RotaryEmbedding(nn.Module):
-    """Rotary Position Embedding (RoPE).
-    
-    Simplified implementation for edge deployment.
-    """
-    
-    def __init__(
-        self,
-        dim: int,
-        max_position_embeddings: int = 32768,
-        base: float = 10000.0,
-    ):
-        super().__init__()
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-        
-        # Precompute inverse frequencies
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        
-        # Precompute cos/sin for common positions
-        self._precompute_rotary_embeddings()
-    
-    def _precompute_rotary_embeddings(self):
-        """Precompute cos and sin for position embeddings."""
-        t = torch.arange(self.max_position_embeddings, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
-        emb = torch.cat([freqs, freqs], dim=-1)
-        
-        cos = emb.cos()
-        sin = emb.sin()
-        
-        self.register_buffer("cos_cached", cos, persistent=False)
-        self.register_buffer("sin_cached", sin, persistent=False)
-    
-    def forward(
-        self,
-        positions: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Apply rotary embeddings to q and k.
-        
-        Args:
-            positions: Position indices [batch_size, seq_len]
-            q: Query tensor [batch_size, num_heads, seq_len, head_dim]
-            k: Key tensor [batch_size, num_kv_heads, seq_len, head_dim]
-            
-        Returns:
-            Tuple of (rotated_q, rotated_k)
-        """
-        # Get cos and sin for the given positions
-        cos = self.cos_cached[positions].unsqueeze(1)  # [B, 1, S, D]
-        sin = self.sin_cached[positions].unsqueeze(1)  # [B, 1, S, D]
-        
-        q_rot = self._apply_rotary_pos_emb(q, cos, sin)
-        k_rot = self._apply_rotary_pos_emb(k, cos, sin)
-        
-        return q_rot, k_rot
-    
-    def _apply_rotary_pos_emb(
-        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-    ) -> torch.Tensor:
-        """Apply rotary position embedding to input tensor."""
-        # Split x into two halves
-        x1, x2 = x.chunk(2, dim=-1)
-        
-        # Rotate
-        rotated = torch.cat([-x2, x1], dim=-1)
-        
-        return x * cos + rotated * sin
 
 
 class AttentionEdge(nn.Module):
@@ -309,27 +208,6 @@ class AttentionEdge(nn.Module):
         return output, None, None
 
 
-class MLP(nn.Module):
-    """Feed-forward network with SwiGLU activation.
-    
-    Standard implementation without parallel linear layers.
-    """
-    
-    def __init__(self, hidden_size: int, intermediate_size: int):
-        super().__init__()
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """SwiGLU: (W_gate(x) * silu(W_up(x))) @ W_down"""
-        gate = self.gate_proj(x)
-        up = self.up_proj(x)
-        # SwiGLU: multiply gate (after SiLU) with up projection
-        activated = F.silu(gate) * up
-        return self.down_proj(activated)
-
-
 class DecoderLayer(nn.Module):
     """Single transformer decoder layer with KV Cache support."""
     
@@ -351,7 +229,7 @@ class DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         
-        self.mlp = MLP(
+        self.mlp = SwiGLUMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
         )
@@ -419,7 +297,7 @@ class FastdLLMV2Edge(nn.Module):
         
         # Rotary embedding (shared across layers)
         self.rotary_emb = RotaryEmbedding(
-            dim=config.head_dim,
+            head_dim=config.head_dim,
             max_position_embeddings=config.max_position_embeddings,
             base=config.rope_theta,
         )
@@ -584,3 +462,9 @@ class FastdLLMV2Edge(nn.Module):
     def device(self) -> torch.device:
         """Get model device."""
         return next(self.parameters()).device
+
+
+__all__ = [
+    "FastdLLMV2EdgeConfig",
+    "FastdLLMV2Edge",
+]
