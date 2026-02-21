@@ -34,7 +34,7 @@ except ImportError:
 try:
     from .runtime.engine import DiffusionEngine, DiffusionGenerationConfig
     from .model import (
-        FastdLLMV2Edge, FastdLLMV2EdgeConfig,
+        FastDLLMv2Edge, FastDLLMv2EdgeConfig,
         DreamEdge, DreamEdgeConfig,
         LLaDAEdge, LLaDAEdgeConfig,
         SDAREdge, SDAREdgeConfig,
@@ -43,7 +43,7 @@ except ImportError:
     sys.path.insert(0, str(Path(__file__).parent))
     from runtime.engine import DiffusionEngine, DiffusionGenerationConfig
     from model import (
-        FastdLLMV2Edge, FastdLLMV2EdgeConfig,
+        FastDLLMv2Edge, FastDLLMv2EdgeConfig,
         DreamEdge, DreamEdgeConfig,
         LLaDAEdge, LLaDAEdgeConfig,
         SDAREdge, SDAREdgeConfig,
@@ -64,7 +64,7 @@ except ImportError:
 class TokenizerWrapper:
     """Tokenizer包装器，支持HuggingFace Tokenizer和简单演示tokenizer"""
     
-    def __init__(self, tokenizer_path: Optional[str] = None, vocab_size: int = 130000):
+    def __init__(self, tokenizer_path: Optional[str] = None, vocab_size: int = 151936):
         self.tokenizer = None
         self.is_hf_tokenizer = False
         self.vocab_size = vocab_size
@@ -152,7 +152,7 @@ class TokenizerWrapper:
 
 class ChatConfig:
     """对话配置"""
-    def __init__(self, block_size: int = 10):
+    def __init__(self, block_size: int = 32):
         self.max_new_tokens: int = 100
         self.temperature: float = 0.8
         self.top_k: int = 50
@@ -191,6 +191,7 @@ class ChatConfig:
   top_p: {self.top_p}
   confidence_threshold: {self.confidence_threshold}
   num_iterations: {self.num_iterations}
+  block_size: {self.block_size}
 """
 
 
@@ -258,66 +259,99 @@ class ChatSession:
 # Model Creation
 # ============================================================================
 
-def create_model(model_type: str, vocab_size: int = 130000):
-    """创建指定类型的模型
+# Model default configurations aligned with actual HF models
+MODEL_CONFIGS = {
+    "fast_dllm": {
+        "vocab_size": 151936,
+        "hidden_size": 1536,
+        "num_hidden_layers": 28,
+        "num_attention_heads": 12,
+        "num_key_value_heads": 2,
+        "intermediate_size": 8960,
+        "attention_bias": True,
+        "tie_word_embeddings": True,
+        "bd_size": 32,
+        "mask_token_id": 151665,  # Fast dLLM v2 specific
+        "pad_token_id": 151643,
+    },
+    "dream": {
+        "vocab_size": 152064,
+        "hidden_size": 3584,
+        "num_hidden_layers": 28,
+        "num_attention_heads": 28,
+        "num_key_value_heads": 4,
+        "intermediate_size": 18944,
+        "attention_bias": True,
+        "tie_word_embeddings": False,
+        "mask_token_id": 151666,
+        "pad_token_id": 151643,
+    },
+    "llada": {
+        "vocab_size": 126336,
+        "hidden_size": 2048,
+        "num_hidden_layers": 28,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 8,
+        "intermediate_size": 5504,
+        "attention_bias": False,
+        "mask_token_id": 126336,
+    },
+    "sdar": {
+        "vocab_size": 151936,
+        "hidden_size": 2048,
+        "num_hidden_layers": 28,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 8,
+        "intermediate_size": 6144,
+        "attention_bias": False,
+        "diffusion_block_size": 4,
+    },
+}
+
+
+def create_model(model_type: str, vocab_size: Optional[int] = None):
+    """创建指定类型的模型，使用与实际模型一致的默认参数
     
     Args:
         model_type: 模型类型 (fast_dllm, dream, llada, sdar)
-        vocab_size: 词汇表大小
-    
+        vocab_size: 词汇表大小 (可选，默认使用模型标准配置)
+
     Returns:
-        (model, is_diffusion, vocab_size)
+        (model, is_diffusion, vocab_size, block_size)
     """
     model_type = model_type.lower()
     
+    if model_type not in MODEL_CONFIGS:
+        raise ValueError(f"Unknown model type: {model_type}. Supported: {list(MODEL_CONFIGS.keys())}")
+    
+    config_dict = MODEL_CONFIGS[model_type].copy()
+    
+    # Override vocab_size if provided
+    if vocab_size is not None:
+        config_dict["vocab_size"] = vocab_size
+    
     if model_type == "fast_dllm":
-        config = FastdLLMV2EdgeConfig(
-            vocab_size=vocab_size,
-            hidden_size=512,
-            num_hidden_layers=8,
-            num_attention_heads=8,
-            num_key_value_heads=4,
-        )
-        model = FastdLLMV2Edge(config)
+        config = FastDLLMv2EdgeConfig(**config_dict)
+        model = FastDLLMv2Edge(config)
+        block_size = config.bd_size
         
     elif model_type == "dream":
-        config = DreamEdgeConfig(
-            vocab_size=vocab_size,
-            hidden_size=512,
-            num_hidden_layers=8,
-            num_attention_heads=8,
-            num_key_value_heads=4,
-            attention_bias=True,
-        )
+        config = DreamEdgeConfig(**config_dict)
         model = DreamEdge(config)
+        block_size = 32  # Dream default block size
         
     elif model_type == "llada":
-        config = LLaDAEdgeConfig(
-            vocab_size=vocab_size,
-            hidden_size=512,
-            num_hidden_layers=8,
-            num_attention_heads=8,
-            num_key_value_heads=4,
-            mask_token_id=min(126336, vocab_size - 1),
-        )
+        config = LLaDAEdgeConfig(**config_dict)
         model = LLaDAEdge(config)
+        block_size = 32  # LLaDA default block size
         
     elif model_type == "sdar":
-        config = SDAREdgeConfig(
-            vocab_size=vocab_size,
-            hidden_size=512,
-            num_hidden_layers=8,
-            num_attention_heads=8,
-            num_key_value_heads=4,
-            attention_bias=False,
-        )
+        config = SDAREdgeConfig(**config_dict)
         model = SDAREdge(config)
-        
-    else:
-        raise ValueError(f"Unknown model type: {model_type}. Supported: fast_dllm, dream, llada, sdar")
+        block_size = config.diffusion_block_size
     
     model.eval()
-    return model, True, vocab_size
+    return model, True, config.vocab_size, block_size
 
 
 # ============================================================================
@@ -360,23 +394,19 @@ def load_model(model_path: Optional[str], pte_path: Optional[str], model_type: s
         print(f"加载模型: {model_path}")
         # TODO: 实现从checkpoint加载真实权重
         # 目前创建对应类型的演示模型
-        model, is_diffusion, vocab_size = create_model(model_type)
+        model, is_diffusion, vocab_size, block_size = create_model(model_type)
         print(f"创建{model_type}模型完成")
         # Map CLI model type to internal model type
         internal_model_type = model_type.replace("fast_dllm", "fast_dllm_v2")
         engine = DiffusionEngine.from_model(model, model_type=internal_model_type)
-        # Default block size based on model type
-        diffusion_block_size = 4 if model_type == 'sdar' else 32
-        return engine, is_diffusion, vocab_size, diffusion_block_size
+        return engine, is_diffusion, vocab_size, block_size
     
     else:
         # 创建演示模型
         print(f"创建演示模型: {model_type}")
-        model, is_diffusion, vocab_size = create_model(model_type)
+        model, is_diffusion, vocab_size, block_size = create_model(model_type)
         engine = DiffusionEngine.from_model(model)
-        # Default block size based on model type
-        diffusion_block_size = 4 if model_type == 'sdar' else 32
-        return engine, is_diffusion, vocab_size, diffusion_block_size
+        return engine, is_diffusion, vocab_size, block_size
 
 
 def find_tokenizer_path(model_path: Optional[str]) -> Optional[str]:
