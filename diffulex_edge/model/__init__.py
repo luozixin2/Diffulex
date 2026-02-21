@@ -17,7 +17,7 @@ from diffulex_edge.model.base import ModelConfig, DiffusionModel, KVCacheModel
 from diffulex_edge.model.wrapper import ExportWrapper, BlockDiffusionWrapper
 
 # Import all edge models
-from diffulex_edge.model.fast_dllm_v2_edge import FastdLLMV2Edge, FastdLLMV2EdgeConfig
+from diffulex_edge.model.fast_dllm_v2_edge import FastDLLMv2Edge, FastDLLMv2EdgeConfig
 from diffulex_edge.model.dream_edge import DreamEdge, DreamEdgeConfig
 from diffulex_edge.model.llada_edge import LLaDAEdge, LLaDAEdgeConfig
 from diffulex_edge.model.sdar_edge import SDAREdge, SDAREdgeConfig
@@ -41,12 +41,12 @@ __all__ = [
     "ExportWrapper",
     "BlockDiffusionWrapper",
     # Models
-    "FastdLLMV2Edge",
+    "FastDLLMv2Edge",
     "DreamEdge",
     "LLaDAEdge",
     "SDAREdge",
     # Configs
-    "FastdLLMV2EdgeConfig",
+    "FastDLLMv2EdgeConfig",
     "DreamEdgeConfig",
     "LLaDAEdgeConfig",
     "SDAREdgeConfig",

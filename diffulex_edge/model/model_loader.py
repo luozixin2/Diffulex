@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Tuple, Optional, Dict, Any, List
 from safetensors import safe_open
 
-from .fast_dllm_v2_edge import FastdLLMV2Edge, FastdLLMV2EdgeConfig
+from .fast_dllm_v2_edge import FastDLLMv2Edge, FastDLLMv2EdgeConfig
 from .dream_edge import DreamEdge, DreamEdgeConfig
 from .llada_edge import LLaDAEdge, LLaDAEdgeConfig
 from .sdar_edge import SDAREdge, SDAREdgeConfig
@@ -55,7 +55,7 @@ def get_safetensor_files(model_path: Path) -> List[Path]:
 
 
 MODEL_REGISTRY = {
-    "fast_dllm_v2": (FastdLLMV2Edge, FastdLLMV2EdgeConfig),
+    "fast_dllm_v2": (FastDLLMv2Edge, FastDLLMv2EdgeConfig),
     "dream": (DreamEdge, DreamEdgeConfig),
     "llada": (LLaDAEdge, LLaDAEdgeConfig),
     "sdar": (SDAREdge, SDAREdgeConfig),
@@ -125,14 +125,17 @@ def create_edge_config(model_type: str, hf_config: Dict[str, Any]) -> Any:
         return ConfigClass(
             vocab_size=common_params["vocab_size"],
             hidden_size=common_params["hidden_size"],
-            num_layers=hf_config.get("num_hidden_layers", 28),
-            num_heads=hf_config.get("num_attention_heads", 16),
-            num_kv_heads=hf_config.get("num_key_value_heads", 8),
+            num_hidden_layers=hf_config.get("num_hidden_layers", 28),
+            num_attention_heads=hf_config.get("num_attention_heads", 12),
+            num_key_value_heads=hf_config.get("num_key_value_heads", 2),
             intermediate_size=common_params["intermediate_size"],
-            max_seq_len=common_params["max_position_embeddings"],
-            head_dim=hf_config.get("head_dim", 128),
+            max_position_embeddings=common_params["max_position_embeddings"],
+            head_dim=hf_config.get("head_dim", None),  # Will be calculated
             rms_norm_eps=hf_config.get("rms_norm_eps", 1e-6),
             rope_theta=hf_config.get("rope_theta", 1000000.0),
+            attention_bias=hf_config.get("attention_bias", True),
+            tie_word_embeddings=hf_config.get("tie_word_embeddings", True),
+            bd_size=hf_config.get("bd_size", 32),
         )
     elif model_type == "dream":
         return ConfigClass(

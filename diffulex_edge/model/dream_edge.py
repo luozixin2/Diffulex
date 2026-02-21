@@ -12,15 +12,18 @@ Key differences from standard causal LLM:
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+from .base import ModelConfig, DiffusionModel
 from ..components import RMSNorm, RotaryEmbedding, SwiGLUMLP
 
 
 @dataclass
-class DreamEdgeConfig:
+class DreamEdgeConfig(ModelConfig):
     """Configuration for Dream Edge model."""
+    # Dream-specific defaults (7B model)
     vocab_size: int = 152064
     hidden_size: int = 3584
     num_hidden_layers: int = 28
@@ -42,11 +45,6 @@ class DreamEdgeConfig:
     pad_token_id: int = 151643
     bos_token_id: int = 151643
     eos_token_id: int = 151643
-    
-    def __post_init__(self):
-        """Validate and set derived values."""
-        if self.head_dim is None:
-            self.head_dim = self.hidden_size // self.num_attention_heads
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -75,9 +73,8 @@ class DreamAttention(nn.Module):
     - Supports KV cache for efficient generation
     """
     
-    def __init__(self, config: DreamEdgeConfig, layer_idx: int):
+    def __init__(self, config: DreamEdgeConfig):
         super().__init__()
-        self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
@@ -109,149 +106,216 @@ class DreamAttention(nn.Module):
     
     def forward(
         self,
+        positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-        """Forward pass with optional KV cache.
+        k_cache: Optional[torch.Tensor] = None,
+        v_cache: Optional[torch.Tensor] = None,
+        cache_len: int = 0,
+        max_cache_len: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward with dynamic KV cache (for Python inference).
         
         Args:
+            positions: Position indices [batch_size, seq_len]
             hidden_states: [batch_size, seq_len, hidden_size]
-            attention_mask: Optional 4D mask [batch_size, 1, seq_len, kv_len]
-            position_ids: [batch_size, seq_len] or [seq_len]
-            past_key_value: Optional tuple of (k_cache, v_cache)
-                k_cache/v_cache: [batch_size, num_kv_heads, cache_len, head_dim]
-            use_cache: Whether to return updated KV cache
+            k_cache: Optional key cache [batch_size, num_kv_heads, cache_len, head_dim]
+            v_cache: Optional value cache [batch_size, num_kv_heads, cache_len, head_dim]
+            cache_len: Length of valid cache entries
+            max_cache_len: Maximum cache length (unused, for API compatibility)
             
         Returns:
-            Tuple of (attn_output, present_key_value)
+            Tuple of (attn_output, new_k, new_v)
         """
-        bsz, q_len, _ = hidden_states.size()
+        batch_size, seq_len, _ = hidden_states.shape
         
         # Project to Q, K, V
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
-        
-        # Reshape for multi-head attention
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        
-        # Apply rotary embeddings
-        if position_ids is None:
-            # Default to sequential positions starting from cache length
-            if past_key_value is not None:
-                past_len = past_key_value[0].shape[2]
-                position_ids = torch.arange(
-                    past_len, past_len + q_len, dtype=torch.long, device=hidden_states.device
-                ).unsqueeze(0)
-            else:
-                position_ids = torch.arange(
-                    0, q_len, dtype=torch.long, device=hidden_states.device
-                ).unsqueeze(0)
-        elif position_ids.dim() == 1:
-            position_ids = position_ids.unsqueeze(0)
-        
-        query_states, key_states = self.rotary_emb(position_ids, query_states, key_states)
-        
-        # Update KV cache
-        if past_key_value is not None:
-            past_key, past_value = past_key_value
-            key_states = torch.cat([past_key, key_states], dim=2)
-            value_states = torch.cat([past_value, value_states], dim=2)
-        
-        present_key_value = (key_states, value_states) if use_cache else None
-        
-        # Repeat k/v heads for GQA
-        key_states = repeat_kv(key_states, self.num_kv_groups)
-        value_states = repeat_kv(value_states, self.num_kv_groups)
-        
-        # Scaled dot-product attention
-        attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) * self.scaling
-        
-        # Apply attention mask
-        if attention_mask is not None:
-            # Slice mask to match kv_len
-            kv_len = key_states.shape[-2]
-            causal_mask = attention_mask[..., :kv_len]
-            attn_weights = attn_weights + causal_mask
-        
-        # Softmax (upcast to fp32 for stability)
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
-            query_states.dtype
+        q = self.q_proj(hidden_states).view(
+            batch_size, seq_len, self.num_heads, self.head_dim
         )
-        attn_weights = nn.functional.dropout(
-            attn_weights, p=self.attention_dropout, training=self.training
+        k = self.k_proj(hidden_states).view(
+            batch_size, seq_len, self.num_kv_heads, self.head_dim
+        )
+        v = self.v_proj(hidden_states).view(
+            batch_size, seq_len, self.num_kv_heads, self.head_dim
         )
         
-        # Apply attention to values
-        attn_output = torch.matmul(attn_weights, value_states)
+        # Transpose for attention: [B, S, H, D] -> [B, H, S, D]
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
         
-        # Reshape and project
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-        attn_output = self.o_proj(attn_output)
+        # Apply RoPE
+        q, k = self.rotary_emb(positions, q, k)
         
-        return attn_output, present_key_value
+        # Concatenate with cache (dynamic)
+        if k_cache is not None and v_cache is not None and cache_len > 0:
+            k_valid = k_cache[:, :, :cache_len, :].to(k.dtype)
+            v_valid = v_cache[:, :, :cache_len, :].to(v.dtype)
+            k = torch.cat([k_valid, k], dim=2)
+            v = torch.cat([v_valid, v], dim=2)
+        
+        new_k, new_v = k.contiguous(), v.contiguous()
+        
+        # Handle GQA
+        if self.num_kv_heads != self.num_heads:
+            k = repeat_kv(k, self.num_kv_groups)
+            v = repeat_kv(v, self.num_kv_groups)
+        
+        # Attention using SDPA
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=None, is_causal=False, scale=self.scaling
+        )
+        
+        attn_output = attn_output.transpose(1, 2).contiguous().view(
+            batch_size, seq_len, -1
+        )
+        return self.o_proj(attn_output), new_k, new_v
+    
+    def forward_export(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        old_k_cache: torch.Tensor,
+        old_v_cache: torch.Tensor,
+        attention_mask: torch.Tensor,
+        insert_matrix: torch.Tensor,
+        keep_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Static forward for Block Diffusion / ExecuTorch export.
+        
+        Args:
+            positions: Position indices [batch_size, seq_len]
+            hidden_states: [batch_size, seq_len, hidden_size]
+            old_k_cache: [batch_size, num_kv_heads, max_len, head_dim]
+            old_v_cache: [batch_size, num_kv_heads, max_len, head_dim]
+            attention_mask: [batch_size, 1, seq_len, max_len + seq_len]
+            insert_matrix: [batch_size, 1, max_len, seq_len]
+            keep_mask: [batch_size, 1, max_len, 1]
+            
+        Returns:
+            Tuple of (block_out, updated_k, updated_v)
+        """
+        batch_size, seq_len, _ = hidden_states.shape
+        
+        # Project to Q, K, V
+        q = self.q_proj(hidden_states).view(
+            batch_size, seq_len, self.num_heads, self.head_dim
+        )
+        k = self.k_proj(hidden_states).view(
+            batch_size, seq_len, self.num_kv_heads, self.head_dim
+        )
+        v = self.v_proj(hidden_states).view(
+            batch_size, seq_len, self.num_kv_heads, self.head_dim
+        )
+        
+        # Transpose for attention
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
+        
+        # Apply RoPE
+        q, k = self.rotary_emb(positions, q, k)
+        
+        # Step 1: Static Attention
+        full_k = torch.cat([old_k_cache.to(k.dtype), k], dim=2)
+        full_v = torch.cat([old_v_cache.to(v.dtype), v], dim=2)
+        
+        # Handle GQA
+        if self.num_kv_heads != self.num_heads:
+            num_repeat = self.num_heads // self.num_kv_heads
+            full_k = full_k.repeat_interleave(num_repeat, dim=1)
+            full_v = full_v.repeat_interleave(num_repeat, dim=1)
+        
+        # Attention computation
+        scores = torch.matmul(q, full_k.transpose(-1, -2)) * self.scaling
+        scores = scores + attention_mask.to(q.dtype)
+        probs = torch.softmax(scores, dim=-1)
+        block_out = torch.matmul(probs, full_v)
+        
+        block_out = block_out.transpose(1, 2).contiguous().view(
+            batch_size, seq_len, -1
+        )
+        block_out = self.o_proj(block_out)
+        
+        # Step 2: Static Cache Update
+        insert_expanded = insert_matrix.expand(-1, self.num_kv_heads, -1, -1)
+        expanded_k = torch.matmul(insert_expanded.to(k.dtype), k)
+        expanded_v = torch.matmul(insert_expanded.to(v.dtype), v)
+        
+        keep_expanded = keep_mask.expand(-1, self.num_kv_heads, -1, self.head_dim)
+        updated_k = (old_k_cache.to(k.dtype) * keep_expanded.to(k.dtype)) + expanded_k
+        updated_v = (old_v_cache.to(v.dtype) * keep_expanded.to(v.dtype)) + expanded_v
+        
+        return block_out, updated_k, updated_v
 
 
 class DreamDecoderLayer(nn.Module):
     """Dream transformer decoder layer."""
     
-    def __init__(self, config: DreamEdgeConfig, layer_idx: int):
+    def __init__(self, config: DreamEdgeConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = DreamAttention(config, layer_idx)
+        self.self_attn = DreamAttention(config)
         self.mlp = SwiGLUMLP(config.hidden_size, config.intermediate_size)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
     
     def forward(
         self,
+        positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-        """Forward pass.
-        
-        Args:
-            hidden_states: [batch_size, seq_len, hidden_size]
-            attention_mask: Optional 4D mask
-            position_ids: Position indices
-            past_key_value: Optional KV cache
-            use_cache: Whether to return updated cache
-            
-        Returns:
-            Tuple of (hidden_states, present_key_value)
-        """
+        k_cache: Optional[torch.Tensor] = None,
+        v_cache: Optional[torch.Tensor] = None,
+        cache_len: int = 0,
+        max_cache_len: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward with dynamic KV cache."""
+        # Self Attention with residual
         residual = hidden_states
-        
-        # Self Attention with pre-norm
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states, present_key_value = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            use_cache=use_cache,
+        hidden_states, new_k, new_v = self.self_attn(
+            positions, hidden_states, k_cache, v_cache, cache_len, max_cache_len
         )
         hidden_states = residual + hidden_states
         
-        # MLP with post-attention norm
+        # MLP with residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         
-        return hidden_states, present_key_value
+        return hidden_states, new_k, new_v
+    
+    def forward_export(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        old_k_cache: torch.Tensor,
+        old_v_cache: torch.Tensor,
+        attention_mask: torch.Tensor,
+        insert_matrix: torch.Tensor,
+        keep_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Static forward for ExecuTorch export."""
+        # Self-attention with residual
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, updated_k, updated_v = self.self_attn.forward_export(
+            positions, hidden_states, old_k_cache, old_v_cache,
+            attention_mask, insert_matrix, keep_mask
+        )
+        hidden_states = residual + hidden_states
+        
+        # MLP with residual
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        
+        return hidden_states, updated_k, updated_v
 
 
-class DreamEdge(nn.Module):
+class DreamEdge(DiffusionModel):
     """Dream model for diffusion language modeling (Edge version).
     
     Aligns with HF DreamModel implementation:
@@ -261,14 +325,14 @@ class DreamEdge(nn.Module):
     """
     
     def __init__(self, config: DreamEdgeConfig):
-        super().__init__()
-        self.config = config
+        super().__init__(config)
         self.vocab_size = config.vocab_size
-        self.padding_idx = config.pad_token_id
+        # Ensure padding_idx is within vocab range
+        self.padding_idx = min(config.pad_token_id, config.vocab_size - 1)
         
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList([
-            DreamDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)
+            DreamDecoderLayer(config) for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -305,12 +369,167 @@ class DreamEdge(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        kv_cache: Optional[list] = None,
+        max_seq_len: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, list]:
+        """Forward with dynamic KV cache (for DiffusionEngine).
+        
+        Args:
+            input_ids: Token indices [batch_size, seq_len]
+            positions: Position indices [batch_size, seq_len]
+            mask: Optional attention mask (unused in standard Dream)
+            kv_cache: Optional list of (k, v) tuples from previous forward
+            max_seq_len: Maximum sequence length for cache
+            
+        Returns:
+            Tuple of (logits, new_kv_cache)
+        """
+        if max_seq_len is None:
+            max_seq_len = self.config.max_position_embeddings
+        
+        hidden_states = self.embed_tokens(input_ids)
+        new_kv_cache = []
+        
+        for i, layer in enumerate(self.layers):
+            k_cache, v_cache = None, None
+            cache_len = 0
+            if kv_cache is not None and i < len(kv_cache):
+                k_cache, v_cache = kv_cache[i]
+                cache_len = k_cache.shape[2] if k_cache is not None else 0
+            
+            hidden_states, new_k, new_v = layer(
+                positions, hidden_states, k_cache, v_cache, cache_len, max_seq_len
+            )
+            new_kv_cache.append((new_k, new_v))
+        
+        hidden_states = self.norm(hidden_states)
+        logits = self.lm_head(hidden_states)
+        
+        return logits, new_kv_cache
+    
+    def forward_export(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attention_mask: torch.Tensor,
+        insert_matrix: torch.Tensor,
+        keep_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward with fixed-shape KV cache for Block Diffusion / ExecuTorch export.
+        
+        Args:
+            input_ids: [batch_size, seq_len]
+            positions: [batch_size, seq_len]
+            kv_cache: [num_layers, 2, batch_size, num_kv_heads, max_len, head_dim]
+            attention_mask: [num_layers, batch_size, 1, seq_len, max_len + seq_len]
+            insert_matrix: [num_layers, batch_size, 1, max_len, seq_len]
+            keep_mask: [num_layers, batch_size, 1, max_len, 1]
+            
+        Returns:
+            Tuple of (logits, updated_kv_cache)
+        """
+        hidden_states = self.embed_tokens(input_ids)
+        num_layers = len(self.layers)
+        updated_kv_cache = torch.zeros_like(kv_cache)
+        
+        for i in range(num_layers):
+            layer = self.layers[i]
+            k_cache = kv_cache[i, 0]
+            v_cache = kv_cache[i, 1]
+            
+            hidden_states, new_k, new_v = layer.forward_export(
+                positions, hidden_states, k_cache, v_cache,
+                attention_mask[i], insert_matrix[i], keep_mask[i]
+            )
+            
+            updated_kv_cache[i, 0] = new_k
+            updated_kv_cache[i, 1] = new_v
+        
+        hidden_states = self.norm(hidden_states)
+        logits = self.lm_head(hidden_states)
+        
+        return logits, updated_kv_cache
+    
+    def get_export_wrapper(self) -> Optional[nn.Module]:
+        """Get the export wrapper for Dream.
+        
+        Dream uses BlockDiffusionWrapper for its special mask-based export format.
+        """
+        from .wrapper import BlockDiffusionWrapper
+        return BlockDiffusionWrapper(
+            self,
+            block_size=1,  # Dream doesn't use block diffusion by default
+            max_seq_len=self.config.max_position_embeddings,
+        )
+    
+    def get_export_inputs(
+        self,
+        batch_size: int = 1,
+        seq_len: int = 128,
+        device: str = "cpu",
+    ) -> Tuple[torch.Tensor, ...]:
+        """Create example inputs for Dream export.
+        
+        Uses Block Diffusion format with special mask inputs.
+        """
+        max_seq_len = self.config.max_position_embeddings
+        num_layers = self.config.num_hidden_layers
+        num_kv_heads = self.config.num_key_value_heads
+        head_dim = self.config.head_dim
+        
+        # Standard inputs
+        input_ids = torch.zeros(batch_size, seq_len, dtype=torch.long, device=device)
+        positions = torch.arange(
+            seq_len, dtype=torch.long, device=device
+        ).unsqueeze(0).expand(batch_size, -1)
+        
+        # KV cache
+        kv_cache = torch.zeros(
+            num_layers, 2, batch_size, num_kv_heads, max_seq_len, head_dim,
+            dtype=torch.float32, device=device
+        )
+        
+        # Block Diffusion masks
+        attention_mask = torch.zeros(
+            num_layers, batch_size, 1, seq_len, max_seq_len + seq_len,
+            dtype=torch.float32, device=device
+        )
+        attention_mask[:, :, :, :, 0:max_seq_len] = -10000.0
+        
+        insert_matrix = torch.zeros(
+            num_layers, batch_size, 1, max_seq_len, seq_len,
+            dtype=torch.float32, device=device
+        )
+        for i in range(seq_len):
+            insert_matrix[:, :, :, i, i] = 1.0
+        
+        keep_mask = torch.ones(
+            num_layers, batch_size, 1, max_seq_len, 1,
+            dtype=torch.float32, device=device
+        )
+        keep_mask[:, :, :, 0:seq_len, :] = 0.0
+        
+        return (input_ids, positions, kv_cache, attention_mask, insert_matrix, keep_mask)
+    
+    # =========================================================================
+    # Legacy HF-style API for backward compatibility
+    # =========================================================================
+    
+    def forward_hf_style(
+        self,
+        input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]]]:
-        """Forward pass aligned with HF DreamModel.
+        """Forward pass aligned with HF DreamModel (legacy API).
+        
+        This method provides backward compatibility with HF-style calling.
+        New code should use forward() instead.
         
         Args:
             input_ids: [batch_size, seq_len]
@@ -327,20 +546,10 @@ class DreamEdge(nn.Module):
         """
         batch_size, seq_len = input_ids.shape
         
-        # Convert 2D attention mask to 4D if needed
-        if attention_mask is not None and attention_mask.dim() == 2:
-            attention_mask = self._prepare_4d_attention_mask(
-                attention_mask, input_ids.dtype, seq_len
-            )
-        
-        # Embeddings
-        inputs_embeds = self.embed_tokens(input_ids)
-        hidden_states = inputs_embeds
-        
         # Prepare position ids
         if position_ids is None:
             if past_key_values is not None:
-                past_len = past_key_values[0][0].shape[2]  # First layer, key cache, seq dim
+                past_len = past_key_values[0][0].shape[2]
                 position_ids = torch.arange(
                     past_len, past_len + seq_len, dtype=torch.long, device=input_ids.device
                 )
@@ -350,67 +559,21 @@ class DreamEdge(nn.Module):
                 )
             position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
         
-        # Decode layers
-        present_key_values = [] if use_cache else None
+        # Convert past_key_values to kv_cache format
+        kv_cache = list(past_key_values) if past_key_values is not None else None
         
-        for layer_idx, decoder_layer in enumerate(self.layers):
-            past_key_value = past_key_values[layer_idx] if past_key_values is not None else None
-            
-            hidden_states, present_kv = decoder_layer(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                use_cache=use_cache,
-            )
-            
-            if use_cache:
-                present_key_values.append(present_kv)
-        
-        hidden_states = self.norm(hidden_states)
-        logits = self.lm_head(hidden_states)
-        
-        if use_cache:
-            present_key_values = tuple(present_key_values)
-        
-        return logits, present_key_values
-    
-    def _prepare_4d_attention_mask(
-        self,
-        attention_mask: torch.Tensor,
-        dtype: torch.dtype,
-        tgt_len: int,
-    ) -> torch.Tensor:
-        """Convert 2D attention mask to 4D causal mask.
-        
-        Args:
-            attention_mask: 2D mask [batch_size, seq_len]
-            dtype: Target dtype
-            tgt_len: Target sequence length
-            
-        Returns:
-            4D mask [batch_size, 1, seq_len, seq_len]
-        """
-        bsz, src_len = attention_mask.shape
-        
-        # Ensure dtype is float for finfo
-        if not dtype.is_floating_point:
-            dtype = torch.float32
-        
-        # Convert to float and expand
-        mask = attention_mask.to(dtype)
-        
-        # Create 4D mask: [bsz, 1, tgt_len, src_len]
-        # For non-causal attention, we just mask out padded positions
-        expanded_mask = mask.unsqueeze(1).unsqueeze(2).expand(bsz, 1, tgt_len, src_len)
-        
-        # Convert 0s to large negative values
-        inverted_mask = 1.0 - expanded_mask
-        inverted_mask = inverted_mask.masked_fill(
-            inverted_mask.to(torch.bool), torch.finfo(dtype).min
+        # Call the main forward
+        logits, new_kv_cache = self.forward(
+            input_ids=input_ids,
+            positions=position_ids,
+            mask=attention_mask,
+            kv_cache=kv_cache,
         )
         
-        return inverted_mask
+        # Convert back to HF format if needed
+        present_key_values = tuple(new_kv_cache) if use_cache else None
+        
+        return logits, present_key_values
     
     def prepare_inputs_for_generation(
         self,
@@ -434,10 +597,8 @@ class DreamEdge(nn.Module):
         
         return {
             "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "position_ids": position_ids,
-            "past_key_values": past_key_values,
-            "use_cache": True,
+            "positions": position_ids,
+            "kv_cache": list(past_key_values) if past_key_values is not None else None,
         }
 
 
