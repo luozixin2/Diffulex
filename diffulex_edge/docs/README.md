@@ -4,16 +4,14 @@
 
 ### Getting Started
 - [Architecture](ARCHITECTURE.md) - System design and module structure
-- [Export Guide](EXPORT.md) - How to export models to ExecuTorch
-- [CLI Usage](CLI_USAGE.md) - Command-line interface reference
+- [User Guide](USER_GUIDE.md) - Model export and CLI usage
+- [Quantization](QUANTIZATION.md) - Quantization support (FP16/INT8/INT4)
 
 ### Advanced Topics
-- [Block Diffusion Export](BLOCK_DIFFUSION_EXPORT.md) - SDAR model export details
-- [Implementation Notes](IMPLEMENTATION.md) - Development internals
+- [Technical Details](TECHNICAL.md) - Block diffusion and KV cache internals
 
-### Planning
-- [Quantization Plan](planning/QUANTIZATION_PLAN.md) - Quantization roadmap
-- [Test Plan](planning/TEST_PLAN.md) - Testing strategy
+### Development
+- [Test Plan](TEST_PLAN.md) - Testing strategy and coverage
 
 ---
 
@@ -21,15 +19,12 @@
 
 ```
 docs/
-├── ARCHITECTURE.md          # System architecture & refactoring history
-├── EXPORT.md                # Model export guide
-├── CLI_USAGE.md             # CLI reference
-├── BLOCK_DIFFUSION_EXPORT.md # SDAR-specific export
-├── IMPLEMENTATION.md        # Implementation details
-├── planning/
-│   ├── QUANTIZATION_PLAN.md
-│   └── TEST_PLAN.md
-└── README.md                # This file
+├── ARCHITECTURE.md      # System architecture & refactoring history
+├── USER_GUIDE.md        # Export guide and CLI usage (merged)
+├── QUANTIZATION.md      # Quantization implementation (replaces planning doc)
+├── TECHNICAL.md         # Block diffusion and KV cache details (merged)
+├── TEST_PLAN.md         # Testing strategy
+└── README.md            # This file
 ```
 
 ---
@@ -53,6 +48,10 @@ The architecture follows a modular design with clear separation of concerns:
 ├─────────────────────────────────────────────────────────────┤
 │  Runtime                                                     │
 │  - DiffusionEngine, Samplers, KV Cache                      │
+├─────────────────────────────────────────────────────────────┤
+│  Quantization                                                │
+│  - FP16Quantizer, INT8Quantizer, INT4Quantizer             │
+│  - BaseQuantizer with unified API                           │
 └─────────────────────────────────────────────────────────────┘
 ```
 

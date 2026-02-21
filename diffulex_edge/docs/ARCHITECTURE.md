@@ -258,7 +258,6 @@ b4236a6 refactor(architecture): implement new modular architecture with shared c
 
 ## References
 
-- [Export Guide](EXPORT.md) - Model export documentation
-- [Implementation Notes](IMPLEMENTATION.md) - Development details
-- [CLI Usage](CLI_USAGE.md) - Command-line interface
-- [Block Diffusion Export](BLOCK_DIFFUSION_EXPORT.md) - SDAR-specific export
+- [User Guide](USER_GUIDE.md) - Export and CLI usage
+- [Quantization](QUANTIZATION.md) - Quantization support details
+- [Technical Details](TECHNICAL.md) - Block diffusion and KV cache internals

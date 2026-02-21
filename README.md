@@ -1,222 +1,88 @@
-# DiffuLex Edge
+<img src=./assets/imgs/diffulex_design.png />
 
-Edge-optimized diffusion LLM inference framework based on ExecuTorch.
+<div align="center">
 
-[![Tests](https://img.shields.io/badge/tests-87%20passed-brightgreen)]()
-[![Python](https://img.shields.io/badge/python-3.9%2B-blue)]()
-[![License](https://img.shields.io/badge/license-MIT-green)]()
+# Diffulex
 
-## Overview
+[![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?logo=discord&logoColor=white)](https://discord.gg/NSa9WH4EKu)
 
-DiffuLex Edge is a simplified version of the DiffuLex dLLM (diffusion language model) inference framework, designed for deployment on edge devices including iOS, Android, and embedded systems.
+</div>
 
-### Key Differences from Server Version
+Diffulex is a Paged Attention-based dLLM accelerated decoding inference framework that is easy to develop and extensible. The design maximizes hiding the complexity of underlying KV Cache management, parallel strategy scheduling, and memory optimization. By providing a clean and unified API interface along with flexible inference strategy configurations (e.g., D2F, Block Diffusion, Fast-dLLM), Diffulex allows developers to focus on model inference logic and business requirements while maintaining production-level inference performance and resource utilization efficiency.
 
-| Feature | Server Version | Edge Version |
-|---------|---------------|--------------|
-| Tensor Parallel | ✅ Multi-GPU | ❌ Single device |
-| Attention | Flash Attention (CUDA) | PyTorch SDPA |
-| KV Cache | PagedAttention | Static KV Cache |
-| Quantization | GPTQ/AWQ/Marlin | XNNPACK/QNN 8-bit |
-| Runtime | vLLM | ExecuTorch |
+## Latest News
+- 12/22/2025 ✨: We are excited to announce that Diffulex, a Paged Attention-based dLLM accelerated decoding inference framework, is now open source and available to the public!
 
-## Project Status
+## Tested Devices
+Although Diffulex aims to be portable across a range of Devices, it has been specifically tested and validated on the following devices: for NVIDIA GPUs, this includes the H200, A100, RTX 4090, RTX 3090.
 
-### Implementation Progress
+## Installation
+### Method 1: Install with Pip
 
-| Phase | Status | Tests |
-|-------|--------|-------|
-| Phase 1: Model Simplification | ✅ Complete | 34/34 |
-| Phase 2: Runtime Implementation | ✅ Complete | 17/17 |
-| Phase 3: Quantization | ✅ Complete | 17/17 |
-| Phase 4: Multi-Backend Support | ✅ Complete | 10/10 |
-| Phase 5: Integration & Testing | 🟡 In Progress | Ongoing |
+The only way to get started is to install from source:
 
-**Total: 87 tests passing, 0 failures**
-
-### Supported Backends
-
-| Backend | Platform | Status |
-|---------|----------|--------|
-| XNNPACK | ARM64/x86 CPU | ✅ Ready |
-| CoreML | Apple Neural Engine | ✅ Ready (macOS/iOS) |
-| QNN | Qualcomm NPU | ✅ Ready (Android) |
+```bash
+uv pip install -e .
+```
 
 ## Quick Start
 
-### Installation
-
-```bash
-# Install dependencies
-pip install torch executorch
-
-# Optional: Backend-specific dependencies
-pip install coremltools  # For CoreML backend
-```
-
-### Basic Usage
+Here's a simple example to get started with Diffulex:
 
 ```python
-from diffulex_edge.model.fast_dllm_v2_edge import FastdLLMV2Edge, FastdLLMV2EdgeConfig
-from diffulex_edge.runtime.engine import InferenceEngine, GenerationConfig
+from diffulex import Diffulex, SamplingParams
+from transformers import AutoTokenizer
 
-# Create model
-config = FastdLLMV2EdgeConfig(
-    vocab_size=32000,
-    hidden_size=512,
-    num_hidden_layers=4,
-    num_attention_heads=8,
-    num_key_value_heads=4,  # GQA
+# Initialize the Diffulex engine
+model_path = "/path/to/your/model"
+llm = Diffulex(
+    model_path,
+    model_name="fast_dllm_v2",  # or "dream", "llada", etc.
+    tensor_parallel_size=1,
+    data_parallel_size=1,
+    gpu_memory_utilization=0.25,
+    max_model_len=2048,
+    decoding_strategy="block_diffusion",  # or "d2f", "fast_dllm"
+    mask_token_id=151665,  # model-specific mask token ID
 )
-model = FastdLLMV2Edge(config)
 
-# Run inference
-engine = InferenceEngine.from_model(model)
-tokens = engine.generate(
-    prompt_tokens=[1, 2, 3],
-    config=GenerationConfig(max_new_tokens=20)
+# Load tokenizer
+tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
+# Set sampling parameters
+sampling_params = SamplingParams(
+    temperature=0.0,
+    max_tokens=256,
 )
+
+# Prepare prompts
+prompts = [
+    "Question: What is the capital of France? Answer:",
+    "Question: Explain quantum computing in simple terms. Answer:",
+]
+
+# Generate responses
+outputs = llm.generate(prompts, sampling_params)
+
+# Process results
+for output in outputs:
+    print(f"Generated text: {output['text']}")
+    print(f"Number of diffusion steps: {output['n_diff_steps']}")
+    print(f"Token IDs: {output['token_ids']}")
 ```
 
-### Model Export
+For more examples, check out the [examples](examples/) directory.
 
-```python
-from diffulex_edge.backends import XNNPACKBackend, BackendConfig
+## Upcoming Features
 
-# Export with XNNPACK backend
-backend = XNNPACKBackend(BackendConfig(
-    quantize=True,
-    quantization_mode="weight_only"
-))
+Check our [Diffulex v0.0.1 release plan](https://github.com/SJTU-DENG-Lab/Diffulex/issues/14) for upcoming features.
 
-result = backend.export(model, example_inputs)
-if result.success:
-    with open("model.pte", "wb") as f:
-        f.write(result.buffer)
-```
+## Join the Discussion
 
-## Project Structure
+Welcome to join our Discord community for discussions, support, and collaboration!
 
-```
-diffulex_edge/
-├── model/              # Simplified model implementation
-│   ├── fast_dllm_v2_edge.py   # Edge model with KV cache
-│   └── kv_cache.py            # Static KV cache
-├── runtime/            # Inference runtime
-│   ├── engine.py              # Inference engine
-│   └── sampler.py             # Sampling strategies
-├── export/             # Model export
-│   ├── exporter.py            # ExecuTorch exporter
-│   └── config.py              # Export configuration
-├── quant/              # Quantization
-│   ├── quantizer.py           # PT2E quantizer
-│   └── observers.py           # Quantization observers
-├── backends/           # Backend implementations
-│   ├── base.py                # Backend abstraction
-│   ├── xnnpack_backend.py     # XNNPACK CPU backend
-│   ├── qnn_backend.py         # Qualcomm QNN backend
-│   └── coreml_backend.py      # Apple CoreML backend
-└── tests/              # Test suite
-    ├── test_model_simplified.py
-    ├── test_kv_cache.py
-    ├── test_engine.py
-    ├── test_export.py
-    ├── test_quantization.py
-    ├── test_backends.py
-    └── integration/
-        └── test_full_pipeline.py
-```
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      Application Layer                       │
-├─────────────────────────────────────────────────────────────┤
-│                   DiffuLex Edge Runtime                      │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
-│  │  Tokenizer  │  │   Sampler   │  │   KV Cache Manager  │  │
-│  │  (Hugging   │  │ (Greedy/    │  │    (Static)         │  │
-│  │   Face)     │  │  Top-k/p)   │  │                     │  │
-│  └─────────────┘  └─────────────┘  └─────────────────────┘  │
-├─────────────────────────────────────────────────────────────┤
-│              ExecuTorch Runtime (.pte model)                 │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │              Transformer Model                      │    │
-│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌────────┐ │    │
-│  │  │Embedding│→ │  Layer  │→ │  ...    │→ │ LM Head│ │    │
-│  │  └─────────┘  │(Attn+MLP)│  └─────────┘  └────────┘ │    │
-│  │               └─────────┘                           │    │
-│  └─────────────────────────────────────────────────────┘    │
-├─────────────────────────────────────────────────────────────┤
-│                    Backend Execution Engine                  │
-│     XNNPACK (CPU)    │    QNN (Qualcomm)   │  CoreML (ANE)  │
-└─────────────────────────────────────────────────────────────┘
-```
-
-## Features
-
-### Model Features
-- ✅ Simplified transformer architecture
-- ✅ Grouped Query Attention (GQA)
-- ✅ Rotary Position Embedding (RoPE)
-- ✅ RMSNorm layer normalization
-- ✅ SwiGLU activation in FFN
-- ✅ Static KV Cache for incremental inference
-
-### Runtime Features
-- ✅ PyTorch eager mode inference
-- ✅ ExecuTorch runtime support
-- ✅ Multiple sampling strategies (Greedy, Top-K, Top-P)
-- ✅ Temperature scaling
-- ✅ Repetition penalty
-- ✅ Stop sequences
-
-### Export Features
-- ✅ Multi-backend export (XNNPACK, CoreML, QNN)
-- ✅ Dynamic INT8 quantization
-- ✅ Static INT8 quantization
-- ✅ Weight-only quantization
-- ✅ FP16 casting
-
-## Testing
-
-Run the test suite:
-
-```bash
-# Run all tests
-python -m pytest diffulex_edge/tests/ -v
-
-# Run specific test module
-python -m pytest diffulex_edge/tests/test_model_simplified.py -v
-python -m pytest diffulex_edge/tests/test_backends.py -v
-```
-
-## Examples
-
-See the `examples/` directory for complete usage examples:
-
-- `edge_inference_example.py` - End-to-end inference demo
-- `export_model.py` - Command-line export tool
-
-## Roadmap
-
-- [x] Model simplification and basic architecture
-- [x] Static KV Cache implementation
-- [x] PyTorch SDPA attention
-- [x] Inference engine with generation
-- [x] XNNPACK backend support
-- [x] CoreML backend support
-- [x] QNN backend support
-- [x] Quantization (dynamic, static, weight-only)
-- [ ] End-to-end benchmark suite
-- [ ] Mobile deployment examples (iOS/Android)
-- [ ] Model compression techniques
-
-## License
-
-MIT License - See LICENSE file for details.
+[![Join our Discord](https://img.shields.io/badge/Discord-Join%20Us-blue?logo=discord&style=for-the-badge)](https://discord.gg/NSa9WH4EKu)
 
 ## Acknowledgments
 
-This project is based on the DiffuLex dLLM framework, adapted for edge deployment using Meta's ExecuTorch runtime.
+We would like to express our gratitude to [Nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm), which serves as the primary codebase foundation for this project, and [vLLM](https://github.com/vllm-project/vllm), from which we draw the core architectural concepts, particularly the Paged Attention mechanism. The initial version of this project was mainly developed by [Yijie Jin](https://github.com/drewjin0827) with supervision from Prof. [Zhijie Deng](https://thudzj.github.io) at Shanghai Jiao Tong University. 
