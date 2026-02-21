@@ -146,8 +146,8 @@ class TestDiffuLexExporter:
     def test_export_with_dynamic_quantization(self, small_model):
         """Test export with dynamic quantization.
         
-        Note: Eager mode quantization is not compatible with torch.export.
-        This test verifies that the export fails gracefully with a helpful message.
+        Note: With real weight quantization, DYNAMIC_INT8 now works with torch.export
+        by converting weights to INT8 storage format, achieving actual file size reduction.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "model_int8.pte"
@@ -175,12 +175,10 @@ class TestDiffuLexExporter:
             
             result = exporter.export(small_model, example_inputs)
             
-            # Dynamic quantization is not compatible with torch.export
-            # Export should fail with a helpful error message
-            assert not result.success  # Expected to fail
-            assert "LinearPackedParamsBase" in str(result.error_message) or \
-                   "not compatible" in str(result.error_message).lower() or \
-                   "flatc" in str(result.error_message).lower()
+            # With real weight quantization, DYNAMIC_INT8 should succeed
+            assert result.success
+            assert result.file_size_mb > 0
+            assert output_path.exists()
     
     def test_export_weight_only_quantization(self, small_model):
         """Test export with weight-only quantization."""

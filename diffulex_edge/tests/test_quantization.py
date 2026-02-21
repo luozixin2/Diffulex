@@ -5,11 +5,13 @@ import torch
 import torch.nn as nn
 
 from diffulex_edge.quant import (
-    DiffuLexQuantizer,
+    quantize_model,
+    quantize_to_fp16,
+    quantize_to_int8,
     QuantizationConfig,
+    QuantizationDtype,
     QuantizationMode,
-    apply_dynamic_quantization,
-    apply_weight_only_quantization,
+    WeightOnlyQuantizer,
 )
 
 
@@ -49,63 +51,92 @@ class TestQuantizationConfig:
             assert config.mode == mode
 
 
-class TestDynamicQuantization:
-    """Test dynamic quantization."""
+class TestUnifiedAPI:
+    """Test the unified quantize_model API."""
     
-    def test_dynamic_quantization_basic(self):
-        """Test basic dynamic quantization."""
+    def test_quantize_model_fp16(self):
+        """Test quantize_model with FP16."""
         model = SimpleLinearModel()
         model.eval()
         
-        # Apply quantization
-        quantized = apply_dynamic_quantization(model)
+        # Quantize using unified API
+        quantized = quantize_model(model, dtype="fp16")
         
-        # Check that linear layers are quantized
-        assert hasattr(quantized.linear1, 'weight')
-        assert hasattr(quantized.linear2, 'weight')
-    
-    def test_dynamic_quantization_outputs(self):
-        """Test that quantized model produces reasonable outputs."""
-        model = SimpleLinearModel()
-        model.eval()
-        
-        # Original output
-        x = torch.randn(4, 64)
-        with torch.no_grad():
-            original_output = model(x)
-        
-        # Quantized output
-        quantized = apply_dynamic_quantization(model)
-        with torch.no_grad():
-            quantized_output = quantized(x)
-        
-        # Outputs should be similar (not identical due to quantization)
-        assert quantized_output.shape == original_output.shape
-        
-        # Check that outputs are finite
-        assert torch.isfinite(quantized_output).all()
-    
-    def test_dynamic_quantization_inference(self):
-        """Test inference with dynamically quantized model."""
-        model = SimpleLinearModel()
-        model.eval()
-        
-        quantized = apply_dynamic_quantization(model)
-        
-        # Run inference
+        # Check model works
         x = torch.randn(2, 64)
         with torch.no_grad():
             output = quantized(x)
         
         assert output.shape == (2, 32)
         assert torch.isfinite(output).all()
-
-
-class TestWeightOnlyQuantization:
-    """Test weight-only quantization."""
     
-    def test_weight_only_quantization_basic(self):
-        """Test basic weight-only quantization."""
+    def test_quantize_model_int8(self):
+        """Test quantize_model with INT8."""
+        model = SimpleLinearModel()
+        model.eval()
+        
+        # Quantize using unified API
+        quantized = quantize_model(model, dtype="int8", mode="weight_only")
+        
+        # Check model works
+        x = torch.randn(2, 64)
+        with torch.no_grad():
+            output = quantized(x)
+        
+        assert output.shape == (2, 32)
+        assert torch.isfinite(output).all()
+    
+    def test_quantize_model_invalid_dtype(self):
+        """Test quantize_model with invalid dtype."""
+        model = SimpleLinearModel()
+        
+        with pytest.raises(ValueError):
+            quantize_model(model, dtype="invalid")
+
+
+class TestQuantizeToFP16:
+    """Test FP16 quantization."""
+    
+    def test_fp16_basic(self):
+        """Test basic FP16 quantization."""
+        model = SimpleLinearModel()
+        model.eval()
+        
+        quantized = quantize_to_fp16(model)
+        
+        # Check that model works
+        x = torch.randn(2, 64)
+        with torch.no_grad():
+            output = quantized(x)
+        
+        assert output.shape == (2, 32)
+    
+    def test_fp16_outputs(self):
+        """Test that FP16 model produces reasonable outputs."""
+        model = SimpleLinearModel()
+        model.eval()
+        
+        x = torch.randn(4, 64)
+        
+        with torch.no_grad():
+            original_output = model(x)
+        
+        quantized = quantize_to_fp16(model)
+        
+        with torch.no_grad():
+            quantized_output = quantized(x)
+        
+        # Outputs should be very similar for FP16
+        assert quantized_output.shape == original_output.shape
+        max_error = (original_output - quantized_output).abs().max().item()
+        assert max_error < 0.01  # Very small error for FP16
+
+
+class TestQuantizeToInt8:
+    """Test INT8 quantization."""
+    
+    def test_int8_weight_only_basic(self):
+        """Test basic INT8 weight-only quantization."""
         model = SimpleLinearModel()
         
         # Store original weights
@@ -113,14 +144,18 @@ class TestWeightOnlyQuantization:
         original_weight2 = model.linear2.weight.data.clone()
         
         # Apply quantization
-        quantized = apply_weight_only_quantization(model)
+        quantized = quantize_to_int8(model, mode="weight_only")
         
-        # Weights should be different (quantized then dequantized)
-        assert not torch.allclose(quantized.linear1.weight, original_weight1)
-        assert not torch.allclose(quantized.linear2.weight, original_weight2)
+        # Check that weights are now stored as INT8 (char type)
+        assert quantized.linear1.weight.dtype == torch.int8
+        assert quantized.linear2.weight.dtype == torch.int8
+        
+        # Check that weights have scale factors for dequantization
+        assert hasattr(quantized.linear1, 'weight_scale')
+        assert hasattr(quantized.linear2, 'weight_scale')
     
-    def test_weight_only_quantization_outputs(self):
-        """Test that weight-only quantization produces reasonable outputs."""
+    def test_int8_outputs(self):
+        """Test that INT8 quantization produces reasonable outputs."""
         model = SimpleLinearModel()
         model.eval()
         
@@ -129,7 +164,7 @@ class TestWeightOnlyQuantization:
         with torch.no_grad():
             original_output = model(x)
         
-        quantized = apply_weight_only_quantization(model)
+        quantized = quantize_to_int8(model, mode="weight_only")
         
         with torch.no_grad():
             quantized_output = quantized(x)
@@ -142,56 +177,37 @@ class TestWeightOnlyQuantization:
         assert max_error < 1.0  # Reasonable error bound for this simple model
 
 
-class TestQuantizerAPI:
-    """Test the main Quantizer API."""
+class TestWeightOnlyQuantizer:
+    """Test the WeightOnlyQuantizer class."""
     
     def test_quantizer_initialization(self):
         """Test quantizer initialization."""
-        config = QuantizationConfig(mode=QuantizationMode.DYNAMIC)
-        quantizer = DiffuLexQuantizer(config)
-        
-        assert quantizer.config == config
+        quantizer = WeightOnlyQuantizer()
+        assert quantizer.is_available() is True
     
-    def test_quantizer_prepare_dynamic(self):
-        """Test preparing model for dynamic quantization."""
+    def test_quantizer_fp16(self):
+        """Test quantizer with FP16."""
         model = SimpleLinearModel()
-        config = QuantizationConfig(mode=QuantizationMode.DYNAMIC)
-        quantizer = DiffuLexQuantizer(config)
+        config = QuantizationConfig(dtype=QuantizationDtype.FP16)
+        quantizer = WeightOnlyQuantizer()
         
-        example_inputs = (torch.randn(2, 64),)
+        result = quantizer.quantize(model, config)
         
-        # For dynamic quantization, prepare should return model
-        prepared = quantizer.prepare_for_quantization(model, example_inputs)
-        assert prepared is not None
+        assert result.success is True
+        assert result.model is not None
+        assert "compression_ratio" in result.metrics
     
-    def test_quantizer_convert_dynamic(self):
-        """Test converting dynamically quantized model."""
+    def test_quantizer_int8(self):
+        """Test quantizer with INT8."""
         model = SimpleLinearModel()
-        config = QuantizationConfig(mode=QuantizationMode.DYNAMIC)
-        quantizer = DiffuLexQuantizer(config)
+        config = QuantizationConfig(dtype=QuantizationDtype.INT8)
+        quantizer = WeightOnlyQuantizer()
         
-        example_inputs = (torch.randn(2, 64),)
-        prepared = quantizer.prepare_for_quantization(model, example_inputs)
+        result = quantizer.quantize(model, config)
         
-        # Convert
-        quantized = quantizer.convert(prepared)
-        assert quantized is not None
-    
-    def test_quantizer_weight_only(self):
-        """Test weight-only quantization through quantizer."""
-        model = SimpleLinearModel()
-        config = QuantizationConfig(mode=QuantizationMode.WEIGHT_ONLY)
-        quantizer = DiffuLexQuantizer(config)
-        
-        # Weight-only doesn't need preparation
-        quantized = quantizer.quantize_weights_only(model)
-        
-        # Test inference
-        x = torch.randn(2, 64)
-        with torch.no_grad():
-            output = quantized(x)
-        
-        assert output.shape == (2, 32)
+        assert result.success is True
+        assert result.model is not None
+        assert result.metrics["compression_ratio"] > 3.0  # INT8 should give ~4x
 
 
 class TestQuantizationWithKVCache:
@@ -215,8 +231,8 @@ class TestQuantizationWithKVCache:
         model = FastdLLMV2Edge(config)
         model.eval()
         
-        # Apply dynamic quantization
-        quantized = apply_dynamic_quantization(model)
+        # Apply INT8 quantization
+        quantized = quantize_to_int8(model, mode="weight_only")
         
         # Test inference with KV cache
         input_ids = torch.randint(0, 1000, (1, 8))
@@ -245,7 +261,7 @@ class TestQuantizationNumericalStability:
         for _ in range(10):
             x = torch.randn(8, 64) * 10  # Larger inputs
             
-            quantized = apply_dynamic_quantization(model)
+            quantized = quantize_to_int8(model, mode="weight_only")
             with torch.no_grad():
                 output = quantized(x)
             
@@ -257,7 +273,7 @@ class TestQuantizationNumericalStability:
         model = SimpleLinearModel()
         model.eval()
         
-        quantized = apply_dynamic_quantization(model)
+        quantized = quantize_to_int8(model, mode="weight_only")
         
         x = torch.randn(4, 64)
         

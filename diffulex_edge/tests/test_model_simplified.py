@@ -23,11 +23,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from diffulex_edge.model.fast_dllm_v2_edge import (
     FastdLLMV2Edge,
     FastdLLMV2EdgeConfig,
-    RMSNorm,
     AttentionEdge,
-    MLP,
-    RotaryEmbedding,
 )
+from diffulex_edge.components import RMSNorm, RotaryEmbedding, SwiGLUMLP as MLP
 
 
 class TestRMSNorm:
@@ -74,7 +72,7 @@ class TestRotaryEmbedding:
     
     def test_shape(self):
         """Test RoPE maintains tensor shapes."""
-        rope = RotaryEmbedding(dim=64, max_position_embeddings=512)
+        rope = RotaryEmbedding(head_dim=64, max_position_embeddings=512)
         
         batch, seq, heads, dim = 2, 10, 8, 64
         q = torch.randn(batch, heads, seq, dim)
@@ -89,7 +87,7 @@ class TestRotaryEmbedding:
     
     def test_position_dependence(self):
         """Test that rotation depends on position."""
-        rope = RotaryEmbedding(dim=64, max_position_embeddings=512)
+        rope = RotaryEmbedding(head_dim=64, max_position_embeddings=512)
         
         q = torch.randn(1, 8, 1, 64)
         k = torch.randn(1, 4, 1, 64)
@@ -106,7 +104,7 @@ class TestRotaryEmbedding:
     
     def test_rotation_orthogonality(self):
         """Test that rotation preserves norms (approximately)."""
-        rope = RotaryEmbedding(dim=64, max_position_embeddings=512)
+        rope = RotaryEmbedding(head_dim=64, max_position_embeddings=512)
         
         q = torch.randn(2, 8, 10, 64)
         k = torch.randn(2, 4, 10, 64)
@@ -136,7 +134,7 @@ class TestAttentionEdge:
         batch, seq = 2, 10
         hidden = torch.randn(batch, seq, 256)
         positions = torch.arange(seq).unsqueeze(0).expand(batch, -1)
-        rope = RotaryEmbedding(dim=32)
+        rope = RotaryEmbedding(head_dim=32)
         
         out, _, _ = attn(hidden, positions, rope)
         
@@ -154,7 +152,7 @@ class TestAttentionEdge:
         batch, seq = 2, 10
         hidden = torch.randn(batch, seq, 256)
         positions = torch.arange(seq).unsqueeze(0).expand(batch, -1)
-        rope = RotaryEmbedding(dim=32)
+        rope = RotaryEmbedding(head_dim=32)
         
         # Should not raise error
         out, _, _ = attn(hidden, positions, rope)
@@ -171,7 +169,7 @@ class TestAttentionEdge:
         
         hidden = torch.randn(2, 10, 128)
         positions = torch.arange(10).unsqueeze(0).expand(2, -1)
-        rope = RotaryEmbedding(dim=32)
+        rope = RotaryEmbedding(head_dim=32)
         
         out, _, _ = attn(hidden, positions, rope)
         
@@ -190,7 +188,7 @@ class TestAttentionEdge:
         
         hidden = torch.randn(2, 10, 128)
         positions = torch.arange(10).unsqueeze(0).expand(2, -1)
-        rope = RotaryEmbedding(dim=32)
+        rope = RotaryEmbedding(head_dim=32)
         
         with torch.no_grad():
             out1, _, _ = attn(hidden, positions, rope)
@@ -423,7 +421,7 @@ class TestNumericalAccuracy:
         
         hidden = torch.randn(1, 10, 128)
         positions = torch.arange(10).unsqueeze(0)
-        rope = RotaryEmbedding(dim=32)
+        rope = RotaryEmbedding(head_dim=32)
         
         with torch.no_grad():
             out, _, _ = attn(hidden, positions, rope)

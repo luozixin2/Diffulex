@@ -245,9 +245,9 @@ class TestQuantizationImpact:
         
         # Try quantized version
         try:
-            from diffulex_edge.quant import apply_dynamic_quantization
+            from diffulex_edge.quant import quantize_to_int8
             
-            model_quant = apply_dynamic_quantization(model_fp32)
+            model_quant = quantize_to_int8(model_fp32, mode="dynamic")
             model_quant.eval()
             
             # Warmup
