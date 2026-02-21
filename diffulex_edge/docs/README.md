@@ -1,58 +1,82 @@
 # DiffuLex Edge Documentation
 
-## Quick Navigation
-
-### Getting Started
-- [Architecture](ARCHITECTURE.md) - System design and module structure
-- [User Guide](USER_GUIDE.md) - Model export and CLI usage
-- [Quantization](QUANTIZATION.md) - Quantization support (FP16/INT8/INT4)
-
-### Advanced Topics
-- [Technical Details](TECHNICAL.md) - Block diffusion and KV cache internals
-
-### Development
-- [Test Plan](TEST_PLAN.md) - Testing strategy and coverage
+Edge deployment toolkit for diffusion language models.
 
 ---
 
-## Documentation Structure
+## Quick Start
 
+```bash
+# Install dependencies
+pip install torch transformers
+
+# Run CLI demo
+python -m diffulex_edge
+
+# Load and run a model
+python -m diffulex_edge --model-path /path/to/model
 ```
-docs/
-├── ARCHITECTURE.md      # System architecture & refactoring history
-├── USER_GUIDE.md        # Export guide and CLI usage (merged)
-├── QUANTIZATION.md      # Quantization implementation (replaces planning doc)
-├── TECHNICAL.md         # Block diffusion and KV cache details (merged)
-├── TEST_PLAN.md         # Testing strategy
-└── README.md            # This file
-```
+
+---
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [Architecture](ARCHITECTURE.md) | System design, module structure, and architecture principles |
+| [User Guide](USER_GUIDE.md) | Model export, CLI usage, and model-specific notes |
+| [Quantization](QUANTIZATION.md) | FP16/INT8/INT4 quantization support |
+| [Technical Details](TECHNICAL.md) | Block diffusion, KV cache, and static graph internals |
+| [Test Plan](TEST_PLAN.md) | Testing strategy and coverage |
 
 ---
 
 ## Architecture Overview
 
-The architecture follows a modular design with clear separation of concerns:
-
 ```
 ┌─────────────────────────────────────────────────────────────┐
+│                    DiffuLex Edge                             │
+├─────────────────────────────────────────────────────────────┤
 │  Components (Shared)                                         │
 │  - RMSNorm, RotaryEmbedding, SwiGLUMLP                      │
 ├─────────────────────────────────────────────────────────────┤
 │  Models                                                      │
-│  - SDAREdge, FastdLLMV2Edge, DreamEdge, LLaDAEdge         │
-│  - Base classes: DiffusionModel, ModelConfig                │
-│  - Export wrappers: ExportWrapper, BlockDiffusionWrapper    │
-├─────────────────────────────────────────────────────────────┤
-│  Backends                                                    │
-│  - XNNPACK, CoreML, QNN (backend-agnostic)                  │
+│  - SDAR, FastdLLMV2, Dream, LLaDA                          │
+│  - Base: DiffusionModel, ModelConfig                        │
 ├─────────────────────────────────────────────────────────────┤
 │  Runtime                                                     │
 │  - DiffusionEngine, Samplers, KV Cache                      │
 ├─────────────────────────────────────────────────────────────┤
+│  Export                                                      │
+│  - XNNPACK, CoreML, QNN backends                            │
+├─────────────────────────────────────────────────────────────┤
 │  Quantization                                                │
-│  - FP16Quantizer, INT8Quantizer, INT4Quantizer             │
-│  - BaseQuantizer with unified API                           │
+│  - FP16, INT8, INT4 weight-only quantization                │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed information.
+---
+
+## Supported Models
+
+| Model | Size | Mask Token ID | Attention |
+|-------|------|---------------|-----------|
+| SDAR | 1.7B | 126336 | Causal |
+| Fast dLLM v2 | 1.5B | 151665 | Causal |
+| Dream | 7B | 151666 | Bidirectional |
+| LLaDA | 8B | 126336 | Bidirectional |
+
+---
+
+## Project Structure
+
+```
+diffulex_edge/
+├── components/          # Shared transformer components
+├── model/              # Model implementations
+├── runtime/            # Inference engine and samplers
+├── export/             # Export configuration
+├── backends/           # Platform backends
+├── quant/              # Quantization
+└── docs/               # Documentation
+```
