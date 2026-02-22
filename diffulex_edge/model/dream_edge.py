@@ -47,22 +47,6 @@ class DreamEdgeConfig(ModelConfig):
     eos_token_id: int = 151643
 
 
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """Repeat key/value heads for GQA.
-    
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep).
-    The hidden states go from (batch, num_key_value_heads, seqlen, head_dim)
-    to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_key_value_heads, n_rep, slen, head_dim
-    )
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-
 class DreamAttention(nn.Module):
     """Dream attention mechanism with KV cache support.
     
@@ -514,94 +498,6 @@ class DreamEdge(DiffusionModel):
         
         return (input_ids, positions, kv_cache, attention_mask, insert_matrix, keep_mask)
     
-    # =========================================================================
-    # Legacy HF-style API for backward compatibility
-    # =========================================================================
-    
-    def forward_hf_style(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
-        use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]]]:
-        """Forward pass aligned with HF DreamModel (legacy API).
-        
-        This method provides backward compatibility with HF-style calling.
-        New code should use forward() instead.
-        
-        Args:
-            input_ids: [batch_size, seq_len]
-            attention_mask: Optional 4D mask [batch_size, 1, seq_len, kv_len]
-                or 2D mask [batch_size, seq_len] that will be converted to 4D
-            position_ids: [batch_size, seq_len] or [seq_len]
-            past_key_values: Optional tuple of layer caches
-                Each layer cache is (k_cache, v_cache) with shape
-                [batch_size, num_kv_heads, cache_len, head_dim]
-            use_cache: Whether to return updated KV cache
-            
-        Returns:
-            Tuple of (logits, present_key_values)
-        """
-        batch_size, seq_len = input_ids.shape
-        
-        # Prepare position ids
-        if position_ids is None:
-            if past_key_values is not None:
-                past_len = past_key_values[0][0].shape[2]
-                position_ids = torch.arange(
-                    past_len, past_len + seq_len, dtype=torch.long, device=input_ids.device
-                )
-            else:
-                position_ids = torch.arange(
-                    0, seq_len, dtype=torch.long, device=input_ids.device
-                )
-            position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
-        
-        # Convert past_key_values to kv_cache format
-        kv_cache = list(past_key_values) if past_key_values is not None else None
-        
-        # Call the main forward
-        logits, new_kv_cache = self.forward(
-            input_ids=input_ids,
-            positions=position_ids,
-            mask=attention_mask,
-            kv_cache=kv_cache,
-        )
-        
-        # Convert back to HF format if needed
-        present_key_values = tuple(new_kv_cache) if use_cache else None
-        
-        return logits, present_key_values
-    
-    def prepare_inputs_for_generation(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Tuple] = None,
-    ) -> dict:
-        """Prepare inputs for generation with KV cache.
-        
-        This method helps align the interface with HF transformers.
-        """
-        batch_size, seq_len = input_ids.shape
-        
-        if past_key_values is not None:
-            # Only use the last token if we have past KV
-            past_len = past_key_values[0][0].shape[2]
-            input_ids = input_ids[:, -1:]
-            position_ids = torch.tensor([[past_len]], device=input_ids.device)
-        else:
-            position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
-        
-        return {
-            "input_ids": input_ids,
-            "positions": position_ids,
-            "kv_cache": list(past_key_values) if past_key_values is not None else None,
-        }
-
-
 __all__ = [
     "DreamEdgeConfig",
     "DreamEdge",

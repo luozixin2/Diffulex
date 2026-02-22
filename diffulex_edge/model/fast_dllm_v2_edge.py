@@ -300,17 +300,15 @@ class FastDLLMv2Edge(DiffusionModel):
         mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         max_seq_len: Optional[int] = None,
-        use_block_diffusion_mask: bool = True,
     ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
         """Forward with dynamic KV cache (for DiffusionEngine).
         
         Args:
             input_ids: [batch_size, seq_len] token indices
             positions: [batch_size, seq_len] position indices
-            mask: Optional attention mask (unused, kept for API compatibility)
+            mask: Optional attention mask [batch, 1, seq_len, total_len]
             kv_cache: Optional list of (k, v) tuples from previous forward pass
             max_seq_len: Maximum sequence length for cache
-            use_block_diffusion_mask: Whether to use block diffusion attention mask
             
         Returns:
             Tuple of (logits, new_kv_cache)
@@ -324,16 +322,6 @@ class FastDLLMv2Edge(DiffusionModel):
         hidden_states = self.embed_tokens(input_ids)
         new_kv_cache = []
         
-        # Create block diffusion mask if needed
-        attention_mask = None
-        if use_block_diffusion_mask:
-            cache_len = kv_cache[0][0].shape[2] if kv_cache else 0
-            # Expand mask for batch and heads: [seq_len, total_len] -> [1, 1, seq_len, total_len]
-            base_mask = self._create_block_diffusion_mask(
-                seq_len, cache_len, input_ids.device, hidden_states.dtype
-            )
-            attention_mask = base_mask.unsqueeze(0).unsqueeze(0)
-        
         for i, layer in enumerate(self.layers):
             k_cache, v_cache = None, None
             cache_len = 0
@@ -343,7 +331,7 @@ class FastDLLMv2Edge(DiffusionModel):
             
             hidden_states, new_k, new_v = layer(
                 positions, hidden_states, k_cache, v_cache, cache_len, max_seq_len,
-                attention_mask
+                mask
             )
             new_kv_cache.append((new_k, new_v))
         
@@ -352,17 +340,4 @@ class FastDLLMv2Edge(DiffusionModel):
         
         return logits, new_kv_cache
     
-    def _extract_kv_cache(
-        self, 
-        kv_cache: Optional[List], 
-        layer_idx: int
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int]:
-        """Extract k_cache, v_cache, and cache_len for a layer."""
-        if kv_cache is None or layer_idx >= len(kv_cache):
-            return None, None, 0
-        k_cache, v_cache = kv_cache[layer_idx]
-        cache_len = k_cache.shape[2] if k_cache is not None else 0
-        return k_cache, v_cache, cache_len
-
-
 __all__ = ["FastDLLMv2EdgeConfig", "FastDLLMv2Edge"]

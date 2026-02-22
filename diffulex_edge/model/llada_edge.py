@@ -9,28 +9,25 @@ import torch.nn as nn
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+from .base import ModelConfig, DiffusionModel
 from ..components import RMSNorm, RotaryEmbedding, SwiGLUMLP
 
 
 @dataclass
-class LLaDAEdgeConfig:
+class LLaDAEdgeConfig(ModelConfig):
     """Configuration for LLaDA Edge model."""
-    vocab_size: int = 32000
+    vocab_size: int = 126336  # LLaDA specific
     hidden_size: int = 2048
-    num_hidden_layers: int = 24
+    num_hidden_layers: int = 28
     num_attention_heads: int = 16
-    num_key_value_heads: int = 16  # GQA support
-    intermediate_size: int = 5632
+    num_key_value_heads: int = 8  # GQA
+    intermediate_size: int = 5504
     max_position_embeddings: int = 4096
     rms_norm_eps: float = 1e-6
-    rope_theta: float = 10000.0
-    rope_scaling: Optional[dict] = None
+    rope_theta: float = 1000000.0
     attention_bias: bool = True  # LLaDA uses bias in attention
-    head_dim: Optional[int] = None
-    hidden_act: str = "silu"
     tie_word_embeddings: bool = False
     mask_token_id: int = 126336  # LLaDA specific
-    confidence_threshold: float = 0.9
 
 
 class LLaDAAttention(nn.Module):
@@ -131,12 +128,11 @@ class LLaDADecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class LLaDAEdge(nn.Module):
+class LLaDAEdge(DiffusionModel):
     """LLaDA model for diffusion language modeling (Edge version)."""
     
     def __init__(self, config: LLaDAEdgeConfig):
-        super().__init__()
-        self.config = config
+        super().__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([LLaDADecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

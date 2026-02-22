@@ -45,6 +45,14 @@ class DiffusionGenerationConfig:
         neg_entropy: Use negative entropy as confidence
     """
     
+    # Model-specific default mask token IDs
+    _DEFAULT_MASK_TOKENS = {
+        "fast_dllm_v2": 151665,
+        "dream": 151666,
+        "llada": 126336,
+        "sdar": 151669,  # SDAR uses <|MASK|> token at 151669
+    }
+    
     def __init__(
         self,
         max_new_tokens: int = 100,
@@ -54,7 +62,7 @@ class DiffusionGenerationConfig:
         temperature: float = 1.0,
         top_k: int = 0,
         top_p: float = 1.0,
-        mask_token_id: int = 126336,
+        mask_token_id: Optional[int] = None,  # None means use model-specific default
         eos_token_id: int = 2,
         model_type: str = "fast_dllm_v2",
         margin_confidence: bool = False,
@@ -67,6 +75,9 @@ class DiffusionGenerationConfig:
         self.temperature = temperature
         self.top_k = top_k
         self.top_p = top_p
+        # Use model-specific default if mask_token_id not provided
+        if mask_token_id is None:
+            mask_token_id = self._DEFAULT_MASK_TOKENS.get(model_type, 126336)
         self.mask_token_id = mask_token_id
         self.eos_token_id = eos_token_id
         self.model_type = model_type
@@ -119,7 +130,15 @@ class DiffusionEngine:
         self.max_seq_len = max_seq_len
         self.use_kv_cache = use_kv_cache and (model is not None)  # KV cache only for PyTorch
         
-        self.block_manager = DiffusionBlockManager()
+        # Use model-specific default mask token
+        default_mask_tokens = {
+            "fast_dllm_v2": 151665,
+            "dream": 151666,
+            "llada": 126336,
+            "sdar": 151669,  # SDAR uses <|MASK|> token at 151669
+        }
+        mask_token = default_mask_tokens.get(model_type, 126336)
+        self.block_manager = DiffusionBlockManager(mask_token_id=mask_token)
         self.sampler: Optional[Any] = None
         
         # PTE state
@@ -284,8 +303,8 @@ class DiffusionEngine:
             prompt_ids = torch.tensor([prompt_tokens], dtype=torch.long, device=self.device)
             prompt_positions = torch.arange(prompt_len, device=self.device).unsqueeze(0)
             
-            # For diffusion models, use non-causal mask (full attention)
-            prompt_mask = self._create_diffusion_mask(prompt_len, prompt_len)
+            # For diffusion models, use block causal mask
+            prompt_mask = self._create_diffusion_mask(prompt_len, prompt_len, config.block_size)
             
             _, kv_cache = self._forward(
                 input_ids=prompt_ids,
@@ -318,8 +337,8 @@ class DiffusionEngine:
                     device=self.device
                 ).unsqueeze(0)
                 
-                # Diffusion mask: block can see all cached + itself
-                block_mask = self._create_diffusion_mask(block_len, cached_len + block_len)
+                # Diffusion mask: block can see all cached + itself (block causal)
+                block_mask = self._create_diffusion_mask(block_len, cached_len + block_len, config.block_size)
                 
                 # Truncate KV cache to cached_len before each iteration
                 truncated_kv_cache = self._truncate_kv_cache(kv_cache, cached_len)
@@ -384,6 +403,13 @@ class DiffusionEngine:
             for iteration in range(config.num_iterations):
                 total_iterations += 1
                 
+                # Rebuild sequence with confirmed tokens from active block
+                sequence = self._build_sequence(
+                    confirmed_tokens, 
+                    active_block, 
+                    config.mask_token_id
+                )
+                
                 # Forward pass
                 logits = self._forward_full_sequence(sequence)
                 
@@ -420,9 +446,10 @@ class DiffusionEngine:
         active_block: Any,
         mask_token_id: int
     ) -> List[int]:
-        """Build sequence: confirmed + active masks + padding."""
+        """Build sequence: confirmed + active block tokens (confirmed or mask)."""
         sequence = list(confirmed_tokens)
-        sequence.extend([mask_token_id] * active_block.length)
+        # Use active_block's confirmed tokens or mask tokens
+        sequence.extend(active_block.get_sequence_tokens())
         
         # Pad to max_seq_len for PTE
         if self._is_pte and self.max_seq_len is not None:
@@ -453,22 +480,52 @@ class DiffusionEngine:
     def _create_diffusion_mask(
         self,
         query_len: int,
-        kv_len: int
+        kv_len: int,
+        block_size: int = 32,
     ) -> torch.Tensor:
-        """Create diffusion mask: query can see all KV (non-causal).
+        """Create diffusion mask based on model type.
         
-        For diffusion models, all positions can attend to all other positions.
+        Supports two mask types:
+        - Block causal (fast_dllm_v2, sdar): query can attend to KV if query's block >= KV's block
+        - Full attention (dream, llada): all positions can attend to all positions
         
         Args:
             query_len: Length of query (current positions)
             kv_len: Length of key/value (cached + current)
+            block_size: Size of each block for block causal attention
             
         Returns:
-            Mask tensor [1, 1, query_len, kv_len] with all zeros (all visible)
+            Mask tensor [1, 1, query_len, kv_len] with 0 for visible, -inf for masked
         """
-        # For diffusion: all positions can see all positions
-        mask = torch.zeros(query_len, kv_len, device=self.device)
-        return mask.unsqueeze(0).unsqueeze(0)
+        # Models that use block causal attention
+        block_causal_models = ["fast_dllm_v2", "sdar"]
+        
+        if self.model_type in block_causal_models:
+            # Block causal mask: query at position i can see KV at position j if block(i) >= block(j)
+            # Use bd_size from model config if available, otherwise use block_size parameter
+            if hasattr(self.model, 'config') and hasattr(self.model.config, 'bd_size'):
+                bd_size = self.model.config.bd_size
+            else:
+                bd_size = block_size
+            
+            cache_len = kv_len - query_len
+            q_indices = torch.arange(query_len, device=self.device) + cache_len
+            k_indices = torch.arange(kv_len, device=self.device)
+            
+            q_blocks = q_indices // bd_size
+            k_blocks = k_indices // bd_size
+            
+            # Block causal: q can attend to k if q_block >= k_block
+            mask = q_blocks.unsqueeze(1) >= k_blocks.unsqueeze(0)
+            
+            # Convert to additive mask (0 for keep, -inf for mask)
+            additive_mask = torch.where(mask, 0.0, float('-inf'))
+            return additive_mask.unsqueeze(0).unsqueeze(0)
+        else:
+            # Full attention for other models (dream, llada)
+            # All positions can attend to all positions
+            mask = torch.zeros(query_len, kv_len, device=self.device)
+            return mask.unsqueeze(0).unsqueeze(0)
     
     def _forward(
         self,
@@ -510,8 +567,22 @@ class DiffusionEngine:
         batch_size, seq_len = input_ids.shape
         positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
         
-        # Non-causal mask (all zeros)
-        mask = torch.zeros(1, 1, seq_len, seq_len, device=input_ids.device)
+        # Create block causal mask for diffusion models
+        # query at position i can see key at position j if block(i) >= block(j)
+        if hasattr(self.model, 'config') and hasattr(self.model.config, 'bd_size'):
+            bd_size = self.model.config.bd_size
+        else:
+            bd_size = 32
+        
+        q_indices = torch.arange(seq_len, device=input_ids.device)
+        k_indices = torch.arange(seq_len, device=input_ids.device)
+        q_blocks = q_indices // bd_size
+        k_blocks = k_indices // bd_size
+        
+        # Block causal: q can attend to k if q_block >= k_block
+        mask_bool = q_blocks.unsqueeze(1) >= k_blocks.unsqueeze(0)
+        mask = torch.where(mask_bool, 0.0, float('-inf')).to(input_ids.device)
+        mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
         
         with torch.no_grad():
             logits, _ = self.model(input_ids, positions, mask, None)

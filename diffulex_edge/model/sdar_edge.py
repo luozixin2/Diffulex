@@ -36,6 +36,9 @@ class SDAREdgeConfig(ModelConfig):
     
     # SDAR-specific parameters
     diffusion_block_size: int = 4
+    bd_size: int = 32  # Block diffusion size
+    mask_token_id: int = 151669  # SDAR mask token
+    pad_token_id: int = 151643
     
     def __post_init__(self):
         """Set derived values."""
@@ -91,6 +94,7 @@ class SDARAttention(nn.Module):
         v_cache: Optional[torch.Tensor] = None,
         cache_len: int = 0,
         max_cache_len: Optional[int] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward with dynamic KV cache (for Python inference)."""
         batch_size, seq_len, _ = hidden_states.shape
@@ -144,10 +148,16 @@ class SDARAttention(nn.Module):
             k = k.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
             v = v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
         
-        # Attention
-        attn_output = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=None, is_causal=False, scale=self.scaling
-        )
+        # Compute attention scores
+        scores = torch.matmul(q, k.transpose(-1, -2)) * self.scaling
+        
+        # Apply attention mask if provided
+        if attention_mask is not None:
+            scores = scores + attention_mask.to(target_dtype)
+        
+        # Softmax and apply to values
+        attn_weights = F.softmax(scores, dim=-1, dtype=torch.float32).to(target_dtype)
+        attn_output = torch.matmul(attn_weights, v)
         
         attn_output = attn_output.transpose(1, 2).contiguous().view(
             batch_size, seq_len, -1
@@ -248,13 +258,15 @@ class SDARDecoderLayer(nn.Module):
         v_cache: Optional[torch.Tensor] = None,
         cache_len: int = 0,
         max_cache_len: Optional[int] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward with dynamic KV cache."""
         # Self Attention with residual
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states, new_k, new_v = self.self_attn(
-            positions, hidden_states, k_cache, v_cache, cache_len, max_cache_len
+            positions, hidden_states, k_cache, v_cache, cache_len, max_cache_len,
+            attention_mask
         )
         hidden_states = residual + hidden_states
         
@@ -338,7 +350,8 @@ class SDAREdge(DiffusionModel):
                 cache_len = k_cache.shape[2] if k_cache is not None else 0
             
             hidden_states, new_k, new_v = layer(
-                positions, hidden_states, k_cache, v_cache, cache_len, max_seq_len
+                positions, hidden_states, k_cache, v_cache, cache_len, max_seq_len,
+                mask
             )
             new_kv_cache.append((new_k, new_v))
         

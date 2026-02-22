@@ -61,8 +61,8 @@ python -m diffulex_edge --model-path /path/to/model
 
 | Model | Size | Mask Token ID | Attention |
 |-------|------|---------------|-----------|
-| SDAR | 1.7B | 126336 | Causal |
-| Fast dLLM v2 | 1.5B | 151665 | Causal |
+| SDAR | 1.7B | 126336 | Block Causal |
+| Fast dLLM v2 | 1.5B | 151665 | Block Causal |
 | Dream | 7B | 151666 | Bidirectional |
 | LLaDA | 8B | 126336 | Bidirectional |
 

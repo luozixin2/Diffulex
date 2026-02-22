@@ -112,82 +112,63 @@ def create_edge_config(model_type: str, hf_config: Dict[str, Any]) -> Any:
     """
     _, ConfigClass = MODEL_REGISTRY[model_type]
     
-    # Common parameters
-    common_params = {
+    # Common parameters extracted from HF config
+    common = {
         "vocab_size": hf_config.get("vocab_size", 32000),
         "hidden_size": hf_config.get("hidden_size", 2048),
+        "num_hidden_layers": hf_config.get("num_hidden_layers", 28),
+        "num_attention_heads": hf_config.get("num_attention_heads", 16),
+        "num_key_value_heads": hf_config.get("num_key_value_heads", 8),
         "intermediate_size": hf_config.get("intermediate_size", 5504),
         "max_position_embeddings": hf_config.get("max_position_embeddings", 32768),
+        "rms_norm_eps": hf_config.get("rms_norm_eps", 1e-6),
+        "rope_theta": hf_config.get("rope_theta", 1000000.0),
+        "attention_bias": hf_config.get("attention_bias", False),
     }
     
-    # Model-specific parameters
-    if model_type == "fast_dllm_v2":
-        return ConfigClass(
-            vocab_size=common_params["vocab_size"],
-            hidden_size=common_params["hidden_size"],
-            num_hidden_layers=hf_config.get("num_hidden_layers", 28),
-            num_attention_heads=hf_config.get("num_attention_heads", 12),
-            num_key_value_heads=hf_config.get("num_key_value_heads", 2),
-            intermediate_size=common_params["intermediate_size"],
-            max_position_embeddings=common_params["max_position_embeddings"],
-            head_dim=hf_config.get("head_dim", None),  # Will be calculated
-            rms_norm_eps=hf_config.get("rms_norm_eps", 1e-6),
-            rope_theta=hf_config.get("rope_theta", 1000000.0),
-            attention_bias=hf_config.get("attention_bias", True),
-            tie_word_embeddings=hf_config.get("tie_word_embeddings", True),
-            bd_size=hf_config.get("bd_size", 32),
-        )
-    elif model_type == "dream":
-        return ConfigClass(
-            vocab_size=common_params["vocab_size"],
-            hidden_size=common_params["hidden_size"],
-            num_hidden_layers=hf_config.get("num_hidden_layers", 28),
-            num_attention_heads=hf_config.get("num_attention_heads", 28),
-            num_key_value_heads=hf_config.get("num_key_value_heads", 4),
-            intermediate_size=common_params["intermediate_size"],
-            max_position_embeddings=common_params["max_position_embeddings"],
-            rms_norm_eps=hf_config.get("rms_norm_eps", 1e-6),
-            rope_theta=hf_config.get("rope_theta", 1000000.0),
-            attention_bias=hf_config.get("attention_bias", True),
-            attention_dropout=hf_config.get("attention_dropout", 0.0),
-            head_dim=common_params["hidden_size"] // hf_config.get("num_attention_heads", 28),
-            mask_token_id=hf_config.get("mask_token_id", 151666),
-            pad_token_id=hf_config.get("pad_token_id", 151643),
-            bos_token_id=hf_config.get("bos_token_id", 151643),
-            eos_token_id=hf_config.get("eos_token_id", 151643),
-        )
+    # Model-specific overrides
+    overrides = {
+        "fast_dllm_v2": {
+            "num_attention_heads": 12,
+            "num_key_value_heads": 2,
+            "intermediate_size": hf_config.get("intermediate_size", 8960),
+            "attention_bias": True,
+            "tie_word_embeddings": True,
+            "bd_size": hf_config.get("bd_size", 32),
+        },
+        "dream": {
+            "num_attention_heads": 28,
+            "num_key_value_heads": 4,
+            "intermediate_size": hf_config.get("intermediate_size", 18944),
+            "attention_bias": True,
+            "attention_dropout": hf_config.get("attention_dropout", 0.0),
+            "mask_token_id": hf_config.get("mask_token_id", 151666),
+            "pad_token_id": hf_config.get("pad_token_id", 151643),
+            "bos_token_id": hf_config.get("bos_token_id", 151643),
+            "eos_token_id": hf_config.get("eos_token_id", 151643),
+        },
+        "llada": {
+            "vocab_size": hf_config.get("vocab_size", 126336),
+            "mask_token_id": hf_config.get("mask_token_id", 126336),
+        },
+        "sdar": {
+            "intermediate_size": hf_config.get("intermediate_size", 6144),
+            "diffusion_block_size": hf_config.get("diffusion_block_size", 4),
+        },
+    }
+    
+    # Merge common params with model-specific overrides
+    config_params = {**common, **overrides.get(model_type, {})}
+    
+    # Handle special calculations
+    if model_type == "dream":
+        config_params["head_dim"] = config_params["hidden_size"] // config_params["num_attention_heads"]
     elif model_type == "llada":
-        return ConfigClass(
-            vocab_size=common_params["vocab_size"],
-            hidden_size=common_params["hidden_size"],
-            num_hidden_layers=hf_config.get("num_hidden_layers", 28),
-            num_attention_heads=hf_config.get("num_attention_heads", 16),
-            num_key_value_heads=hf_config.get("num_key_value_heads", 8),
-            intermediate_size=common_params["intermediate_size"],
-            max_position_embeddings=common_params["max_position_embeddings"],
-            rms_norm_eps=hf_config.get("rms_norm_eps", 1e-6),
-            rope_theta=hf_config.get("rope_theta", 1000000.0),
-            attention_bias=hf_config.get("attention_bias", False),
-            head_dim=hf_config.get("head_dim", 128),
-            mask_token_id=hf_config.get("mask_token_id", 126336),
-        )
-    elif model_type == "sdar":
-        return ConfigClass(
-            vocab_size=common_params["vocab_size"],
-            hidden_size=common_params["hidden_size"],
-            num_hidden_layers=hf_config.get("num_hidden_layers", 28),
-            num_attention_heads=hf_config.get("num_attention_heads", 16),
-            num_key_value_heads=hf_config.get("num_key_value_heads", 8),
-            intermediate_size=common_params["intermediate_size"],
-            max_position_embeddings=common_params["max_position_embeddings"],
-            rms_norm_eps=hf_config.get("rms_norm_eps", 1e-6),
-            rope_theta=hf_config.get("rope_theta", 1000000.0),
-            attention_bias=hf_config.get("attention_bias", False),
-            head_dim=hf_config.get("head_dim", 128),
-            diffusion_block_size=hf_config.get("diffusion_block_size", 4),  # SDAR default is 4
-        )
-    else:
-        raise ValueError(f"Unknown model type: {model_type}")
+        config_params["head_dim"] = hf_config.get("head_dim", 128)
+    elif model_type in ("fast_dllm_v2", "sdar"):
+        config_params["head_dim"] = hf_config.get("head_dim")  # Let __post_init__ calculate
+    
+    return ConfigClass(**config_params)
 
 
 def load_hf_weights_to_edge(
