@@ -167,7 +167,14 @@ class DiffusionEngine:
                 verification=Verification.Minimal
             )
             self._pte_module = self._pte_program.load_method("forward")
+            
+            # Get input shape info from PTE metadata
+            meta = self._pte_module.metadata
+            input_meta = meta.input_tensor_meta(0)
+            self._pte_input_shape = list(input_meta.sizes())  # [batch, seq_len]
+            
             logger.info(f"Loaded ExecuTorch model from {self.pte_path}")
+            logger.info(f"PTE fixed input shape: {self._pte_input_shape}")
         except ImportError as e:
             raise ImportError("ExecuTorch runtime not available. "
                             "Install with: pip install executorch") from e
@@ -387,17 +394,18 @@ class DiffusionEngine:
     ) -> List[int]:
         """Generate using full-sequence inference (no KV cache).
         
-        Used for PTE models or when KV cache is disabled.
+        Used for PyTorch models when KV cache is disabled.
+        For PTE models, use _generate_pte instead.
         """
+        if self._is_pte:
+            return self._generate_pte(prompt_tokens, config)
+        
         confirmed_tokens = list(prompt_tokens)
         total_iterations = 0
         confirmed_blocks = 0
         
         while self.block_manager.has_active_block():
             active_block = self.block_manager.get_active_block()
-            
-            # Build full sequence: confirmed + active masks
-            sequence = self._build_sequence(confirmed_tokens, active_block, config.mask_token_id)
             
             block_confirmed = False
             for iteration in range(config.num_iterations):
@@ -411,7 +419,9 @@ class DiffusionEngine:
                 )
                 
                 # Forward pass
-                logits = self._forward_full_sequence(sequence)
+                logits = self._forward_torch_full(
+                    torch.tensor([sequence], dtype=torch.long, device=self.device)
+                )
                 
                 # Get logits for active block only
                 active_start = len(confirmed_tokens)
@@ -430,6 +440,76 @@ class DiffusionEngine:
             # Get confirmed tokens for this block
             block_tokens = active_block.get_sequence_tokens()
             confirmed_tokens.extend(block_tokens)
+            
+            # Advance
+            has_more = self.block_manager.confirm_current_block()
+            if not has_more:
+                break
+        
+        logger.info(f"Done: {confirmed_blocks}/{len(self.block_manager)} blocks confirmed, "
+                   f"{total_iterations} total iterations")
+        return confirmed_tokens
+    
+    def _generate_pte(
+        self,
+        prompt_tokens: List[int],
+        config: DiffusionGenerationConfig,
+    ) -> List[int]:
+        """Generate using PTE model with KV cache.
+        
+        For PTE models, we use:
+        1. _forward_pte_prefill: Process prompt and fill KV cache
+        2. _forward_pte_block: Process each block for denoising
+        """
+        confirmed_tokens = list(prompt_tokens)
+        total_iterations = 0
+        confirmed_blocks = 0
+        
+        # Step 1: Prefill - process prompt and fill KV cache
+        kv_cache = self._forward_pte_prefill(prompt_tokens)
+        cache_len = len(prompt_tokens)
+        
+        # Step 2: Generate blocks incrementally
+        while self.block_manager.has_active_block():
+            active_block = self.block_manager.get_active_block()
+            
+            block_confirmed = False
+            for iteration in range(config.num_iterations):
+                total_iterations += 1
+                
+                # Get current block tokens (may contain masks)
+                block_tokens = active_block.get_sequence_tokens()
+                
+                # Forward this block (discard KV cache updates during sampling)
+                active_logits, _ = self._forward_pte_block(
+                    block_tokens=block_tokens,
+                    kv_cache=kv_cache,
+                    cache_len=cache_len
+                )
+                
+                # Sample
+                output = self.sampler.sample(self.block_manager, active_logits)
+                
+                if output.block_confirmed:
+                    block_confirmed = True
+                    break
+            
+            confirmed_blocks += 1 if block_confirmed else 0
+            
+            # Get confirmed tokens for this block
+            confirmed_block_tokens = active_block.get_sequence_tokens()
+            confirmed_tokens.extend(confirmed_block_tokens)
+            
+            # Update KV cache with the confirmed block tokens
+            # We use _forward_pte_block to append these tokens to the existing cache
+            # The keep_mask in _create_pte_masks will preserve old cache values
+            # Discard logits (we only need the updated KV cache)
+            _, kv_cache = self._forward_pte_block(
+                block_tokens=confirmed_block_tokens,
+                kv_cache=kv_cache,
+                cache_len=cache_len
+            )
+            cache_len += len(confirmed_block_tokens)
             
             # Advance
             has_more = self.block_manager.confirm_current_block()
@@ -547,14 +627,142 @@ class DiffusionEngine:
     ) -> torch.Tensor:
         """Forward pass for full sequence (no KV cache).
         
-        Used for PTE models or when KV cache is disabled.
+        Used for PyTorch models when KV cache is disabled.
+        For PTE models, use _forward_pte_prefill or _forward_pte_block instead.
         """
         input_ids = torch.tensor([sequence], dtype=torch.long, device=self.device)
         
         if self._is_pte:
-            return self._forward_pte(input_ids)
+            raise RuntimeError(
+                "For PTE models, use _forward_pte_prefill for prompt processing "
+                "or _forward_pte_block for block denoising"
+            )
         else:
             return self._forward_torch_full(input_ids)
+    
+    def _forward_pte_prefill(
+        self,
+        prompt_tokens: List[int]
+    ) -> torch.Tensor:
+        """Prefill phase: process prompt tokens and fill KV cache.
+        
+        For diffusion models, this processes the prompt in chunks to fill
+        the KV cache. The returned KV cache will be used in subsequent
+        denoising steps.
+        
+        Args:
+            prompt_tokens: List of prompt token IDs
+            
+        Returns:
+            kv_cache: Filled KV cache tensor
+        """
+        input_ids = torch.tensor([prompt_tokens], dtype=torch.long, device=self.device)
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+        
+        # Get block_size from PTE metadata
+        _, block_size = self._pte_input_shape
+        
+        # Calculate number of chunks needed (pad to multiple of block_size)
+        num_chunks = (seq_len + block_size - 1) // block_size
+        padded_len = num_chunks * block_size
+        
+        # Pad input to multiple of block_size
+        if seq_len < padded_len:
+            pad_id = getattr(self, 'pad_token_id', 0)
+            padding = torch.full((batch_size, padded_len - seq_len), pad_id,
+                                dtype=input_ids.dtype, device=device)
+            input_ids_padded = torch.cat([input_ids, padding], dim=1)
+        else:
+            input_ids_padded = input_ids
+        
+        # Initialize KV cache
+        kv_cache = self._create_empty_kv_cache(device)
+        cache_len = 0
+        
+        # Process all chunks
+        for chunk_idx in range(num_chunks):
+            start_idx = chunk_idx * block_size
+            chunk_ids = input_ids_padded[:, start_idx:start_idx + block_size]
+            
+            # Calculate valid length for this chunk
+            valid_len = min(block_size, seq_len - start_idx)
+            
+            # Generate masks for this chunk
+            positions, attn_mask, insert_matrix, keep_mask = self._create_pte_masks(
+                cache_len=cache_len,
+                valid_len=valid_len
+            )
+            
+            # Execute PTE step (discard logits, only need KV cache)
+            _, kv_cache = self._forward_pte_step(
+                input_ids=chunk_ids,
+                positions=positions,
+                kv_cache=kv_cache,
+                attention_mask=attn_mask,
+                insert_matrix=insert_matrix,
+                keep_mask=keep_mask
+            )
+            
+            cache_len += valid_len
+        
+        return kv_cache
+    
+    def _forward_pte_block(
+        self,
+        block_tokens: List[int],
+        kv_cache: torch.Tensor,
+        cache_len: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Denoising phase: process a single block and return logits + updated cache.
+        
+        For block diffusion models, this processes a block of tokens
+        (typically containing mask tokens) and returns logits for all
+        positions in the block.
+        
+        Args:
+            block_tokens: List of block token IDs (length <= block_size)
+            kv_cache: Current KV cache
+            cache_len: Current valid length in KV cache
+            
+        Returns:
+            Tuple of (logits, updated_kv_cache)
+            logits: [block_len, vocab_size] logits for the block
+            updated_kv_cache: updated KV cache with new block appended
+        """
+        device = self.device
+        block_len = len(block_tokens)
+        
+        # Get block_size from PTE metadata
+        _, block_size = self._pte_input_shape
+        
+        # Pad block to block_size if needed
+        if block_len < block_size:
+            pad_id = getattr(self, 'pad_token_id', 0)
+            block_tokens = list(block_tokens) + [pad_id] * (block_size - block_len)
+        
+        input_ids = torch.tensor([block_tokens], dtype=torch.long, device=device)
+        
+        # Generate masks for this block
+        positions, attn_mask, insert_matrix, keep_mask = self._create_pte_masks(
+            cache_len=cache_len,
+            valid_len=block_len
+        )
+        
+        # Execute PTE step
+        logits, updated_kv_cache = self._forward_pte_step(
+            input_ids=input_ids,
+            positions=positions,
+            kv_cache=kv_cache,
+            attention_mask=attn_mask,
+            insert_matrix=insert_matrix,
+            keep_mask=keep_mask
+        )
+        
+        # Return logits for valid positions only
+        # logits shape: [batch, block_size, vocab_size]
+        valid_logits = logits[0, :block_len, :]  # [block_len, vocab_size]
+        return valid_logits, updated_kv_cache
     
     def _forward_torch_full(
         self,
@@ -589,36 +797,173 @@ class DiffusionEngine:
         
         return logits[0] if logits.dim() == 3 else logits
     
-    def _forward_pte(
-        self,
-        input_ids: torch.Tensor
-    ) -> torch.Tensor:
-        """Forward using ExecuTorch model."""
+    def _create_empty_kv_cache(self, device: torch.device) -> torch.Tensor:
+        """Create an empty KV cache tensor for PTE model.
+        
+        Returns:
+            kv_cache: [num_layers, 2, batch, num_kv_heads, max_seq_len, head_dim]
+        """
         if self._pte_module is None:
             raise RuntimeError("No PTE model loaded")
         
-        result = self._pte_module.execute([input_ids])
+        meta = self._pte_module.metadata
+        kv_cache_meta = meta.input_tensor_meta(2)
+        kv_cache_shape = list(kv_cache_meta.sizes())
+        return torch.zeros(kv_cache_shape, dtype=torch.float32, device=device)
+    
+    def _create_pte_masks(
+        self,
+        cache_len: int,
+        valid_len: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Create masks for PTE model inference.
+        
+        This function generates all necessary masks for a single PTE step.
+        It runs on CPU and creates fixed-shape tensors for the static PTE graph.
+        
+        Args:
+            cache_len: Current valid length in KV cache
+            valid_len: Number of valid tokens in current block (<= block_size)
+            
+        Returns:
+            positions: [batch, block_size] - absolute positions
+            attention_mask: [num_layers, batch, 1, block_size, max_seq_len+block_size]
+            insert_matrix: [num_layers, batch, 1, max_seq_len, block_size]
+            keep_mask: [num_layers, batch, 1, max_seq_len, 1]
+        """
+        if self._pte_module is None:
+            raise RuntimeError("No PTE model loaded")
+        
+        meta = self._pte_module.metadata
+        max_seq_len = self.max_seq_len or 32768
+        device = self.device
+        
+        # Get shapes from PTE metadata
+        _, block_size = self._pte_input_shape
+        num_layers = list(meta.input_tensor_meta(2).sizes())[0]
+        batch_size = 1  # Typically 1 for inference
+        
+        # positions: absolute positions [batch, block_size]
+        positions = torch.arange(
+            cache_len, cache_len + block_size, 
+            dtype=torch.long, device=device
+        ).unsqueeze(0).expand(batch_size, -1)
+        
+        # attention_mask: [num_layers, batch, 1, block_size, max_seq_len+block_size]
+        mask_meta = meta.input_tensor_meta(3)
+        mask_shape = list(mask_meta.sizes())
+        attention_mask = torch.zeros(mask_shape, dtype=torch.float32, device=device)
+        
+        # Initialize all as blocked (-10000)
+        attention_mask[..., :max_seq_len] = -10000.0
+        
+        # Allow attending to valid cached positions [0:cache_len]
+        if cache_len > 0:
+            attention_mask[..., :cache_len] = 0.0
+        
+        # For each query position i in valid range, allow attending to [0:cache_len+valid_len]
+        for i in range(min(valid_len, block_size)):
+            attention_mask[..., i, :cache_len + valid_len] = 0.0
+        
+        # insert_matrix: [num_layers, batch, 1, max_seq_len, block_size]
+        insert_meta = meta.input_tensor_meta(4)
+        insert_shape = list(insert_meta.sizes())
+        insert_matrix = torch.zeros(insert_shape, dtype=torch.float32, device=device)
+        
+        # Insert valid tokens at position cache_len + i
+        for i in range(min(valid_len, block_size)):
+            insert_matrix[..., cache_len + i, i] = 1.0
+        
+        # keep_mask: [num_layers, batch, 1, max_seq_len, 1]
+        # keep_mask = 1 means "keep old value" (old_k * 1 + 0 = old_k)
+        # keep_mask = 0 means "use new value" (old_k * 0 + new_k = new_k)
+        keep_meta = meta.input_tensor_meta(5)
+        keep_shape = list(keep_meta.sizes())
+        keep_mask = torch.ones(keep_shape, dtype=torch.float32, device=device)
+        
+        # Keep cached positions: set to 1
+        if cache_len > 0:
+            keep_mask[..., :cache_len, :] = 1.0
+        
+        # Update valid new positions: set to 0
+        for i in range(min(valid_len, block_size)):
+            keep_mask[..., cache_len + i, :] = 0.0
+        
+        # Positions beyond cache_len+valid_len remain 1 (don't modify uninitialized cache)
+        
+        return positions, attention_mask, insert_matrix, keep_mask
+    
+    def _forward_pte_step(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attention_mask: torch.Tensor,
+        insert_matrix: torch.Tensor,
+        keep_mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Pure static forward using ExecuTorch model.
+        
+        This is the lowest-level PTE execution function. It assumes:
+        1. input_ids is exactly [batch, block_size]
+        2. All masks are pre-computed and have correct shapes
+        3. No dynamic shape handling inside this function
+        
+        Args:
+            input_ids: [batch, block_size] - must match PTE fixed input shape
+            positions: [batch, block_size] - absolute positions
+            kv_cache: [num_layers, 2, batch, num_kv_heads, max_seq_len, head_dim]
+            attention_mask: [num_layers, batch, 1, block_size, max_seq_len+block_size]
+            insert_matrix: [num_layers, batch, 1, max_seq_len, block_size]
+            keep_mask: [num_layers, batch, 1, max_seq_len, 1]
+            
+        Returns:
+            Tuple of (logits, updated_kv_cache)
+            logits: [batch, block_size, vocab_size]
+            updated_kv_cache: same shape as input kv_cache
+        """
+        if self._pte_module is None:
+            raise RuntimeError("No PTE model loaded")
+        
+        # Get expected shape from PTE metadata
+        _, block_size = self._pte_input_shape
+        
+        # Validate inputs
+        assert input_ids.shape[1] == block_size, \
+            f"PTE graph requires input shape [batch, {block_size}], got {input_ids.shape}"
+        assert positions.shape == input_ids.shape, \
+            f"Positions shape {positions.shape} doesn't match input_ids {input_ids.shape}"
+        
+        # Execute with all 6 inputs
+        result = self._pte_module.execute([
+            input_ids, positions, kv_cache, 
+            attention_mask, insert_matrix, keep_mask
+        ])
         
         # Unwrap result
         if hasattr(result, '__iter__') and not isinstance(result, torch.Tensor):
-            result = list(result)[0]
-            if hasattr(result, 'to_torch'):
-                result = result.to_torch()
-        
-        if not isinstance(result, torch.Tensor):
-            result = torch.tensor(result)
-        
-        if result.dim() == 2:
-            result = result.unsqueeze(0)
-        
-        # Truncate to actual length
-        actual_len = input_ids.shape[1]
-        if self.max_seq_len is not None and actual_len < self.max_seq_len:
-            result = result[0, :actual_len, :]
+            result_list = list(result)
+            logits = result_list[0]
+            updated_kv_cache = result_list[1] if len(result_list) > 1 else kv_cache
+            if hasattr(logits, 'to_torch'):
+                logits = logits.to_torch()
+            if hasattr(updated_kv_cache, 'to_torch'):
+                updated_kv_cache = updated_kv_cache.to_torch()
         else:
-            result = result[0]
+            logits = result
+            updated_kv_cache = kv_cache
         
-        return result
+        # Ensure tensor types
+        if not isinstance(logits, torch.Tensor):
+            logits = torch.tensor(logits)
+        if not isinstance(updated_kv_cache, torch.Tensor):
+            updated_kv_cache = torch.tensor(updated_kv_cache)
+        
+        # Ensure logits has shape [batch, block_size, vocab_size]
+        if logits.dim() == 2:
+            logits = logits.unsqueeze(0)
+        
+        return logits, updated_kv_cache
 
 
 # Backward compatibility aliases

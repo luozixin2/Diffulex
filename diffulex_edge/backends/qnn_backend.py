@@ -2,12 +2,9 @@
 
 import logging
 import sys
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional
 
-import torch
-import torch.nn as nn
-
-from .base import BackendConfig, EdgeBackend, ExportResult
+from .base import BackendConfig, BackendRegistry, EdgeBackend, ExportResult
 
 logger = logging.getLogger(__name__)
 
@@ -61,38 +58,6 @@ class QNNBackend(EdgeBackend):
         except ImportError:
             return False
     
-    def get_partitioner(self):
-        """获取 QNN 分区器."""
-        if self._partitioner is None:
-            try:
-                from executorch.backends.qualcomm.partition.qnn_partitioner import (
-                    QnnPartitioner,
-                )
-                from executorch.backends.qualcomm.serialization.qnn_definitions import (
-                    QcomChipset,
-                )
-                
-                # 配置 SoC 模型
-                soc_model = self._get_soc_model()
-                
-                # 创建分区器
-                partitioner_kwargs = {
-                    "soc_model": soc_model,
-                }
-                
-                # 添加量化相关配置
-                if self.config.quantize:
-                    partitioner_kwargs["quantization_mode"] = self.config.quantization_mode
-                
-                self._partitioner = QnnPartitioner(**partitioner_kwargs)
-                logger.info(f"Created QNN partitioner for SoC: {soc_model}")
-                
-            except ImportError as e:
-                logger.error(f"Failed to import QNN partitioner: {e}")
-                raise RuntimeError("QNN partitioner not available") from e
-        
-        return self._partitioner
-    
     def _get_soc_model(self):
         """获取 SoC 模型配置."""
         try:
@@ -122,37 +87,38 @@ class QNNBackend(EdgeBackend):
             logger.warning("QNN QcomChipset not available, using default")
             return None
     
-    def _prepare_model_for_export(self, model: nn.Module) -> nn.Module:
-        """准备模型用于导出.
+    def get_partitioner(self):
+        """获取 QNN 分区器."""
+        if self._partitioner is None:
+            try:
+                from executorch.backends.qualcomm.partition.qnn_partitioner import (
+                    QnnPartitioner,
+                )
+                
+                # 配置 SoC 模型
+                soc_model = self._get_soc_model()
+                
+                # 创建分区器
+                partitioner_kwargs = {
+                    "soc_model": soc_model,
+                }
+                
+                # 添加量化相关配置
+                if self.config.quantize:
+                    partitioner_kwargs["quantization_mode"] = self.config.quantization_mode
+                
+                self._partitioner = QnnPartitioner(**partitioner_kwargs)
+                logger.info(f"Created QNN partitioner for SoC: {soc_model}")
+                
+            except ImportError as e:
+                logger.error(f"Failed to import QNN partitioner: {e}")
+                raise RuntimeError("QNN partitioner not available") from e
         
-        如果模型支持导出（有 get_export_wrapper 方法），使用包装器。
-        否则直接使用原始模型。
-        
-        Args:
-            model: 原始模型
-            
-        Returns:
-            准备好用于导出的模型
-        """
-        # Check if model provides an export wrapper
-        if hasattr(model, 'get_export_wrapper'):
-            wrapper = model.get_export_wrapper()
-            if wrapper is not None:
-                logger.info(f"Using model's export wrapper: {type(wrapper).__name__}")
-                return wrapper
-        
-        # Check for legacy forward_export (backward compatibility)
-        if hasattr(model, 'forward_export'):
-            logger.info("Detected forward_export method, using generic ExportWrapper")
-            from ..model.wrapper import ExportWrapper
-            return ExportWrapper(model)
-        
-        # Use model as-is
-        return model
+        return self._partitioner
     
     def export(
         self,
-        model: nn.Module,
+        model,
         example_inputs,
         config: Optional[BackendConfig] = None,
     ) -> ExportResult:
@@ -166,9 +132,6 @@ class QNNBackend(EdgeBackend):
         Returns:
             ExportResult: 导出结果
         """
-        if config is not None:
-            self.config = config
-        
         # 检查平台
         if sys.platform == "win32":
             return ExportResult(
@@ -176,84 +139,24 @@ class QNNBackend(EdgeBackend):
                 error_message="QNN backend is not supported on Windows. Use Linux or Android.",
             )
         
-        try:
-            from torch.export import export
-            from executorch.exir import to_edge_transform_and_lower
-            from executorch.exir.passes import MemoryPlanningPass
-            from executorch.exir.program._program import ExecutorchBackendConfig
-            
-            logger.info(f"Starting QNN export for SoC: {self._soc_model or 'default'}")
-            
-            # 1. 确保模型处于评估模式
-            model.eval()
-            
-            # 2. 准备模型（使用包装器如果需要）
-            export_model = self._prepare_model_for_export(model)
-            
-            # 3. 导出为 ExportedProgram
-            logger.info("Exporting to ExportedProgram...")
-            if isinstance(example_inputs, dict):
-                ep = export(export_model, (), example_inputs)
-            else:
-                if not isinstance(example_inputs, tuple):
-                    example_inputs = (example_inputs,)
-                ep = export(export_model, example_inputs)
-            
-            # 3. 使用新的工作流：to_edge_transform_and_lower
-            logger.info("Converting to Edge Dialect and lowering to QNN...")
-            partitioner = self.get_partitioner()
-            edge = to_edge_transform_and_lower(
-                ep,
-                partitioner=[partitioner],
-            )
-            logger.info("Edge conversion and QNN lowering successful")
-            
-            # 4. 生成 .pte 文件
-            logger.info("Generating ExecuTorch program...")
-            # memory_planning_algo 需要是一个 callable，而不是字符串
-            from executorch.exir.memory_planning import greedy, MemoryPlanningAlgorithmSuite
-            
-            if self.config.memory_planning == "greedy":
-                algo = greedy
-            else:
-                algo = MemoryPlanningAlgorithmSuite()
-            
-            memory_planning_pass = MemoryPlanningPass(
-                memory_planning_algo=algo,
-                alloc_graph_input=False,
-                alloc_graph_output=False,
-            )
-            
-            exec_config = ExecutorchBackendConfig(
-                memory_planning_pass=memory_planning_pass,
-            )
-            
-            exec_prog = edge.to_executorch(exec_config)
-            buffer = exec_prog.buffer
-            
-            logger.info(f"QNN export successful, buffer size: {len(buffer)} bytes")
-            
-            metadata = {
-                "buffer_size_bytes": len(buffer),
-                "backend": "qnn",
+        logger.info(f"Starting QNN export for SoC: {self._soc_model or 'default'}")
+        
+        # 调用基类的通用导出流程
+        result = super().export(model, example_inputs, config)
+        
+        # 添加 QNN 特定的元数据
+        if result.success:
+            result.metadata.update({
                 "soc_model": self._soc_model,
-                "quantized": self.config.quantize,
-                "quantization_mode": self.config.quantization_mode if self.config.quantize else None,
-            }
-            
-            return ExportResult(
-                success=True,
-                buffer=buffer,
-                metadata=metadata,
-            )
-            
-        except Exception as e:
-            error_msg = str(e)
-            logger.error(f"QNN export failed: {error_msg}")
-            return ExportResult(
-                success=False,
-                error_message=error_msg,
-            )
+                "supported_platforms": ["android", "linux_embedded"],
+                "supported_soc": ["SM8550", "SM8650", "SM8475", "SM8450", "SM7475"],
+                "supports_quantization": True,
+                "recommended_quantization": "static",
+                "recommended_for": ["qualcomm_npu", "android_high_end"],
+                "requires_sdk": True,
+            })
+        
+        return result
     
     def get_metadata(self) -> Dict[str, Any]:
         """获取后端元数据."""
@@ -270,5 +173,4 @@ class QNNBackend(EdgeBackend):
 
 
 # 注册后端
-from .base import BackendRegistry
 BackendRegistry.register("qnn", QNNBackend)

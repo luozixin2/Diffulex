@@ -50,6 +50,7 @@ from .core_quant import (
     
     # Core classes
     QuantizedLinear,
+    QuantizedEmbedding,
     WeightOnlyQuantizer,
 )
 
@@ -100,6 +101,7 @@ __all__ = [
     
     # Core classes
     "QuantizedLinear",
+    "QuantizedEmbedding",
     "WeightOnlyQuantizer",
     
     # Specific quantizers

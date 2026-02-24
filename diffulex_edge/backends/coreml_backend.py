@@ -2,12 +2,9 @@
 
 import logging
 import sys
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional
 
-import torch
-import torch.nn as nn
-
-from .base import BackendConfig, EdgeBackend, ExportResult
+from .base import BackendConfig, BackendRegistry, EdgeBackend, ExportResult
 
 logger = logging.getLogger(__name__)
 
@@ -95,37 +92,9 @@ class CoreMLBackend(EdgeBackend):
         
         return self._partitioner
     
-    def _prepare_model_for_export(self, model: nn.Module) -> nn.Module:
-        """准备模型用于导出.
-        
-        如果模型支持导出（有 get_export_wrapper 方法），使用包装器。
-        否则直接使用原始模型。
-        
-        Args:
-            model: 原始模型
-            
-        Returns:
-            准备好用于导出的模型
-        """
-        # Check if model provides an export wrapper
-        if hasattr(model, 'get_export_wrapper'):
-            wrapper = model.get_export_wrapper()
-            if wrapper is not None:
-                logger.info(f"Using model's export wrapper: {type(wrapper).__name__}")
-                return wrapper
-        
-        # Check for legacy forward_export (backward compatibility)
-        if hasattr(model, 'forward_export'):
-            logger.info("Detected forward_export method, using generic ExportWrapper")
-            from ..model.wrapper import ExportWrapper
-            return ExportWrapper(model)
-        
-        # Use model as-is
-        return model
-    
     def export(
         self,
-        model: nn.Module,
+        model,
         example_inputs,
         config: Optional[BackendConfig] = None,
     ) -> ExportResult:
@@ -139,9 +108,6 @@ class CoreMLBackend(EdgeBackend):
         Returns:
             ExportResult: 导出结果
         """
-        if config is not None:
-            self.config = config
-        
         # 检查平台
         if sys.platform != "darwin":
             return ExportResult(
@@ -149,84 +115,23 @@ class CoreMLBackend(EdgeBackend):
                 error_message="CoreML backend is only supported on macOS/iOS.",
             )
         
-        try:
-            from torch.export import export
-            from executorch.exir import to_edge_transform_and_lower
-            from executorch.exir.passes import MemoryPlanningPass
-            from executorch.exir.program._program import ExecutorchBackendConfig
-            
-            logger.info(f"Starting CoreML export with compute_unit: {self._compute_unit}")
-            
-            # 1. 确保模型处于评估模式
-            model.eval()
-            
-            # 2. 准备模型（使用包装器如果需要）
-            export_model = self._prepare_model_for_export(model)
-            
-            # 3. 导出为 ExportedProgram
-            logger.info("Exporting to ExportedProgram...")
-            if isinstance(example_inputs, dict):
-                ep = export(export_model, (), example_inputs)
-            else:
-                if not isinstance(example_inputs, tuple):
-                    example_inputs = (example_inputs,)
-                ep = export(export_model, example_inputs)
-            
-            # 3. 使用新的工作流：to_edge_transform_and_lower
-            logger.info("Converting to Edge Dialect and lowering to CoreML...")
-            partitioner = self.get_partitioner()
-            edge = to_edge_transform_and_lower(
-                ep,
-                partitioner=[partitioner],
-            )
-            logger.info("Edge conversion and CoreML lowering successful")
-            
-            # 4. 生成 .pte 文件
-            logger.info("Generating ExecuTorch program...")
-            # memory_planning_algo 需要是一个 callable，而不是字符串
-            from executorch.exir.memory_planning import greedy, MemoryPlanningAlgorithmSuite
-            
-            if self.config.memory_planning == "greedy":
-                algo = greedy
-            else:
-                algo = MemoryPlanningAlgorithmSuite()
-            
-            memory_planning_pass = MemoryPlanningPass(
-                memory_planning_algo=algo,
-                alloc_graph_input=False,
-                alloc_graph_output=False,
-            )
-            
-            exec_config = ExecutorchBackendConfig(
-                memory_planning_pass=memory_planning_pass,
-            )
-            
-            exec_prog = edge.to_executorch(exec_config)
-            buffer = exec_prog.buffer
-            
-            logger.info(f"CoreML export successful, buffer size: {len(buffer)} bytes")
-            
-            metadata = {
-                "buffer_size_bytes": len(buffer),
-                "backend": "coreml",
+        logger.info(f"Starting CoreML export with compute_unit: {self._compute_unit}")
+        
+        # 调用基类的通用导出流程
+        result = super().export(model, example_inputs, config)
+        
+        # 添加 CoreML 特定的元数据
+        if result.success:
+            result.metadata.update({
                 "compute_unit": self._compute_unit,
-                "quantized": self.config.quantize,
-                "quantization_mode": self.config.quantization_mode if self.config.quantize else None,
-            }
-            
-            return ExportResult(
-                success=True,
-                buffer=buffer,
-                metadata=metadata,
-            )
-            
-        except Exception as e:
-            error_msg = str(e)
-            logger.error(f"CoreML export failed: {error_msg}")
-            return ExportResult(
-                success=False,
-                error_message=error_msg,
-            )
+                "supported_platforms": ["macos", "ios", "ipados", "watchos"],
+                "supported_chips": ["A12+", "M1+", "A14+", "M2+"],
+                "supports_quantization": True,
+                "recommended_quantization": "static",
+                "recommended_for": ["apple_ane", "ios", "macos"],
+            })
+        
+        return result
     
     def get_execution_metrics(self) -> Dict[str, Any]:
         """获取执行指标 (仅在 Apple 设备上可用).
@@ -246,16 +151,15 @@ class CoreMLBackend(EdgeBackend):
         """获取后端元数据."""
         metadata = super().get_metadata()
         metadata.update({
+            "compute_units": list(self.COMPUTE_UNITS.keys()),
             "supported_platforms": ["macos", "ios", "ipados", "watchos"],
             "supported_chips": ["A12+", "M1+", "A14+", "M2+"],
             "supports_quantization": True,
             "recommended_quantization": "static",
             "recommended_for": ["apple_ane", "ios", "macos"],
-            "compute_units": list(self.COMPUTE_UNITS.keys()),
         })
         return metadata
 
 
 # 注册后端
-from .base import BackendRegistry
 BackendRegistry.register("coreml", CoreMLBackend)

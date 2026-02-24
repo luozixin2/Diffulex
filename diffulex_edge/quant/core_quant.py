@@ -104,6 +104,120 @@ class QuantizedLinear(nn.Module):
         return qlinear
 
 
+class QuantizedEmbedding(nn.Module):
+    """Embedding layer with quantized weights for PTE export.
+    
+    Stores weights in lower precision (INT8 or FP16) and dequantizes during forward.
+    This achieves actual size reduction in the exported model file.
+    
+    Args:
+        num_embeddings: Size of the dictionary of embeddings
+        embedding_dim: The size of each embedding vector
+        dtype: Quantization dtype (int8 or float16)
+        padding_idx: If specified, the entries at padding_idx do not contribute to the gradient
+        max_norm: If given, each embedding vector with norm larger than max_norm is renormalized to have norm max_norm
+        norm_type: The p of the p-norm to compute for the max_norm option
+        scale_grad_by_freq: If given, this will scale gradients by the inverse of frequency of the words in the mini-batch
+        sparse: If True, gradient w.r.t. weight matrix will be a sparse tensor
+    """
+    
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        dtype: torch.dtype = torch.int8,
+        padding_idx: Optional[int] = None,
+        max_norm: Optional[float] = None,
+        norm_type: float = 2.0,
+        scale_grad_by_freq: bool = False,
+        sparse: bool = False,
+    ):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.quant_dtype = dtype
+        self.padding_idx = padding_idx
+        self.max_norm = max_norm
+        self.norm_type = norm_type
+        self.scale_grad_by_freq = scale_grad_by_freq
+        self.sparse = sparse
+        
+        if dtype == torch.int8:
+            # Int8 weights with per-channel scales
+            self.register_buffer(
+                'weight',
+                torch.randint(-128, 127, (num_embeddings, embedding_dim), dtype=torch.int8)
+            )
+            self.register_buffer(
+                'weight_scale',
+                torch.ones(num_embeddings, dtype=torch.float32)
+            )
+        elif dtype == torch.float16:
+            # FP16 weights (no scale needed)
+            self.register_buffer(
+                'weight',
+                torch.randn(num_embeddings, embedding_dim, dtype=torch.float16)
+            )
+        else:
+            raise ValueError(f"Unsupported dtype: {dtype}")
+    
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """Forward pass with dequantization."""
+        if self.quant_dtype == torch.int8:
+            # Dequantize: weight is (num_embeddings, embedding_dim), scale is (num_embeddings,)
+            weight_float = self.weight.float() * self.weight_scale.view(-1, 1)
+        elif self.quant_dtype == torch.float16:
+            weight_float = self.weight.float()
+        else:
+            weight_float = self.weight
+        
+        return F.embedding(
+            input,
+            weight_float,
+            self.padding_idx,
+            self.max_norm,
+            self.norm_type,
+            self.scale_grad_by_freq,
+            self.sparse,
+        )
+    
+    @classmethod
+    def from_float(
+        cls,
+        embedding: nn.Embedding,
+        dtype: torch.dtype = torch.int8
+    ) -> "QuantizedEmbedding":
+        """Create QuantizedEmbedding from a float Embedding layer."""
+        qembedding = cls(
+            embedding.num_embeddings,
+            embedding.embedding_dim,
+            dtype,
+            embedding.padding_idx,
+            embedding.max_norm,
+            embedding.norm_type,
+            embedding.scale_grad_by_freq,
+            embedding.sparse,
+        )
+        
+        weight = embedding.weight.data
+        
+        if dtype == torch.int8:
+            # Per-channel (per-embedding) symmetric quantization
+            max_abs = weight.abs().max(dim=1, keepdim=True)[0]
+            scale = max_abs / 127.0
+            scale[scale == 0] = 1.0
+            
+            weight_quant = torch.round(weight / scale).clamp(-128, 127).to(torch.int8)
+            qembedding.weight.copy_(weight_quant)
+            qembedding.weight_scale.copy_(scale.squeeze())
+            
+        elif dtype == torch.float16:
+            # Direct cast to FP16
+            qembedding.weight.copy_(weight.to(torch.float16))
+        
+        return qembedding
+
+
 class WeightOnlyQuantizer(BaseQuantizer):
     """Weight-only quantizer for INT8 and FP16.
     
@@ -149,8 +263,9 @@ class WeightOnlyQuantizer(BaseQuantizer):
         # Get original memory
         original_memory = self._estimate_memory(model_copy)
         
-        # Convert Linear layers
-        converted_count = self._convert_linear_layers(model_copy, target_dtype, config)
+        # Convert Linear and Embedding layers
+        converted_counts = self._convert_layers(model_copy, target_dtype, config)
+        total_converted = sum(converted_counts.values())
         
         # Get new memory
         new_memory = self._estimate_memory(model_copy)
@@ -163,7 +278,9 @@ class WeightOnlyQuantizer(BaseQuantizer):
             "memory_reduction_pct": ((original_memory - new_memory) / original_memory * 100)
                 if original_memory > 0 else 0,
             "compression_ratio": (original_memory / new_memory) if new_memory > 0 else 1.0,
-            "converted_layers": converted_count,
+            "converted_layers": total_converted,
+            "converted_linear_layers": converted_counts["linear"],
+            "converted_embedding_layers": converted_counts["embedding"],
             "quantization_time_sec": time.time() - start_time,
         }
         
@@ -173,18 +290,20 @@ class WeightOnlyQuantizer(BaseQuantizer):
             warnings=self._warnings.copy(),
         )
     
-    def _convert_linear_layers(
+    def _convert_layers(
         self,
         model: nn.Module,
         dtype: torch.dtype,
         config: QuantizationConfig
-    ) -> int:
-        """Convert all Linear layers in model."""
-        converted_count = 0
+    ) -> dict:
+        """Convert all Linear and Embedding layers in model.
+        
+        Returns:
+            Dictionary with counts of converted layers by type
+        """
+        converted_counts = {"linear": 0, "embedding": 0}
         
         def convert_module(module: nn.Module, name: str = ""):
-            nonlocal converted_count
-            
             for child_name, child in module.named_children():
                 full_name = f"{name}.{child_name}" if name else child_name
                 
@@ -192,12 +311,31 @@ class WeightOnlyQuantizer(BaseQuantizer):
                     if self._should_convert_layer(full_name, child, config):
                         qlinear = QuantizedLinear.from_float(child, dtype=dtype)
                         setattr(module, child_name, qlinear)
-                        converted_count += 1
+                        converted_counts["linear"] += 1
+                elif isinstance(child, nn.Embedding):
+                    if self._should_convert_layer(full_name, child, config):
+                        qembedding = QuantizedEmbedding.from_float(child, dtype=dtype)
+                        setattr(module, child_name, qembedding)
+                        converted_counts["embedding"] += 1
                 else:
                     convert_module(child, full_name)
         
         convert_module(model)
-        return converted_count
+        return converted_counts
+    
+    def _convert_linear_layers(
+        self,
+        model: nn.Module,
+        dtype: torch.dtype,
+        config: QuantizationConfig
+    ) -> int:
+        """Convert all Linear layers in model.
+        
+        .. deprecated::
+            Use _convert_layers instead for both Linear and Embedding conversion.
+        """
+        counts = self._convert_layers(model, dtype, config)
+        return counts["linear"]
 
 
 # =============================================================================
@@ -368,6 +506,7 @@ def get_model_compression_ratio(original_model: nn.Module, quantized_model: nn.M
 __all__ = [
     # Core classes
     "QuantizedLinear",
+    "QuantizedEmbedding",
     "WeightOnlyQuantizer",
     
     # Unified API

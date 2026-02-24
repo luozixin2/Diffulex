@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from diffulex_edge.export import ExportConfig, BackendType, QuantizationType, DiffuLexExporter
 from diffulex_edge.model import load_hf_model, MODEL_REGISTRY
-from diffulex_edge.quant.real_weight_quant import get_model_size_info
+from diffulex_edge.quant.base import get_model_size_info
 
 
 def create_demo_model(model_type: str):
