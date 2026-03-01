@@ -19,14 +19,31 @@ logger = get_logger(__name__)
 
 def _read_quantize_config(model_dir: str) -> dict:
     """Read vLLM-style quantization metadata."""
+    # Try quantize_config.json first (vLLM/AutoGPTQ style)
     cfg_path = os.path.join(model_dir, "quantize_config.json")
-    if not os.path.exists(cfg_path):
-        return {}
-    try:
-        with open(cfg_path, "r") as f:
-            return json.load(f) or {}
-    except Exception:
-        return {}
+    if os.path.exists(cfg_path):
+        try:
+            with open(cfg_path, "r") as f:
+                return json.load(f) or {}
+        except Exception:
+            pass
+    
+    # Fallback to quantization_metadata_gptq.json (our format)
+    meta_path = os.path.join(model_dir, "quantization_metadata_gptq.json")
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r") as f:
+                data = json.load(f) or {}
+                # Extract global settings
+                return {
+                    "bits": data.get("bits", 4),
+                    "group_size": data.get("group_size", 128),
+                    "quant_format": data.get("quant_format", "gptq"),
+                }
+        except Exception:
+            pass
+    
+    return {}
 
 
 def _find_offline_capable_modules(model: nn.Module) -> dict[str, nn.Module]:
@@ -275,10 +292,24 @@ def load_model(model: nn.Module, config: Config):
         lora_config = load_lora_config(config.lora_path)
         model = enable_lora_for_model(model, lora_config or {'r': 16, 'lora_alpha': 32.0, 'lora_dropout': 0.0})
     
+    # Initialize quantization context (needed for both online and offline quantization)
+    from diffulex.utils.quantization.factory import QuantizationStrategyFactory
+    QuantizationStrategyFactory.create_from_config(config)
+    
     # Load offline quantized weights
     loaded_gptq, loaded_awq, skipped = _load_gptq_awq_weights(model, config)
     if loaded_gptq or loaded_awq:
         print(f"Loaded offline quantized weights: GPTQ={loaded_gptq}, AWQ={loaded_awq}, skipped={skipped}")
+    
+    # For online quantization (W8A8/W8A16), ensure all LinearBase modules have delegates
+    # This must happen before loading base weights so weight_loader can trigger quantization
+    if not (loaded_gptq or loaded_awq):
+        from diffulex.utils.quantization import create_quantized_delegate
+        # Create delegates for all linear modules
+        for name, module in model.named_modules():
+            if hasattr(module, 'set_delegate') and hasattr(module, 'quant_kind'):
+                if not module.has_delegate():
+                    module.set_delegate(create_quantized_delegate(module.quant_kind))
     
     # Load base model weights
     for file in tqdm(glob(os.path.join(config.model, "*.safetensors")), desc="Loading base model"):
@@ -288,13 +319,16 @@ def load_model(model: nn.Module, config: Config):
                     continue  # Skip quantized weights
                 
                 # Map weight name to model parameter
-                param_name = weight_name.replace(".weight", "").replace(".", "_")
+                # Parameter names in model.named_parameters() include .weight suffix
+                param_name = weight_name
                 if param_name in dict(model.named_parameters()):
                     param = dict(model.named_parameters())[param_name]
                     if hasattr(param, 'weight_loader'):
                         param.weight_loader(param, f.get_tensor(weight_name))
                     else:
                         default_weight_loader(param, f.get_tensor(weight_name))
+    
+    return model
 
 
 def load_lora_weights(model: nn.Module, lora_path: str, packed_modules_mapping: dict | None = None):

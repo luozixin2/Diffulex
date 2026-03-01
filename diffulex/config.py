@@ -64,6 +64,10 @@ class Config:
     linear_w8a16_quant_block_n: int = 256
     linear_w8a16_allspark_cublas_m_threshold: int = 256
 
+    # Offline quantization loading flags
+    load_gptq: bool = False
+    load_awq: bool = False
+
     def __post_init__(self):
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 16 == 0
