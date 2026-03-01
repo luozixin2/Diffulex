@@ -52,6 +52,10 @@ class EngineConfig:
     linear_attn_act_dtype: Optional[str] = None
     linear_mlp_act_dtype: Optional[str] = None
     
+    # Offline quantization loading flags
+    load_gptq: bool = False
+    load_awq: bool = False
+    
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> "EngineConfig":
         """Create engine configuration from dictionary"""
@@ -66,7 +70,7 @@ class EngineConfig:
     
     def get_diffulex_kwargs(self) -> Dict[str, Any]:
         """Get arguments to pass to Diffulex engine"""
-        return {
+        kwargs = {
             'model_name': self.model_name,
             'decoding_strategy': self.decoding_strategy,
             'mask_token_id': self.mask_token_id,
@@ -99,6 +103,12 @@ class EngineConfig:
             kwargs['linear_attn_act_dtype'] = self.linear_attn_act_dtype
         if self.linear_mlp_act_dtype is not None:
             kwargs['linear_mlp_act_dtype'] = self.linear_mlp_act_dtype
+        
+        # Add offline quantization loading flags
+        if self.load_gptq:
+            kwargs['load_gptq'] = self.load_gptq
+        if self.load_awq:
+            kwargs['load_awq'] = self.load_awq
         
         return kwargs
 

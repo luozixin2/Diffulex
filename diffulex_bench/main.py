@@ -66,6 +66,12 @@ def config_to_model_args(config: BenchmarkConfig) -> str:
     if engine.linear_mlp_act_dtype is not None:
         args_dict['linear_mlp_act_dtype'] = engine.linear_mlp_act_dtype
     
+    # Add offline quantization loading flags
+    if engine.load_gptq:
+        args_dict['load_gptq'] = engine.load_gptq
+    if engine.load_awq:
+        args_dict['load_awq'] = engine.load_awq
+    
     if engine.tokenizer_path:
         args_dict['tokenizer_path'] = engine.tokenizer_path
     

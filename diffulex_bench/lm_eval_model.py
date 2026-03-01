@@ -63,6 +63,8 @@ class DiffulexLM(LM):
         linear_mlp_weight_dtype: Optional[str] = None,
         linear_attn_act_dtype: Optional[str] = None,
         linear_mlp_act_dtype: Optional[str] = None,
+        load_gptq: Optional[bool] = False,
+        load_awq: Optional[bool] = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -126,6 +128,8 @@ class DiffulexLM(LM):
             linear_mlp_weight_dtype=linear_mlp_weight_dtype,
             linear_attn_act_dtype=linear_attn_act_dtype,
             linear_mlp_act_dtype=linear_mlp_act_dtype,
+            load_gptq=load_gptq,
+            load_awq=load_awq,
         )
         
         self.tokenizer = self.runner.tokenizer
