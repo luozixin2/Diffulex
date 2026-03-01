@@ -16,8 +16,8 @@ from diffulex.engine.sequence import AutoSequence, SequenceBase
 from diffulex.attention.metadata import set_warming_up, reset_warming_up
 from diffulex.model import AutoModelForDiffusionLM
 from diffulex.engine.strategy_registry import DiffulexStrategyRegistry
-from diffulex.utils.quantization.factory import QuantizationStrategyFactory
-from diffulex.utils.quantization.context import get_kv_cache_strategy
+from diffulex.utils.quantization.infra.factory import QuantizationStrategyFactory
+from diffulex.utils.quantization.infra.context import get_kv_cache_strategy
 from diffulex.utils.quantization.strategies import NoQuantizationStrategy
 from diffulex.logger import get_logger
 

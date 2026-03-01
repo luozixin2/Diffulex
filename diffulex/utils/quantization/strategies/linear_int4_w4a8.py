@@ -16,8 +16,8 @@ from typing import Any, Optional
 import torch
 import torch.nn.functional as F
 
-from diffulex.utils.quantization.registry import register_linear_strategy
-from diffulex.utils.quantization.strategy import LinearQuantizationStrategy
+from diffulex.utils.quantization.infra.registry import register_linear_strategy
+from diffulex.utils.quantization.strategies.strategy import LinearQuantizationStrategy
 
 from .linear_int4_w4a16 import LinearInt4W4A16Strategy
 

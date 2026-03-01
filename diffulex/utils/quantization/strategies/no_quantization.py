@@ -3,7 +3,7 @@ No quantization strategy (default, backward compatible).
 """
 
 import torch
-from diffulex.utils.quantization.strategy import QuantizationStrategy
+from diffulex.utils.quantization.strategies.strategy import QuantizationStrategy
 
 
 class NoQuantizationStrategy(QuantizationStrategy):

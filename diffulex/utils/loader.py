@@ -12,7 +12,7 @@ from glob import glob
 from safetensors import safe_open
 from diffulex.config import Config
 from diffulex.logger import get_logger
-from diffulex.utils.quantization.loader_adapter import load_offline_quantized_weight
+from diffulex.utils.quantization.runtime.loader_adapter import load_offline_quantized_weight
 
 logger = get_logger(__name__)
 
@@ -293,7 +293,7 @@ def load_model(model: nn.Module, config: Config):
         model = enable_lora_for_model(model, lora_config or {'r': 16, 'lora_alpha': 32.0, 'lora_dropout': 0.0})
     
     # Initialize quantization context (needed for both online and offline quantization)
-    from diffulex.utils.quantization.factory import QuantizationStrategyFactory
+    from diffulex.utils.quantization.infra.factory import QuantizationStrategyFactory
     QuantizationStrategyFactory.create_from_config(config)
     
     # Load offline quantized weights

@@ -894,7 +894,7 @@ def store_kvcache_unified_layout(key: torch.Tensor, value: torch.Tensor,
                 f"N={N}, slot_mapping.numel()={int(slot_mapping.numel())}"
             )
 
-    from diffulex.utils.quantization.context import get_kv_cache_strategy
+    from diffulex.utils.quantization.infra.context import get_kv_cache_strategy
     strategy = get_kv_cache_strategy()
     if strategy is None:
         _store_kvcache_unified_bf16(key, value, k_cache, v_cache, slot_mapping)
@@ -923,7 +923,7 @@ def store_kvcache_distinct_layout(key: torch.Tensor, value: torch.Tensor,
     Store KV cache (distinct layout).
     Dynamically selects the appropriate kernel based on quantization strategy from context.
     """
-    from diffulex.utils.quantization.context import get_kv_cache_strategy
+    from diffulex.utils.quantization.infra.context import get_kv_cache_strategy
     strategy = get_kv_cache_strategy()
     if strategy is None:
         _store_kvcache_distinct_bf16(key, value, k_cache, v_cache, slot_mapping)
@@ -957,7 +957,7 @@ def _load_kvcache_fp8(k_cache: torch.Tensor, v_cache: torch.Tensor,
     - Unified: [num_blocks, page_size, num_kv_heads, head_dim]
     - Distinct: k_cache [num_blks, h, hdim // x, blk_sz, x], v_cache [num_blks, h, hdim, blk_sz]
     """
-    from diffulex.utils.quantization.context import get_kv_cache_strategy
+    from diffulex.utils.quantization.infra.context import get_kv_cache_strategy
     strategy = get_kv_cache_strategy()
     if strategy is None or getattr(strategy, "kv_cache_format", "bf16") != "fp8":
         raise ValueError(f"Expected kv_cache_format='fp8', got strategy={type(strategy)}")
@@ -1123,7 +1123,7 @@ def load_kvcache(k_cache: torch.Tensor, v_cache: torch.Tensor,
     Load KV cache.
     Dynamically selects the appropriate kernel based on quantization strategy from context.
     """
-    from diffulex.utils.quantization.context import get_kv_cache_strategy
+    from diffulex.utils.quantization.infra.context import get_kv_cache_strategy
     strategy = get_kv_cache_strategy()
     if strategy is None:
         return _load_kvcache_bf16(k_cache, v_cache, attn_metadata, k_new, v_new)

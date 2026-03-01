@@ -129,7 +129,7 @@ def _decode_static_unified_triton_fp8_cache(
         raise ValueError("FP8 KV decode requires k_scale and v_scale in metadata")
 
     # KV cache is stored as uint8 for FP8, but Triton expects float8 view dtype.
-    from diffulex.utils.quantization.context import get_kv_cache_strategy
+    from diffulex.utils.quantization.infra.context import get_kv_cache_strategy
 
     strategy = get_kv_cache_strategy()
     if strategy is None or getattr(strategy, "kv_cache_format", "bf16") != "fp8":
@@ -164,7 +164,7 @@ def dllm_flash_attn_decode(
     - static: Triton paged-attention over (paged) KV cache + current-step KV
     - varlen: load_kvcache (Triton gather/dequant) + flash-attn varlen
     """
-    from diffulex.utils.quantization.context import get_kv_cache_strategy
+    from diffulex.utils.quantization.infra.context import get_kv_cache_strategy
 
     kv_strategy = get_kv_cache_strategy()
     kv_fmt = getattr(kv_strategy, "kv_cache_format", "bf16") if kv_strategy is not None else "bf16"

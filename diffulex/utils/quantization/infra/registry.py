@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import Callable, Dict, Optional
 
 from diffulex.utils.quantization.kv_cache_dtype import _normalize_kv_cache_dtype
-from diffulex.utils.quantization.strategy import (
+from diffulex.utils.quantization.strategies.strategy import (
     KVCacheQuantizationStrategy,
     LinearQuantizationStrategy,
 )

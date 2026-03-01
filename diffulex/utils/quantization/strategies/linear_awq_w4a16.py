@@ -15,8 +15,8 @@ from typing import Any, Optional
 import torch
 import torch.nn.functional as F
 
-from diffulex.utils.quantization.registry import register_linear_strategy, register_strategy_key
-from diffulex.utils.quantization.strategy import LinearQuantizationStrategy
+from diffulex.utils.quantization.infra.registry import register_linear_strategy, register_strategy_key
+from diffulex.utils.quantization.strategies.strategy import LinearQuantizationStrategy
 
 try:
     from vllm import _custom_ops as ops  # type: ignore

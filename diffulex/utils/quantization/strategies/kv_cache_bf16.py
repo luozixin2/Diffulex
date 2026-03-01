@@ -4,8 +4,8 @@ BF16 KV Cache quantization strategy (no actual quantization, just storage format
 
 import torch
 from typing import Optional
-from diffulex.utils.quantization.strategy import KVCacheQuantizationStrategy
-from diffulex.utils.quantization.registry import register_kv_cache_strategy
+from diffulex.utils.quantization.strategies.strategy import KVCacheQuantizationStrategy
+from diffulex.utils.quantization.infra.registry import register_kv_cache_strategy
 
 
 class KVCacheBF16Strategy(KVCacheQuantizationStrategy):

@@ -16,8 +16,8 @@ from typing import Any, Optional
 
 import torch
 
-from diffulex.utils.quantization.registry import register_linear_strategy
-from diffulex.utils.quantization.strategy import LinearQuantizationStrategy
+from diffulex.utils.quantization.infra.registry import register_linear_strategy
+from diffulex.utils.quantization.strategies.strategy import LinearQuantizationStrategy
 
 
 @register_linear_strategy(weight_dtype="fp8_e4m3", act_dtype="bf16")

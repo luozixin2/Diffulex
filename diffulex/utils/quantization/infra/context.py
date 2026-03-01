@@ -8,7 +8,7 @@ avoiding the need to pass quantization parameters through multiple layers.
 from typing import Dict, Optional
 from threading import local
 
-from diffulex.utils.quantization.strategy import (
+from diffulex.utils.quantization.strategies.strategy import (
     QuantizationStrategy,
     KVCacheQuantizationStrategy,
     WeightQuantizationStrategy,

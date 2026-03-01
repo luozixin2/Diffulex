@@ -6,11 +6,11 @@ This module provides factory functions to create quantization strategies from co
 
 from typing import Optional
 
-from diffulex.utils.quantization.context import QuantizationContext
+from diffulex.utils.quantization.infra.context import QuantizationContext
 from diffulex.utils.quantization.config import QuantizationConfig
-from diffulex.utils.quantization.registry import create_kv_cache_strategy as _create_kv_cache_strategy
-from diffulex.utils.quantization.registry import create_linear_strategy as _create_linear_strategy
-from diffulex.utils.quantization.strategy import KVCacheQuantizationStrategy
+from diffulex.utils.quantization.infra.registry import create_kv_cache_strategy as _create_kv_cache_strategy
+from diffulex.utils.quantization.infra.registry import create_linear_strategy as _create_linear_strategy
+from diffulex.utils.quantization.strategies.strategy import KVCacheQuantizationStrategy
 
 # Ensure built-in strategies are imported so they can register themselves.
 from diffulex.utils.quantization import strategies as _builtin_strategies  # noqa: F401

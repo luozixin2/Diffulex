@@ -7,8 +7,8 @@ strategy, which matches vLLM's effective fast path and avoids TileLang.
 
 from __future__ import annotations
 
-from diffulex.utils.quantization.registry import register_linear_strategy
-from diffulex.utils.quantization.strategy import LinearQuantizationStrategy
+from diffulex.utils.quantization.infra.registry import register_linear_strategy
+from diffulex.utils.quantization.strategies.strategy import LinearQuantizationStrategy
 
 from .linear_marlin_int8_w8a16 import LinearMarlinInt8W8A16Strategy
 

@@ -18,8 +18,8 @@ from typing import Any, Optional
 import torch
 import torch.nn.functional as F
 
-from diffulex.utils.quantization.registry import register_linear_strategy
-from diffulex.utils.quantization.strategy import LinearQuantizationStrategy
+from diffulex.utils.quantization.infra.registry import register_linear_strategy
+from diffulex.utils.quantization.strategies.strategy import LinearQuantizationStrategy
 
 try:
     import vllm._custom_ops as _vllm_ops

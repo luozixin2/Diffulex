@@ -18,9 +18,9 @@ from diffulex.utils.quantization.core import (
     WeightFormat,
 )
 from diffulex.utils.quantization.core.protocol import LinearQuantizationProtocol
-from diffulex.utils.quantization.context import get_linear_strategy, QuantizationContext
-from diffulex.utils.quantization.strategy_resolver import get_strategy_for_container
-from diffulex.utils.quantization.marlin_converter import (
+from diffulex.utils.quantization.infra.context import get_linear_strategy, QuantizationContext
+from diffulex.utils.quantization.runtime.strategy_resolver import get_strategy_for_container
+from diffulex.utils.quantization.runtime.marlin_converter import (
     convert_gptq_to_marlin,
     convert_awq_to_marlin,
 )

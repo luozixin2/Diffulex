@@ -14,7 +14,7 @@ from diffulex.utils.quantization.core import (
     WeightContainerFactory,
 )
 
-from diffulex.utils.quantization.context import (
+from diffulex.utils.quantization.infra.context import (
     QuantizationContext,
     get_quantization_context,
     set_kv_cache_strategy,
@@ -28,7 +28,7 @@ from diffulex.utils.quantization.context import (
     set_cached_act_quant,
 )
 
-from diffulex.utils.quantization.factory import QuantizationStrategyFactory
+from diffulex.utils.quantization.infra.factory import QuantizationStrategyFactory
 
 from diffulex.utils.quantization.config import (
     KVCacheQuantConfig,
@@ -37,7 +37,7 @@ from diffulex.utils.quantization.config import (
     QuantizationConfig,
 )
 
-from diffulex.utils.quantization.registry import (
+from diffulex.utils.quantization.infra.registry import (
     register_kv_cache_strategy,
     create_kv_cache_strategy,
     register_linear_strategy,
@@ -46,20 +46,20 @@ from diffulex.utils.quantization.registry import (
     registered_linear_dtypes,
 )
 
-from diffulex.utils.quantization.strategy import (
+from diffulex.utils.quantization.strategies.strategy import (
     QuantizationStrategy,
     KVCacheQuantizationStrategy,
     WeightQuantizationStrategy,
     LinearQuantizationStrategy,
 )
 
-from diffulex.utils.quantization.delegate import (
+from diffulex.utils.quantization.runtime.delegate import (
     QuantizedLinearDelegate,
     ForwardPlanManager,
     create_quantized_delegate,
 )
 
-from diffulex.utils.quantization.loader_adapter import (
+from diffulex.utils.quantization.runtime.loader_adapter import (
     set_offline_gptq_weight,
     set_offline_awq_weight,
     set_offline_gptq_marlin_weight,

@@ -58,7 +58,7 @@ class Attention(nn.Module):
             if attn_metadata.need_kv_cache_store:
                 # Update scales if quantization strategy requires them
                 if self.k_scale is not None and self.v_scale is not None:
-                    from diffulex.utils.quantization.context import get_kv_cache_strategy
+                    from diffulex.utils.quantization.infra.context import get_kv_cache_strategy
                     strategy = get_kv_cache_strategy()
                     if strategy is not None:
                         self.k_scale, self.v_scale = strategy.update_scales(
@@ -82,7 +82,7 @@ class Attention(nn.Module):
             o = dllm_flash_attn_prefill(q, k, v, self.scale, attn_metadata)
         else:
             if is_unified_layout:
-                from diffulex.utils.quantization.context import get_kv_cache_strategy
+                from diffulex.utils.quantization.infra.context import get_kv_cache_strategy
                 strategy = get_kv_cache_strategy()
                 if strategy is not None:
                     # e.g. FP8: pass scales to metadata for kernel / load_kvcache to handle
@@ -94,7 +94,7 @@ class Attention(nn.Module):
             else:
                 # Distinct layout: use varlen mode with load_kvcache
                 from diffulex_kernel import load_kvcache
-                from diffulex.utils.quantization.context import get_kv_cache_strategy
+                from diffulex.utils.quantization.infra.context import get_kv_cache_strategy
                 strategy = get_kv_cache_strategy()
                 if strategy is not None:
                     # e.g. FP8: pass scales to metadata for load_kvcache to handle

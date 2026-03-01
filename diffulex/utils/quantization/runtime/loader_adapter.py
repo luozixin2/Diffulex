@@ -15,8 +15,8 @@ import torch
 import torch.nn as nn
 
 from diffulex.utils.quantization.core import WeightContainerFactory, GPTQWeight, AWQWeight, GPTQMarlinWeight, AWQMarlinWeight
-from diffulex.utils.quantization.delegate import QuantizedLinearDelegate
-from diffulex.utils.quantization.marlin_converter import (
+from diffulex.utils.quantization.runtime.delegate import QuantizedLinearDelegate
+from diffulex.utils.quantization.runtime.marlin_converter import (
     convert_gptq_tensors_to_marlin,
     convert_awq_tensors_to_marlin,
 )

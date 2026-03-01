@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
-from diffulex.utils.quantization.registry import (
+from diffulex.utils.quantization.infra.registry import (
     get_strategy_by_key,
     create_linear_strategy,
 )
@@ -23,10 +23,10 @@ from diffulex.utils.quantization.core import (
     AWQWeight,
     BF16Weight,
 )
-from diffulex.utils.quantization.context import get_linear_strategy
+from diffulex.utils.quantization.infra.context import get_linear_strategy
 
 if TYPE_CHECKING:
-    from diffulex.utils.quantization.strategy import LinearQuantizationStrategy
+    from diffulex.utils.quantization.strategies.strategy import LinearQuantizationStrategy
 
 
 def get_strategy_for_container(
