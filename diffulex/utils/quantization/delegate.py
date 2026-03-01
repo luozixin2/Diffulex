@@ -22,7 +22,60 @@ from diffulex.utils.quantization.core import (
     WeightFormat,
 )
 from diffulex.utils.quantization.core.protocol import LinearQuantizationProtocol
-from diffulex.utils.quantization.context import get_linear_strategy
+from diffulex.utils.quantization.context import get_linear_strategy, QuantizationContext
+
+
+def _get_strategy_for_container(container: QuantizedWeight, quant_kind: str) -> Any:
+    """Get appropriate strategy for weight container.
+    
+    For offline quantized weights (Marlin, etc.), select strategy based on container type.
+    For online quantized weights, use quant_kind to select strategy.
+    """
+    ctx = QuantizationContext.current()
+    
+    # For Marlin containers, we need to use Marlin-specific strategy
+    if isinstance(container, GPTQMarlinWeight):
+        # Try to get Marlin strategy based on bits
+        bits = getattr(container, 'bits', 4)
+        marlin_kind = f"gptq_marlin_w{bits}a16"
+        strategy = ctx.get_linear_strategy(marlin_kind)
+        if strategy is not None:
+            return strategy
+        # Dynamically create Marlin strategy if not registered
+        from diffulex.utils.quantization.strategies.linear_gptq_marlin_w4a16 import LinearGPTQMarlinW4A16Strategy
+        strategy = LinearGPTQMarlinW4A16Strategy()
+        ctx.set_linear_strategy(marlin_kind, strategy)
+        return strategy
+    
+    if isinstance(container, AWQMarlinWeight):
+        marlin_kind = "awq_marlin_w4a16"
+        strategy = ctx.get_linear_strategy(marlin_kind)
+        if strategy is not None:
+            return strategy
+        # Dynamically create AWQ Marlin strategy if not registered
+        from diffulex.utils.quantization.strategies.linear_awq_marlin_w4a16 import LinearAWQMarlinW4A16Strategy
+        strategy = LinearAWQMarlinW4A16Strategy()
+        ctx.set_linear_strategy(marlin_kind, strategy)
+        return strategy
+    
+    # For GPTQ containers, dynamically create strategy based on bits
+    if isinstance(container, GPTQWeight):
+        bits = getattr(container, 'bits', 4)
+        from diffulex.utils.quantization.strategies.linear_gptq_w4a16 import LinearGPTQW4A16Strategy
+        from diffulex.utils.quantization.strategies.linear_gptq_w8a16 import LinearGPTQW8A16Strategy
+        if bits == 8:
+            return LinearGPTQW8A16Strategy()
+        elif bits == 4:
+            return LinearGPTQW4A16Strategy()
+        # For other bits (like 2), fall through to default
+    
+    # For AWQ containers
+    if isinstance(container, AWQWeight):
+        from diffulex.utils.quantization.strategies.linear_awq_w4a16 import LinearAWQW4A16Strategy
+        return LinearAWQW4A16Strategy()
+    
+    # Default: use quant_kind to get strategy
+    return get_linear_strategy(quant_kind)
 
 
 @dataclass(frozen=True)
@@ -35,21 +88,55 @@ class ForwardPlanSig:
     has_bias: bool
     weight_format: str
     strategy_name: str
+    quant_kind: str
 
 
 class ForwardPlan:
-    """Cached forward execution plan."""
+    """Cached forward execution plan.
+    
+    Mirrors the old code's pattern: store direct references to strategy, weight, etc.
+    to avoid indirection overhead in the hot path.
+    """
     
     def __init__(
         self,
         sig: ForwardPlanSig,
-        executor: Callable[[torch.Tensor, Optional[torch.Tensor]], torch.Tensor],
+        strategy: Any,
+        weight: torch.Tensor,
+        scales: Optional[torch.Tensor],
+        bias: Optional[torch.Tensor],
+        quant_kind: str,
+        out_features: int,
     ):
         self.sig = sig
-        self._executor = executor
+        self._strategy = strategy
+        self._weight = weight  # qweight for quantized, regular weight for bf16
+        self._scales = scales  # quant scales, None for bf16
+        self._bias = bias
+        self._quant_kind = quant_kind
+        self._out_features = out_features
     
     def __call__(self, x: torch.Tensor, bias: Optional[torch.Tensor]) -> torch.Tensor:
-        return self._executor(x, bias)
+        # Direct call to strategy, matching old code pattern
+        b = bias if bias is not None else self._bias
+        if self._scales is not None:
+            # Quantized path: W8A8, W8A16, etc.
+            return self._strategy.linear_forward(
+                x,
+                self._weight,
+                b,
+                quant_kind=self._quant_kind,
+                quant_scales=self._scales,
+                out_features=self._out_features,
+            )
+        else:
+            # BF16 path
+            return self._strategy.linear_forward(
+                x,
+                self._weight,
+                b,
+                quant_kind=self._quant_kind,
+            )
 
 
 class ForwardPlanManager:
@@ -74,9 +161,13 @@ class ForwardPlanManager:
         x: torch.Tensor,
         bias: Optional[torch.Tensor],
         container: QuantizedWeight,
-        strategy: LinearQuantizationProtocol,
+        quant_kind: str = "other",
     ) -> Optional[ForwardPlan]:
-        """Get cached plan if signature matches."""
+        """Get cached plan if signature matches.
+        
+        Note: strategy is not passed here because plan already captures it in executor.
+        This avoids expensive strategy lookup on the hot path.
+        """
         if not self._enabled:
             return None
         
@@ -87,12 +178,15 @@ class ForwardPlanManager:
         device = x.device
         dev_idx = self._device_index(device)
         
+        # Check signature components (strategy_name is already validated in sig)
         if (
             sig.device_type == device.type
             and sig.device_index == dev_idx
             and sig.x_dtype == x.dtype
             and sig.x_shape == tuple(int(v) for v in x.shape)
             and sig.has_bias == (bias is not None)
+            and sig.weight_format == container.weight_format.value
+            and sig.quant_kind == quant_kind
         ):
             return self._plan
         
@@ -104,6 +198,7 @@ class ForwardPlanManager:
         bias: Optional[torch.Tensor],
         container: QuantizedWeight,
         strategy: LinearQuantizationProtocol,
+        quant_kind: str = "other",
     ) -> ForwardPlan:
         """Build a new forward plan."""
         device = x.device
@@ -117,12 +212,28 @@ class ForwardPlanManager:
             has_bias=bias is not None,
             weight_format=container.weight_format.value,
             strategy_name=getattr(strategy, 'name', 'unknown'),
+            quant_kind=quant_kind,
         )
         
-        def executor(x_in: torch.Tensor, bias_in: Optional[torch.Tensor]) -> torch.Tensor:
-            return container.forward(x_in, bias_in, strategy)
+        # Extract weight and scales from container for direct access in Plan
+        if hasattr(container, 'qweight'):
+            # Quantized weights (W8A8, W8A16, GPTQ, etc.)
+            weight = container.qweight
+            scales = getattr(container, 'scales', None)
+        else:
+            # BF16 path
+            weight = getattr(container, 'weight', None)
+            scales = None
         
-        self._plan = ForwardPlan(sig, executor)
+        self._plan = ForwardPlan(
+            sig=sig,
+            strategy=strategy,
+            weight=weight,
+            scales=scales,
+            bias=bias,
+            quant_kind=quant_kind,
+            out_features=container.out_features,
+        )
         return self._plan
     
     @staticmethod
@@ -168,21 +279,25 @@ class QuantizedLinearDelegate:
         if self._container is None:
             raise RuntimeError("QuantizedLinearDelegate: no weight container set")
         
-        strategy = get_linear_strategy(self.quant_kind)
+        # Try cached forward plan first (fast path for CUDA Graph)
+        # This avoids expensive _get_strategy_for_container() call on hot path
+        if self._plan_manager._enabled:
+            plan = self._plan_manager.get_plan(x, bias, self._container, quant_kind=self.quant_kind)
+            if plan is not None:
+                return plan(x, bias)
+        
+        # Slow path: get strategy and optionally build plan
+        strategy = _get_strategy_for_container(self._container, self.quant_kind)
         if strategy is None:
             if isinstance(self._container, BF16Weight):
                 return F.linear(x, self._container.weight, bias)
             raise RuntimeError("QuantizedLinearDelegate: no strategy configured for quantized weight")
         
-        plan = self._plan_manager.get_plan(x, bias, self._container, strategy)
-        if plan is not None:
-            return plan(x, bias)
-        
         if self._plan_manager._enabled:
-            plan = self._plan_manager.build_plan(x, bias, self._container, strategy)
+            plan = self._plan_manager.build_plan(x, bias, self._container, strategy, quant_kind=self.quant_kind)
             return plan(x, bias)
         
-        return self._container.forward(x, bias, strategy)
+        return self._container.forward(x, bias, strategy, quant_kind=self.quant_kind)
     
     def load_weight(
         self,
@@ -250,8 +365,11 @@ class QuantizedLinearDelegate:
         if getattr(strategy, "name", "").startswith("linear_stub"):
             return
         
-        weight_format = getattr(strategy, 'weight_format', None)
-        if weight_format is None or weight_format == WeightFormat.BF16:
+        weight_format = getattr(strategy, 'linear_weight_format', None) or getattr(strategy, 'weight_format', None)
+        if weight_format is None or weight_format == WeightFormat.BF16 or weight_format == 'bf16':
+            # For BF16, create a BF16Weight container so forward() works properly
+            from diffulex.utils.quantization.core.container import BF16Weight
+            self.set_container(BF16Weight(param.data))
             return
         
         try:
@@ -282,23 +400,34 @@ class QuantizedLinearDelegate:
         quant_scales: torch.Tensor,
     ) -> None:
         """Set online quantized weight (W8A16/W8A8)."""
+        from .core.container import W8A8Weight
+        
         scale_dtype = torch.bfloat16
+        is_w8a8 = False
         strategy = get_linear_strategy(self.quant_kind)
         if strategy is not None:
             weight_format = getattr(strategy, 'linear_weight_format', None)
             act_format = getattr(strategy, 'linear_act_format', None)
             if weight_format == "int8" and act_format == "int8":
                 scale_dtype = torch.float32
+                is_w8a8 = True
             elif weight_format in ("fp8_e4m3", "fp8_e5m2"):
                 scale_dtype = torch.float32
         
         if quant_scales.dtype != scale_dtype:
             quant_scales = quant_scales.to(scale_dtype)
         
-        container = W8A16Weight(
-            qweight=quant_weight.contiguous(),
-            scales=quant_scales.contiguous(),
-        )
+        # Create the appropriate container based on quantization type
+        if is_w8a8:
+            container = W8A8Weight(
+                qweight=quant_weight.contiguous(),
+                scales=quant_scales.contiguous(),
+            )
+        else:
+            container = W8A16Weight(
+                qweight=quant_weight.contiguous(),
+                scales=quant_scales.contiguous(),
+            )
         self.set_container(container)
     
     def set_offline_quantized_weight(
@@ -333,6 +462,8 @@ class QuantizedLinearDelegate:
                 device=device,
             )
         elif format == "awq":
+            # AWQ requires GPU tensors for vLLM kernels
+            target_device = torch.device("cuda") if device.type == "cpu" else device
             container = WeightContainerFactory.from_awq(
                 qweight=qweight,
                 qzeros=qzeros,
@@ -341,7 +472,7 @@ class QuantizedLinearDelegate:
                 in_features=in_features,
                 group_size=group_size,
                 bits=4,
-                device=device,
+                device=target_device,
             )
         else:
             raise ValueError(f"Unsupported format: {format}")
