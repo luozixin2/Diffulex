@@ -14,7 +14,7 @@ from typing import Any, Optional
 
 import torch
 
-from diffulex.utils.quantization.registry import register_linear_strategy
+from diffulex.utils.quantization.registry import register_linear_strategy, register_strategy_key
 from diffulex.utils.quantization.strategy import LinearQuantizationStrategy
 
 try:
@@ -34,6 +34,7 @@ except Exception:  # pragma: no cover
 
 
 @register_linear_strategy(weight_dtype="awq_marlin", act_dtype="bf16")
+@register_strategy_key("awq_marlin_w4a16")
 def _build_linear_awq_marlin_w4a16() -> LinearQuantizationStrategy:
     return LinearAWQMarlinW4A16Strategy()
 

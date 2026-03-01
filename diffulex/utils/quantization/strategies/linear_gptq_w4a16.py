@@ -19,7 +19,7 @@ from typing import Any, Optional
 import torch
 import torch.nn.functional as F
 
-from diffulex.utils.quantization.registry import register_linear_strategy
+from diffulex.utils.quantization.registry import register_linear_strategy, register_strategy_key
 from diffulex.utils.quantization.strategy import LinearQuantizationStrategy
 
 try:
@@ -29,6 +29,7 @@ except Exception:  # pragma: no cover
 
 
 @register_linear_strategy(weight_dtype="gptq", act_dtype="bf16")
+@register_strategy_key("gptq_w4a16")
 def _build_linear_gptq_w4a16() -> LinearQuantizationStrategy:
     return LinearGPTQW4A16Strategy()
 

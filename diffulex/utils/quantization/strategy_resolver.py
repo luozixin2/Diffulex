@@ -3,74 +3,34 @@
 This module centralizes the logic for mapping weight containers to their
 appropriate quantization strategies, eliminating the need for large
 if-elif chains scattered throughout the codebase.
+
+All strategies are resolved through the registry system, eliminating
+lazy imports and ensuring compile-time dependency verification.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
+from diffulex.utils.quantization.registry import (
+    get_strategy_by_key,
+    create_linear_strategy,
+)
+from diffulex.utils.quantization.core import (
+    GPTQMarlinWeight,
+    AWQMarlinWeight,
+    GPTQWeight,
+    AWQWeight,
+    BF16Weight,
+)
+from diffulex.utils.quantization.context import get_linear_strategy
+
 if TYPE_CHECKING:
-    from diffulex.utils.quantization.core import QuantizedWeight
     from diffulex.utils.quantization.strategy import LinearQuantizationStrategy
 
 
-def _create_marlin_strategy(bits: int) -> "LinearQuantizationStrategy":
-    """Dynamically create and cache a GPTQ Marlin strategy."""
-    from diffulex.utils.quantization.context import QuantizationContext
-    from diffulex.utils.quantization.strategies.linear_gptq_marlin_w4a16 import (
-        LinearGPTQMarlinW4A16Strategy,
-    )
-    
-    marlin_kind = f"gptq_marlin_w{bits}a16"
-    ctx = QuantizationContext.current()
-    strategy = ctx.get_linear_strategy(marlin_kind)
-    if strategy is None:
-        strategy = LinearGPTQMarlinW4A16Strategy()
-        ctx.set_linear_strategy(marlin_kind, strategy)
-    return strategy
-
-
-def _create_awq_marlin_strategy() -> "LinearQuantizationStrategy":
-    """Dynamically create and cache an AWQ Marlin strategy."""
-    from diffulex.utils.quantization.context import QuantizationContext
-    from diffulex.utils.quantization.strategies.linear_awq_marlin_w4a16 import (
-        LinearAWQMarlinW4A16Strategy,
-    )
-    
-    ctx = QuantizationContext.current()
-    strategy = ctx.get_linear_strategy("awq_marlin_w4a16")
-    if strategy is None:
-        strategy = LinearAWQMarlinW4A16Strategy()
-        ctx.set_linear_strategy("awq_marlin_w4a16", strategy)
-    return strategy
-
-
-def _create_gptq_strategy(bits: int) -> "LinearQuantizationStrategy":
-    """Create a GPTQ strategy based on bit width."""
-    if bits == 8:
-        from diffulex.utils.quantization.strategies.linear_gptq_w8a16 import (
-            LinearGPTQW8A16Strategy,
-        )
-        return LinearGPTQW8A16Strategy()
-    elif bits == 4:
-        from diffulex.utils.quantization.strategies.linear_gptq_w4a16 import (
-            LinearGPTQW4A16Strategy,
-        )
-        return LinearGPTQW4A16Strategy()
-    # For other bits, fall through to default strategy lookup
-    return None  # type: ignore
-
-
-def _create_awq_strategy() -> "LinearQuantizationStrategy":
-    """Create an AWQ strategy."""
-    from diffulex.utils.quantization.strategies.linear_awq_w4a16 import (
-        LinearAWQW4A16Strategy,
-    )
-    return LinearAWQW4A16Strategy()
-
-
 def get_strategy_for_container(
-    container: "QuantizedWeight",
+    container,
     quant_kind: str,
 ) -> Optional["LinearQuantizationStrategy"]:
     """Get appropriate strategy for a weight container.
@@ -82,6 +42,9 @@ def get_strategy_for_container(
     - Standard AWQ
     - Runtime/online quantized weights (delegates to quant_kind)
     
+    All strategy lookups go through the registry, eliminating the need
+    for lazy imports of concrete strategy classes.
+    
     Args:
         container: The weight container to get a strategy for
         quant_kind: Quantization kind ("attn", "mlp", "other") for runtime weights
@@ -90,32 +53,45 @@ def get_strategy_for_container(
         The appropriate LinearQuantizationStrategy, or None if no strategy
         is configured for the container type.
     """
-    # Import here to avoid circular dependencies
-    from diffulex.utils.quantization.core import (
-        GPTQMarlinWeight,
-        AWQMarlinWeight,
-        GPTQWeight,
-        AWQWeight,
-    )
-    from diffulex.utils.quantization.context import get_linear_strategy
-    
-    # Marlin formats need special handling
+    # Marlin formats: use key-based lookup through registry
     if isinstance(container, GPTQMarlinWeight):
-        return _create_marlin_strategy(container.bits)
+        return get_strategy_by_key(f"gptq_marlin_w{container.bits}a16")
     
     if isinstance(container, AWQMarlinWeight):
-        return _create_awq_marlin_strategy()
+        return get_strategy_by_key("awq_marlin_w4a16")
     
-    # Standard GPTQ with bit-specific strategies
+    # Standard GPTQ: use dtype-pair lookup through registry
     if isinstance(container, GPTQWeight):
-        strategy = _create_gptq_strategy(container.bits)
-        if strategy is not None:
-            return strategy
-        # Fall through to default lookup for other bit widths
+        # Map bits to strategy
+        if container.bits == 4:
+            return create_linear_strategy(weight_dtype="gptq", act_dtype="bf16")
+        elif container.bits == 8:
+            # GPTQ W8A16 - use key-based lookup if available
+            strategy = get_strategy_by_key("gptq_w8a16")
+            if strategy is not None:
+                return strategy
+            # Fall back to dtype-pair lookup
+            return create_linear_strategy(weight_dtype="gptq", act_dtype="bf16")
+        # For other bit widths, fall through to default
     
-    # Standard AWQ
+    # Standard AWQ: use key-based lookup
     if isinstance(container, AWQWeight):
-        return _create_awq_strategy()
+        return get_strategy_by_key("awq_w4a16")
     
-    # For runtime quantized weights, use quant_kind to select strategy
-    return get_linear_strategy(quant_kind)
+    # For runtime quantized weights (BF16, W8A16, W8A8), use quant_kind
+    # to look up strategy from context
+    if isinstance(container, BF16Weight):
+        return get_linear_strategy(quant_kind)
+    
+    # Fallback: try to create strategy from weight format
+    weight_format = getattr(container, 'weight_format', None)
+    if weight_format and hasattr(weight_format, 'value'):
+        try:
+            return create_linear_strategy(
+                weight_dtype=weight_format.value,
+                act_dtype="bf16"
+            )
+        except ValueError:
+            pass
+    
+    return None

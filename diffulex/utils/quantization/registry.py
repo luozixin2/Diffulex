@@ -9,7 +9,7 @@ and let factories/registries decide which strategy to instantiate.
 
 from __future__ import annotations
 
-from typing import Callable, Dict
+from typing import Callable, Dict, Optional
 
 from diffulex.utils.quantization.kv_cache_dtype import _normalize_kv_cache_dtype
 from diffulex.utils.quantization.strategy import (
@@ -168,6 +168,47 @@ def registered_linear_dtypes() -> list[str]:
         "gptq_awq",
         "marlin_int8",
     ]
+
+
+# ---- Key-based strategy registry (for runtime resolution without lazy imports) ----
+# Maps string keys (e.g., 'gptq_marlin_w4a16') to strategy builders
+_KEYED_STRATEGIES: Dict[str, LinearStrategyBuilder] = {}
+
+
+def register_strategy_key(key: str) -> Callable[[LinearStrategyBuilder], LinearStrategyBuilder]:
+    """Register a Linear strategy builder for a specific key.
+    
+    This allows runtime resolution of strategies by key without lazy imports.
+    Example keys: 'gptq_marlin_w4a16', 'awq_marlin_w4a16', 'gptq_w4a16'
+    
+    Args:
+        key: Unique string identifier for this strategy
+        
+    Returns:
+        Decorator that registers the strategy builder
+    """
+    def _decorator(builder: LinearStrategyBuilder) -> LinearStrategyBuilder:
+        _KEYED_STRATEGIES[key] = builder
+        return builder
+    return _decorator
+
+
+def get_strategy_by_key(key: str) -> Optional[LinearQuantizationStrategy]:
+    """Get a Linear strategy by its registered key.
+    
+    Args:
+        key: Strategy key (e.g., 'gptq_marlin_w4a16')
+        
+    Returns:
+        Strategy instance if found, None otherwise
+    """
+    builder = _KEYED_STRATEGIES.get(key)
+    return builder() if builder else None
+
+
+def registered_strategy_keys() -> list[str]:
+    """Return all registered strategy keys."""
+    return sorted(_KEYED_STRATEGIES.keys())
 
 
 
