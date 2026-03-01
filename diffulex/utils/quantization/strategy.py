@@ -318,3 +318,4 @@ class LinearQuantizationStrategy(QuantizationStrategy):
         _ = quant_kind, kwargs
         return F.linear(x, weight, bias)
 
+

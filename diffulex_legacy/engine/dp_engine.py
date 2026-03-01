@@ -291,3 +291,4 @@ class DPEngine:
                 restored[orig_idx] = out
         assert all(x is not None for x in restored), "Mismatch in outputs after DP collection"
         return restored
+
