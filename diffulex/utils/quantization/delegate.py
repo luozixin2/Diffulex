@@ -18,7 +18,7 @@ from diffulex.utils.quantization.core import (
     WeightFormat,
 )
 from diffulex.utils.quantization.core.protocol import LinearQuantizationProtocol
-from diffulex.utils.quantization.context import get_linear_strategy
+from diffulex.utils.quantization.context import get_linear_strategy, QuantizationContext
 from diffulex.utils.quantization.strategy_resolver import get_strategy_for_container
 from diffulex.utils.quantization.marlin_converter import (
     convert_gptq_to_marlin,
@@ -196,20 +196,33 @@ class QuantizedLinearDelegate:
     
     Implements the LinearDelegate protocol. Handles weight storage,
     computation via strategies, forward plan caching, and weight loading.
+    
+    Supports explicit context injection (Phase 3) for isolated testing
+    and explicit dependency management.
     """
     
     def __init__(
         self,
         quant_kind: str = "other",
         enable_forward_plan: bool = False,
+        context: Optional[QuantizationContext] = None,
     ):
         self.quant_kind = quant_kind
+        self._context = context  # Optional explicit context for Phase 3
         
         self._container: Optional[QuantizedWeight] = None
         self._plan_manager = ForwardPlanManager()
         self._plan_manager.enable(enable_forward_plan)
         
         self._loaded_shards: set[object] = set()
+    
+    def _get_context(self) -> QuantizationContext:
+        """Get the quantization context to use.
+        
+        Returns explicit context if provided, otherwise falls back to
+        thread-local current context for backward compatibility.
+        """
+        return self._context if self._context is not None else QuantizationContext.current()
     
     @property
     def weight_format(self) -> str:
@@ -306,7 +319,8 @@ class QuantizedLinearDelegate:
     
     def _maybe_quantize_weight(self, param: nn.Parameter) -> None:
         """Quantize weight at load time if configured."""
-        strategy = get_linear_strategy(self.quant_kind)
+        ctx = self._get_context()
+        strategy = ctx.get_linear_strategy(self.quant_kind)
         if strategy is None:
             return
         
@@ -352,7 +366,8 @@ class QuantizedLinearDelegate:
         
         scale_dtype = torch.bfloat16
         is_w8a8 = False
-        strategy = get_linear_strategy(self.quant_kind)
+        ctx = self._get_context()
+        strategy = ctx.get_linear_strategy(self.quant_kind)
         if strategy is not None:
             weight_format = getattr(strategy, 'linear_weight_format', None)
             act_format = getattr(strategy, 'linear_act_format', None)
@@ -460,12 +475,14 @@ class QuantizedLinearDelegate:
 def create_quantized_delegate(
     quant_kind: str = "other",
     enable_forward_plan: bool = False,
+    context: Optional[QuantizationContext] = None,
 ) -> QuantizedLinearDelegate:
     """Factory function to create a quantized delegate.
     
     Args:
         quant_kind: Quantization kind ("attn", "mlp", "other")
         enable_forward_plan: Whether to enable forward plan caching
+        context: Optional explicit quantization context. If None, uses thread-local context.
         
     Returns:
         QuantizedLinearDelegate instance
@@ -473,4 +490,5 @@ def create_quantized_delegate(
     return QuantizedLinearDelegate(
         quant_kind=quant_kind,
         enable_forward_plan=enable_forward_plan,
+        context=context,
     )

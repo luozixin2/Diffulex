@@ -39,6 +39,19 @@ class QuantizationContext:
             cls._thread_local.context = QuantizationContext()
         return cls._thread_local.context
     
+    # NEW: Explicit factory for isolated context (Phase 3)
+    @classmethod
+    def create_isolated(cls) -> 'QuantizationContext':
+        """Create a new isolated context for testing or explicit management.
+        
+        Unlike current(), this creates a standalone context that is NOT
+        stored in thread-local storage. Useful for:
+        - Unit testing with isolated state
+        - Multi-context scenarios where contexts should not interfere
+        - Explicit context lifecycle management
+        """
+        return cls()
+    
     def set_strategy(self, key: str, strategy: QuantizationStrategy):
         """Set a quantization strategy."""
         self._strategies[key] = strategy
