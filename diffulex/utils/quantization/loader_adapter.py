@@ -16,6 +16,10 @@ import torch.nn as nn
 
 from diffulex.utils.quantization.core import WeightContainerFactory, GPTQWeight, AWQWeight, GPTQMarlinWeight, AWQMarlinWeight
 from diffulex.utils.quantization.delegate import QuantizedLinearDelegate
+from diffulex.utils.quantization.marlin_converter import (
+    convert_gptq_tensors_to_marlin,
+    convert_awq_tensors_to_marlin,
+)
 
 # Optional vLLM import for Marlin
 try:
@@ -328,70 +332,17 @@ def prepare_gptq_marlin_from_standard(
 ) -> GPTQMarlinWeight:
     """Prepare GPTQ Marlin weight container from standard GPTQ tensors.
     
-    This function repacks standard GPTQ weights into Marlin format.
-    
-    Args:
-        qweight: Packed quantized weights
-        scales: Quantization scales
-        g_idx: Group indices tensor
-        bits: Quantization bits (2, 4, or 8)
-        group_size: Group size for quantization
-        out_features: Output features dimension
-        in_features: Input features dimension
-        device: Target device
-        
-    Returns:
-        GPTQMarlinWeight container with repacked weights
+    This is a thin wrapper around marlin_converter for backward compatibility.
     """
-    try:
-        from vllm import _custom_ops as ops
-        from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-            marlin_make_empty_g_idx,
-            marlin_make_workspace_new,
-            marlin_permute_scales,
-            marlin_sort_g_idx,
-        )
-    except Exception as e:
-        raise RuntimeError(f"Failed to import vllm Marlin utils: {e}")
-    
-    if g_idx.numel() > 0:
-        g_idx_sorted, g_idx_sort = marlin_sort_g_idx(
-            g_idx.to(device=device, dtype=torch.int32)
-        )
-    else:
-        g_idx_sorted = marlin_make_empty_g_idx(device)
-        g_idx_sort = marlin_make_empty_g_idx(device)
-    
-    workspace = marlin_make_workspace_new(device)
-    
-    marlin_qweight = ops.gptq_marlin_repack(
-        qweight.to(device).contiguous(),
-        perm=g_idx_sort,
-        size_k=in_features,
-        size_n=out_features,
-        num_bits=bits,
-        is_a_8bit=False,
-    )
-    
-    marlin_scales = marlin_permute_scales(
-        scales.to(device).contiguous(),
-        size_k=in_features,
-        size_n=out_features,
-        group_size=group_size,
-        is_a_8bit=False,
-    )
-    
-    return GPTQMarlinWeight(
-        qweight=marlin_qweight.contiguous(),
-        scales=marlin_scales.contiguous(),
-        zp=marlin_make_empty_g_idx(device),
-        g_idx=g_idx_sorted.contiguous(),
-        g_idx_sort_indices=g_idx_sort.contiguous(),
-        workspace=workspace,
+    return convert_gptq_tensors_to_marlin(
+        qweight=qweight,
+        scales=scales,
+        g_idx=g_idx,
         bits=bits,
         group_size=group_size,
         out_features=out_features,
         in_features=in_features,
+        device=device,
     )
 
 
@@ -407,67 +358,15 @@ def prepare_awq_marlin_from_standard(
 ) -> AWQMarlinWeight:
     """Prepare AWQ Marlin weight container from standard AWQ tensors.
     
-    This function repacks standard AWQ weights into Marlin format.
-    
-    Args:
-        qweight: Packed quantized weights
-        scales: Quantization scales
-        qzeros: Packed zero points
-        bits: Quantization bits
-        group_size: Group size for quantization
-        out_features: Output features dimension
-        in_features: Input features dimension
-        device: Target device
-        
-    Returns:
-        AWQMarlinWeight container with repacked weights
+    This is a thin wrapper around marlin_converter for backward compatibility.
     """
-    try:
-        from vllm import _custom_ops as ops
-        from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-            awq_to_marlin_zero_points,
-            marlin_make_workspace_new,
-            marlin_permute_scales,
-            marlin_make_empty_g_idx,
-        )
-    except Exception as e:
-        raise RuntimeError(f"Failed to import vllm Marlin utils: {e}")
-    
-    num_groups = in_features // group_size
-    
-    workspace = marlin_make_workspace_new(device)
-    
-    marlin_qweight = ops.awq_marlin_repack(
-        qweight.to(device).contiguous(),
-        size_k=in_features,
-        size_n=out_features,
-        num_bits=bits,
-        is_a_8bit=False,
-    )
-    
-    marlin_scales = marlin_permute_scales(
-        scales.to(device).contiguous(),
-        size_k=in_features,
-        size_n=out_features,
-        group_size=group_size,
-        is_a_8bit=False,
-    )
-    
-    marlin_zp = awq_to_marlin_zero_points(
-        qzeros.to(device).contiguous(),
-        size_k=num_groups,
-        size_n=out_features,
-        num_bits=bits,
-        is_a_8bit=False,
-    )
-    
-    return AWQMarlinWeight(
-        qweight=marlin_qweight.contiguous(),
-        scales=marlin_scales.contiguous(),
-        zp=marlin_zp.contiguous(),
-        workspace=workspace,
+    return convert_awq_tensors_to_marlin(
+        qweight=qweight,
+        scales=scales,
+        qzeros=qzeros,
+        bits=bits,
         group_size=group_size,
         out_features=out_features,
         in_features=in_features,
-        bits=bits,
+        device=device,
     )

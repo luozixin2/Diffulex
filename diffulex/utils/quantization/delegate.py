@@ -14,68 +14,16 @@ from diffulex.utils.quantization.core import (
     BF16Weight,
     W8A16Weight,
     W8A8Weight,
-    GPTQWeight,
-    AWQWeight,
-    GPTQMarlinWeight,
-    AWQMarlinWeight,
     WeightContainerFactory,
     WeightFormat,
 )
 from diffulex.utils.quantization.core.protocol import LinearQuantizationProtocol
-from diffulex.utils.quantization.context import get_linear_strategy, QuantizationContext
-
-
-def _get_strategy_for_container(container: QuantizedWeight, quant_kind: str) -> Any:
-    """Get appropriate strategy for weight container.
-    
-    For offline quantized weights (Marlin, etc.), select strategy based on container type.
-    For online quantized weights, use quant_kind to select strategy.
-    """
-    ctx = QuantizationContext.current()
-    
-    # For Marlin containers, we need to use Marlin-specific strategy
-    if isinstance(container, GPTQMarlinWeight):
-        # Try to get Marlin strategy based on bits
-        bits = getattr(container, 'bits', 4)
-        marlin_kind = f"gptq_marlin_w{bits}a16"
-        strategy = ctx.get_linear_strategy(marlin_kind)
-        if strategy is not None:
-            return strategy
-        # Dynamically create Marlin strategy if not registered
-        from diffulex.utils.quantization.strategies.linear_gptq_marlin_w4a16 import LinearGPTQMarlinW4A16Strategy
-        strategy = LinearGPTQMarlinW4A16Strategy()
-        ctx.set_linear_strategy(marlin_kind, strategy)
-        return strategy
-    
-    if isinstance(container, AWQMarlinWeight):
-        marlin_kind = "awq_marlin_w4a16"
-        strategy = ctx.get_linear_strategy(marlin_kind)
-        if strategy is not None:
-            return strategy
-        # Dynamically create AWQ Marlin strategy if not registered
-        from diffulex.utils.quantization.strategies.linear_awq_marlin_w4a16 import LinearAWQMarlinW4A16Strategy
-        strategy = LinearAWQMarlinW4A16Strategy()
-        ctx.set_linear_strategy(marlin_kind, strategy)
-        return strategy
-    
-    # For GPTQ containers, dynamically create strategy based on bits
-    if isinstance(container, GPTQWeight):
-        bits = getattr(container, 'bits', 4)
-        from diffulex.utils.quantization.strategies.linear_gptq_w4a16 import LinearGPTQW4A16Strategy
-        from diffulex.utils.quantization.strategies.linear_gptq_w8a16 import LinearGPTQW8A16Strategy
-        if bits == 8:
-            return LinearGPTQW8A16Strategy()
-        elif bits == 4:
-            return LinearGPTQW4A16Strategy()
-        # For other bits (like 2), fall through to default
-    
-    # For AWQ containers
-    if isinstance(container, AWQWeight):
-        from diffulex.utils.quantization.strategies.linear_awq_w4a16 import LinearAWQW4A16Strategy
-        return LinearAWQW4A16Strategy()
-    
-    # Default: use quant_kind to get strategy
-    return get_linear_strategy(quant_kind)
+from diffulex.utils.quantization.context import get_linear_strategy
+from diffulex.utils.quantization.strategy_resolver import get_strategy_for_container
+from diffulex.utils.quantization.marlin_converter import (
+    convert_gptq_to_marlin,
+    convert_awq_to_marlin,
+)
 
 
 @dataclass(frozen=True)
@@ -280,14 +228,14 @@ class QuantizedLinearDelegate:
             raise RuntimeError("QuantizedLinearDelegate: no weight container set")
         
         # Try cached forward plan first (fast path for CUDA Graph)
-        # This avoids expensive _get_strategy_for_container() call on hot path
+        # This avoids expensive get_strategy_for_container() call on hot path
         if self._plan_manager._enabled:
             plan = self._plan_manager.get_plan(x, bias, self._container, quant_kind=self.quant_kind)
             if plan is not None:
                 return plan(x, bias)
         
         # Slow path: get strategy and optionally build plan
-        strategy = _get_strategy_for_container(self._container, self.quant_kind)
+        strategy = get_strategy_for_container(self._container, self.quant_kind)
         if strategy is None:
             if isinstance(self._container, BF16Weight):
                 return F.linear(x, self._container.weight, bias)
@@ -492,121 +440,21 @@ class QuantizedLinearDelegate:
         """Prepare GPTQ Marlin weights."""
         if not isinstance(self._container, GPTQWeight):
             return
-        
         try:
-            from vllm import _custom_ops as ops
-            from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-                marlin_make_empty_g_idx,
-                marlin_make_workspace_new,
-                marlin_permute_scales,
-                marlin_sort_g_idx,
-            )
+            marlin_container = convert_gptq_to_marlin(self._container, x.device)
+            self.set_container(marlin_container)
         except Exception:
-            return
-        
-        device = x.device
-        container = self._container
-        
-        if container.g_idx.numel() > 0:
-            g_idx_sorted, g_idx_sort = marlin_sort_g_idx(
-                container.g_idx.to(device=device, dtype=torch.int32)
-            )
-        else:
-            g_idx_sorted = marlin_make_empty_g_idx(device)
-            g_idx_sort = marlin_make_empty_g_idx(device)
-        
-        workspace = marlin_make_workspace_new(device)
-        
-        marlin_qweight = ops.gptq_marlin_repack(
-            container.qweight.to(device).contiguous(),
-            perm=g_idx_sort,
-            size_k=container.in_features,
-            size_n=container.out_features,
-            num_bits=container.bits,
-            is_a_8bit=False,
-        )
-        
-        marlin_scales = marlin_permute_scales(
-            container.scales.to(device).contiguous(),
-            size_k=container.in_features,
-            size_n=container.out_features,
-            group_size=container.group_size,
-            is_a_8bit=False,
-        )
-        
-        marlin_container = GPTQMarlinWeight(
-            qweight=marlin_qweight.contiguous(),
-            scales=marlin_scales.contiguous(),
-            zp=marlin_make_empty_g_idx(device),
-            g_idx=g_idx_sorted.contiguous(),
-            g_idx_sort_indices=g_idx_sort.contiguous(),
-            workspace=workspace,
-            bits=container.bits,
-            group_size=container.group_size,
-            out_features=container.out_features,
-            in_features=container.in_features,
-        )
-        
-        self.set_container(marlin_container)
+            pass
     
     def _maybe_prepare_offline_awq_marlin(self, x: torch.Tensor) -> None:
         """Prepare AWQ Marlin weights."""
         if not isinstance(self._container, AWQWeight):
             return
-        
         try:
-            from vllm import _custom_ops as ops
-            from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-                awq_to_marlin_zero_points,
-                marlin_make_workspace_new,
-                marlin_permute_scales,
-                marlin_make_empty_g_idx,
-            )
+            marlin_container = convert_awq_to_marlin(self._container, x.device)
+            self.set_container(marlin_container)
         except Exception:
-            return
-        
-        device = x.device
-        container = self._container
-        num_groups = container.in_features // container.group_size
-        
-        workspace = marlin_make_workspace_new(device)
-        
-        marlin_qweight = ops.awq_marlin_repack(
-            container.qweight.to(device).contiguous(),
-            size_k=container.in_features,
-            size_n=container.out_features,
-            num_bits=container.bits,
-            is_a_8bit=False,
-        )
-        
-        marlin_scales = marlin_permute_scales(
-            container.scales.to(device).contiguous(),
-            size_k=container.in_features,
-            size_n=container.out_features,
-            group_size=container.group_size,
-            is_a_8bit=False,
-        )
-        
-        marlin_zp = awq_to_marlin_zero_points(
-            container.qzeros.to(device).contiguous(),
-            size_k=num_groups,
-            size_n=container.out_features,
-            num_bits=container.bits,
-            is_a_8bit=False,
-        )
-        
-        marlin_container = AWQMarlinWeight(
-            qweight=marlin_qweight.contiguous(),
-            scales=marlin_scales.contiguous(),
-            zp=marlin_zp.contiguous(),
-            workspace=workspace,
-            group_size=container.group_size,
-            out_features=container.out_features,
-            in_features=container.in_features,
-            bits=container.bits,
-        )
-        
-        self.set_container(marlin_container)
+            pass
 
 
 def create_quantized_delegate(

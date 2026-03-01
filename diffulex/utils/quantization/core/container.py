@@ -87,8 +87,11 @@ class BF16Weight(QuantizedWeight):
         return BF16Weight(self.weight.to(device))
 
 
-class W8A16Weight(QuantizedWeight):
-    """W8A16 quantized weight (int8 weight + bf16 activation)."""
+class _OnlineQuantizedWeight(QuantizedWeight, ABC):
+    """Base class for online quantized weights (W8A16, W8A8).
+    
+    Eliminates duplication between W8A16Weight and W8A8Weight.
+    """
     
     def __init__(
         self,
@@ -96,19 +99,9 @@ class W8A16Weight(QuantizedWeight):
         scales: torch.Tensor,
         original_shape: Optional[tuple[int, int]] = None,
     ):
-        """
-        Args:
-            qweight: Quantized weight tensor [out_features, in_features] or packed format
-            scales: Scale tensor [out_features] or [1, out_features]
-            original_shape: Original shape before packing (if different)
-        """
         self.qweight = qweight
         self.scales = scales
         self._original_shape = original_shape
-    
-    @property
-    def weight_format(self) -> WeightFormat:
-        return WeightFormat.INT8
     
     @property
     def out_features(self) -> int:
@@ -126,60 +119,47 @@ class W8A16Weight(QuantizedWeight):
             return self.qweight.shape[1]
         return 0
     
-    def forward(
-        self,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor],
-        strategy: Any,
-        quant_kind: str = "other",
-    ) -> torch.Tensor:
-        return strategy.linear_forward(
-            x,
-            self,
-            bias,
-            quant_kind=quant_kind,
-            quant_scales=self.scales,
-            out_features=self.out_features,
-        )
-    
-    def to(self, device: torch.device) -> QuantizedWeight:
+    def _move_to_device(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        """Move tensors to device if needed."""
         if self.qweight.device == device:
-            return self
-        return W8A16Weight(
-            self.qweight.to(device),
-            self.scales.to(device),
-            self._original_shape,
-        )
+            return self.qweight, self.scales
+        return self.qweight.to(device), self.scales.to(device)
 
 
-class W8A8Weight(QuantizedWeight):
-    """W8A8 quantized weight (int8 weight + int8 activation)."""
-    
-    def __init__(
-        self,
-        qweight: torch.Tensor,
-        scales: torch.Tensor,
-        original_shape: Optional[tuple[int, int]] = None,
-    ):
-        self.qweight = qweight
-        self.scales = scales
-        self._original_shape = original_shape
+class W8A16Weight(_OnlineQuantizedWeight):
+    """W8A16 quantized weight (int8 weight + bf16 activation)."""
     
     @property
     def weight_format(self) -> WeightFormat:
         return WeightFormat.INT8
     
-    @property
-    def out_features(self) -> int:
-        if self._original_shape:
-            return self._original_shape[0]
-        return self.qweight.shape[0] if self.qweight.dim() == 2 else self.scales.shape[-1]
+    def forward(
+        self,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        strategy: Any,
+        quant_kind: str = "other",
+    ) -> torch.Tensor:
+        return strategy.linear_forward(
+            x, self, bias,
+            quant_kind=quant_kind,
+            quant_scales=self.scales,
+            out_features=self.out_features,
+        )
+    
+    def to(self, device: torch.device) -> QuantizedWeight:
+        qw, sc = self._move_to_device(device)
+        if qw is self.qweight:  # Already on device
+            return self
+        return W8A16Weight(qw, sc, self._original_shape)
+
+
+class W8A8Weight(_OnlineQuantizedWeight):
+    """W8A8 quantized weight (int8 weight + int8 activation)."""
     
     @property
-    def in_features(self) -> int:
-        if self._original_shape:
-            return self._original_shape[1]
-        return self.qweight.shape[1] if self.qweight.dim() == 2 else 0
+    def weight_format(self) -> WeightFormat:
+        return WeightFormat.INT8
     
     def forward(
         self,
@@ -189,25 +169,47 @@ class W8A8Weight(QuantizedWeight):
         quant_kind: str = "other",
     ) -> torch.Tensor:
         return strategy.linear_forward(
-            x,
-            self,
-            bias,
+            x, self, bias,
             quant_kind=quant_kind,
             quant_scales=self.scales,
             out_features=self.out_features,
         )
     
     def to(self, device: torch.device) -> QuantizedWeight:
-        if self.qweight.device == device:
+        qw, sc = self._move_to_device(device)
+        if qw is self.qweight:  # Already on device
             return self
-        return W8A8Weight(
-            self.qweight.to(device),
-            self.scales.to(device),
-            self._original_shape,
-        )
+        return W8A8Weight(qw, sc, self._original_shape)
 
 
-class GPTQWeight(QuantizedWeight):
+class _OfflineQuantizedWeight(QuantizedWeight, ABC):
+    """Base class for offline quantized weights with common tensor handling.
+    
+    Provides utilities for moving multiple tensors to devices.
+    """
+    
+    def _move_tensors(
+        self,
+        device: torch.device,
+        *tensors: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        """Move tensors to device, preserving empty tensors."""
+        result = []
+        for t in tensors:
+            if t.numel() == 0:
+                result.append(t)
+            elif t.device == device:
+                result.append(t)
+            else:
+                result.append(t.to(device))
+        return result
+    
+    def _check_device(self, device: torch.device, *tensors: torch.Tensor) -> bool:
+        """Check if all non-empty tensors are already on the target device."""
+        return all(t.device == device or t.numel() == 0 for t in tensors)
+
+
+class GPTQWeight(_OfflineQuantizedWeight):
     """GPTQ offline quantized weight (W4A16 or similar)."""
     
     def __init__(
@@ -250,12 +252,11 @@ class GPTQWeight(QuantizedWeight):
         
         try:
             from vllm import _custom_ops as ops
-        except Exception as e:
+        except ImportError as e:
             raise RuntimeError(
                 "GPTQ requires vLLM CUDA custom ops but they are not available."
             ) from e
         
-        # Ensure all weights are on CUDA device
         target_device = torch.device("cuda") if self.qweight.device.type == "cpu" else self.qweight.device
         self.qweight = self.qweight.to(target_device)
         self.qzeros = self.qzeros.to(target_device)
@@ -278,9 +279,7 @@ class GPTQWeight(QuantizedWeight):
     ) -> torch.Tensor:
         self.prepare()
         return strategy.linear_forward(
-            x,
-            self,
-            bias,
+            x, self, bias,
             quant_kind=quant_kind,
             gptq_qweight=self.qweight,
             gptq_qzeros=self.qzeros,
@@ -293,21 +292,13 @@ class GPTQWeight(QuantizedWeight):
         )
     
     def to(self, device: torch.device) -> QuantizedWeight:
-        if self.qweight.device == device:
+        if self._check_device(device, self.qweight, self.qzeros, self.scales, self.g_idx):
             return self
-        return GPTQWeight(
-            self.qweight.to(device),
-            self.qzeros.to(device),
-            self.scales.to(device),
-            self.g_idx.to(device) if self.g_idx.numel() > 0 else self.g_idx,
-            self.bits,
-            self.group_size,
-            self._out_features,
-            self._in_features,
-        )
+        qw, qz, sc, gi = self._move_tensors(device, self.qweight, self.qzeros, self.scales, self.g_idx)
+        return GPTQWeight(qw, qz, sc, gi, self.bits, self.group_size, self._out_features, self._in_features)
 
 
-class AWQWeight(QuantizedWeight):
+class AWQWeight(_OfflineQuantizedWeight):
     """AWQ offline quantized weight (W4A16)."""
     
     def __init__(
@@ -349,9 +340,7 @@ class AWQWeight(QuantizedWeight):
         quant_kind: str = "other",
     ) -> torch.Tensor:
         return strategy.linear_forward(
-            x,
-            self,
-            bias,
+            x, self, bias,
             quant_kind=quant_kind,
             awq_qweight=self.qweight,
             awq_qzeros=self.qzeros,
@@ -363,20 +352,13 @@ class AWQWeight(QuantizedWeight):
         )
     
     def to(self, device: torch.device) -> QuantizedWeight:
-        if self.qweight.device == device:
+        if self._check_device(device, self.qweight, self.qzeros, self.scales):
             return self
-        return AWQWeight(
-            self.qweight.to(device),
-            self.qzeros.to(device),
-            self.scales.to(device),
-            self.group_size,
-            self._out_features,
-            self._in_features,
-            self.bits,
-        )
+        qw, qz, sc = self._move_tensors(device, self.qweight, self.qzeros, self.scales)
+        return AWQWeight(qw, qz, sc, self.group_size, self._out_features, self._in_features, self.bits)
 
 
-class GPTQMarlinWeight(QuantizedWeight):
+class GPTQMarlinWeight(_OfflineQuantizedWeight):
     """GPTQ Marlin repacked weight."""
     
     def __init__(
@@ -423,9 +405,7 @@ class GPTQMarlinWeight(QuantizedWeight):
         quant_kind: str = "other",
     ) -> torch.Tensor:
         return strategy.linear_forward(
-            x,
-            self,
-            bias,
+            x, self, bias,
             quant_kind=quant_kind,
             qweight=self.qweight,
             scales=self.scales,
@@ -440,23 +420,19 @@ class GPTQMarlinWeight(QuantizedWeight):
         )
     
     def to(self, device: torch.device) -> QuantizedWeight:
-        if self.qweight.device == device:
+        if self._check_device(device, self.qweight, self.scales, self.workspace):
             return self
+        qw, sc, zp, gi, gisi, ws = self._move_tensors(
+            device, self.qweight, self.scales, self.zp, self.g_idx, 
+            self.g_idx_sort_indices, self.workspace
+        )
         return GPTQMarlinWeight(
-            self.qweight.to(device),
-            self.scales.to(device),
-            self.zp.to(device) if self.zp.numel() > 0 else self.zp,
-            self.g_idx.to(device) if self.g_idx.numel() > 0 else self.g_idx,
-            self.g_idx_sort_indices.to(device) if self.g_idx_sort_indices.numel() > 0 else self.g_idx_sort_indices,
-            self.workspace.to(device),
-            self.bits,
-            self.group_size,
-            self._out_features,
-            self._in_features,
+            qw, sc, zp, gi, gisi, ws,
+            self.bits, self.group_size, self._out_features, self._in_features
         )
 
 
-class AWQMarlinWeight(QuantizedWeight):
+class AWQMarlinWeight(_OfflineQuantizedWeight):
     """AWQ Marlin repacked weight."""
     
     def __init__(
@@ -499,9 +475,7 @@ class AWQMarlinWeight(QuantizedWeight):
         quant_kind: str = "other",
     ) -> torch.Tensor:
         return strategy.linear_forward(
-            x,
-            self,
-            bias,
+            x, self, bias,
             quant_kind=quant_kind,
             qweight=self.qweight,
             scales=self.scales,
@@ -513,15 +487,7 @@ class AWQMarlinWeight(QuantizedWeight):
         )
     
     def to(self, device: torch.device) -> QuantizedWeight:
-        if self.qweight.device == device:
+        if self._check_device(device, self.qweight, self.scales, self.zp, self.workspace):
             return self
-        return AWQMarlinWeight(
-            self.qweight.to(device),
-            self.scales.to(device),
-            self.zp.to(device),
-            self.workspace.to(device),
-            self.group_size,
-            self._out_features,
-            self._in_features,
-            self.bits,
-        )
+        qw, sc, zp, ws = self._move_tensors(device, self.qweight, self.scales, self.zp, self.workspace)
+        return AWQMarlinWeight(qw, sc, zp, ws, self.group_size, self._out_features, self._in_features, self.bits)
