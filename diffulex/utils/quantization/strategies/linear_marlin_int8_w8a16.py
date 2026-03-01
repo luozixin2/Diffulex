@@ -213,6 +213,14 @@ class LinearMarlinInt8W8A16Strategy(LinearQuantizationStrategy):
         s_1d = s_reorder_1xn.reshape(-1).to(dtype=torch.bfloat16)
         return q_reorder.contiguous(), s_1d.contiguous()
 
+    def quantize_weight(
+        self,
+        weight: torch.Tensor,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize weight for W8A16 (compatible interface for WeightContainerFactory)."""
+        return self.quantize_weight_for_kernel(weight, **kwargs)
+
     def quantize_act_for_kernel(
         self,
         x: torch.Tensor,
@@ -278,7 +286,12 @@ class LinearMarlinInt8W8A16Strategy(LinearQuantizationStrategy):
             x2 = x2.contiguous()
 
         # Load-time quantized module path: weight is uint8/int8 buffer and scales provided.
-        if weight is not None and weight.dtype in (torch.uint8, torch.int8):
+        # Handle W8A16Weight container (from load-time quantization)
+        if hasattr(weight, 'qweight') and hasattr(weight, 'scales'):
+            # weight is a W8A16Weight container
+            qweight = weight.qweight
+            scales = weight.scales
+        elif weight is not None and getattr(weight, 'dtype', None) in (torch.uint8, torch.int8):
             if quant_scales is None:
                 raise ValueError("quant_scales is required when weight is quantized")
             qweight = weight

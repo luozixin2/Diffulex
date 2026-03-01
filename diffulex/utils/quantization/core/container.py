@@ -38,6 +38,7 @@ class QuantizedWeight(ABC):
         x: torch.Tensor,
         bias: Optional[torch.Tensor],
         strategy: Any,  # LinearQuantizationProtocol
+        quant_kind: str = "other",
     ) -> torch.Tensor:
         """Execute forward pass using the provided strategy."""
         pass
@@ -75,7 +76,9 @@ class BF16Weight(QuantizedWeight):
         x: torch.Tensor,
         bias: Optional[torch.Tensor],
         strategy: Any,
+        quant_kind: str = "other",
     ) -> torch.Tensor:
+        _ = strategy, quant_kind
         return F.linear(x, self.weight, bias)
     
     def to(self, device: torch.device) -> QuantizedWeight:
@@ -128,11 +131,13 @@ class W8A16Weight(QuantizedWeight):
         x: torch.Tensor,
         bias: Optional[torch.Tensor],
         strategy: Any,
+        quant_kind: str = "other",
     ) -> torch.Tensor:
         return strategy.linear_forward(
             x,
             self,
             bias,
+            quant_kind=quant_kind,
             quant_scales=self.scales,
             out_features=self.out_features,
         )
@@ -181,11 +186,13 @@ class W8A8Weight(QuantizedWeight):
         x: torch.Tensor,
         bias: Optional[torch.Tensor],
         strategy: Any,
+        quant_kind: str = "other",
     ) -> torch.Tensor:
         return strategy.linear_forward(
             x,
             self,
             bias,
+            quant_kind=quant_kind,
             quant_scales=self.scales,
             out_features=self.out_features,
         )
@@ -248,10 +255,16 @@ class GPTQWeight(QuantizedWeight):
                 "GPTQ requires vLLM CUDA custom ops but they are not available."
             ) from e
         
+        # Ensure all weights are on CUDA device
+        target_device = torch.device("cuda") if self.qweight.device.type == "cpu" else self.qweight.device
+        self.qweight = self.qweight.to(target_device)
+        self.qzeros = self.qzeros.to(target_device)
+        self.scales = self.scales.to(target_device)
+        
         if self.g_idx.numel() == 0:
-            g_idx = torch.empty((0,), device=self.qweight.device, dtype=torch.int)
+            g_idx = torch.empty((0,), device=target_device, dtype=torch.int)
         else:
-            g_idx = self.g_idx.to(dtype=torch.int)
+            g_idx = self.g_idx.to(device=target_device, dtype=torch.int)
         
         ops.gptq_shuffle(self.qweight, g_idx, self.bits)
         self._is_prepared = True
@@ -261,12 +274,14 @@ class GPTQWeight(QuantizedWeight):
         x: torch.Tensor,
         bias: Optional[torch.Tensor],
         strategy: Any,
+        quant_kind: str = "other",
     ) -> torch.Tensor:
         self.prepare()
         return strategy.linear_forward(
             x,
             self,
             bias,
+            quant_kind=quant_kind,
             gptq_qweight=self.qweight,
             gptq_qzeros=self.qzeros,
             gptq_scales=self.scales,
@@ -331,11 +346,13 @@ class AWQWeight(QuantizedWeight):
         x: torch.Tensor,
         bias: Optional[torch.Tensor],
         strategy: Any,
+        quant_kind: str = "other",
     ) -> torch.Tensor:
         return strategy.linear_forward(
             x,
             self,
             bias,
+            quant_kind=quant_kind,
             awq_qweight=self.qweight,
             awq_qzeros=self.qzeros,
             awq_scales=self.scales,
@@ -403,11 +420,13 @@ class GPTQMarlinWeight(QuantizedWeight):
         x: torch.Tensor,
         bias: Optional[torch.Tensor],
         strategy: Any,
+        quant_kind: str = "other",
     ) -> torch.Tensor:
         return strategy.linear_forward(
             x,
             self,
             bias,
+            quant_kind=quant_kind,
             qweight=self.qweight,
             scales=self.scales,
             zp=self.zp,
@@ -477,11 +496,13 @@ class AWQMarlinWeight(QuantizedWeight):
         x: torch.Tensor,
         bias: Optional[torch.Tensor],
         strategy: Any,
+        quant_kind: str = "other",
     ) -> torch.Tensor:
         return strategy.linear_forward(
             x,
             self,
             bias,
+            quant_kind=quant_kind,
             qweight=self.qweight,
             scales=self.scales,
             zp=self.zp,

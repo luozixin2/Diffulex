@@ -79,6 +79,11 @@ class LinearFP8W8A8Strategy(LinearQuantizationStrategy):
         scale = scale.to(torch.float32).reshape(1).contiguous()
         return q_kn_fp8, {"scales": scale, "fp8_dtype": current_platform.fp8_dtype()}
 
+    def quantize_weight(self, weight: torch.Tensor, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        """Alias for quantize_weight_for_kernel for WeightContainerFactory compatibility."""
+        device = kwargs.get('device', None)
+        return self.quantize_weight_for_kernel(weight, device=device)
+
     def quantize_weight_for_kernel(
         self,
         weight: torch.Tensor,
@@ -106,17 +111,22 @@ class LinearFP8W8A8Strategy(LinearQuantizationStrategy):
         **kwargs: Any,
     ) -> torch.Tensor:
         _ = quant_kind
-        wid = id(weight)
-        cached = self._weight_cache.get(wid)
-        if cached is None or cached[0].device != x.device:
-            q_fp8, meta = self.quantize(weight)
-            q_fp8 = q_fp8.to(device=x.device)
-            w_scale = meta["scales"].to(device=x.device, dtype=torch.float32).reshape(1)
-            self._weight_cache[wid] = (q_fp8, w_scale)
+        # Handle W8A8Weight container (from load-time quantization)
+        if hasattr(weight, 'qweight') and hasattr(weight, 'scales'):
+            # weight is a W8A8Weight container with FP8 quantized weights
+            q_kn = weight.qweight
+            w_scale = weight.scales
         else:
-            q_fp8, w_scale = cached
-
-        q_kn = q_fp8
+            wid = id(weight)
+            cached = self._weight_cache.get(wid)
+            if cached is None or cached[0].device != x.device:
+                q_fp8, meta = self.quantize(weight)
+                q_fp8 = q_fp8.to(device=x.device)
+                w_scale = meta["scales"].to(device=x.device, dtype=torch.float32).reshape(1)
+                self._weight_cache[wid] = (q_fp8, w_scale)
+            else:
+                q_fp8, w_scale = cached
+            q_kn = q_fp8
 
         return self._fp8_linear.apply(
             input=x,

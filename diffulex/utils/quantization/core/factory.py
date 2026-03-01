@@ -283,15 +283,24 @@ class WeightContainerFactory:
         target_device = device or weight.device
         weight = weight.to(target_device)
         
-        weight_format = strategy.weight_format
+        weight_format = getattr(strategy, 'linear_weight_format', None) or getattr(strategy, 'weight_format', None)
         
-        if weight_format == WeightFormat.BF16:
+        if weight_format == WeightFormat.BF16 or weight_format == 'bf16':
             return BF16Weight(weight)
         
-        elif weight_format == WeightFormat.INT8:
+        elif weight_format == WeightFormat.INT8 or weight_format == 'int8':
             qweight, scales = strategy.quantize_weight(weight)
             act_format = getattr(strategy, 'linear_act_format', 'bf16')
             if act_format == 'int8':
+                return W8A8Weight(qweight, scales, weight.shape)
+            else:
+                return W8A16Weight(qweight, scales, weight.shape)
+        
+        elif weight_format in ('fp8_e4m3', 'fp8_e5m2'):
+            # FP8 quantization
+            qweight, scales = strategy.quantize_weight(weight)
+            act_format = getattr(strategy, 'linear_act_format', 'bf16')
+            if act_format in ('fp8_e4m3', 'fp8_e5m2'):
                 return W8A8Weight(qweight, scales, weight.shape)
             else:
                 return W8A16Weight(qweight, scales, weight.shape)
@@ -322,11 +331,12 @@ class WeightContainerFactory:
             qweight = qweight.to(target_device)
         if scales.device != target_device:
             scales = scales.to(target_device)
-        if zp.device != target_device and zp.numel() > 0:
+        # Note: Empty tensors also need to be on the correct device for vLLM kernels
+        if zp.device != target_device:
             zp = zp.to(target_device)
-        if g_idx.device != target_device and g_idx.numel() > 0:
+        if g_idx.device != target_device:
             g_idx = g_idx.to(target_device)
-        if g_idx_sort_indices.device != target_device and g_idx_sort_indices.numel() > 0:
+        if g_idx_sort_indices.device != target_device:
             g_idx_sort_indices = g_idx_sort_indices.to(target_device)
         if workspace.device != target_device:
             workspace = workspace.to(target_device)

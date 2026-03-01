@@ -56,6 +56,17 @@ class QuantizationConfig:
         linear_mlp_weight_dtype = getattr(config, "linear_mlp_weight_dtype", "bf16") or "bf16"
         linear_attn_act_dtype = getattr(config, "linear_attn_act_dtype", "bf16") or "bf16"
         linear_mlp_act_dtype = getattr(config, "linear_mlp_act_dtype", "bf16") or "bf16"
+        
+        # Handle offline quantization flags
+        load_gptq = getattr(config, "load_gptq", False)
+        load_awq = getattr(config, "load_awq", False)
+        if load_gptq:
+            linear_attn_weight_dtype = "gptq"
+            linear_mlp_weight_dtype = "gptq"
+        elif load_awq:
+            linear_attn_weight_dtype = "awq"
+            linear_mlp_weight_dtype = "awq"
+        
         return cls(
             kv_cache=KVCacheQuantConfig(dtype=kv_cache_dtype),
             weights=WeightQuantConfig(

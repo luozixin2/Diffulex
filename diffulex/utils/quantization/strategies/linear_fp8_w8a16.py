@@ -84,6 +84,11 @@ class LinearFP8W8A16Strategy(LinearQuantizationStrategy):
         scale = scale.to(torch.float32).reshape(1).contiguous()
         return q_kn_fp8, {"scales": scale, "fp8_dtype": current_platform.fp8_dtype()}
 
+    def quantize_weight(self, weight: torch.Tensor, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        """Alias for quantize_weight_for_kernel for WeightContainerFactory compatibility."""
+        device = kwargs.get('device', None)
+        return self.quantize_weight_for_kernel(weight, device=device)
+
     def quantize_weight_for_kernel(
         self,
         weight: torch.Tensor,
@@ -112,7 +117,12 @@ class LinearFP8W8A16Strategy(LinearQuantizationStrategy):
         out_features: Optional[int] = None,
     ) -> torch.Tensor:
         _ = quant_kind, out_features
-        if weight is not None and quant_scales is not None:
+        # Handle W8A16Weight container (from load-time quantization)
+        if hasattr(weight, 'qweight') and hasattr(weight, 'scales'):
+            # weight is a W8A16Weight container with FP8 quantized weights
+            q_kn = weight.qweight.to(device=x.device)
+            scales = weight.scales.to(device=x.device, dtype=torch.float32).reshape(1)
+        elif weight is not None and quant_scales is not None:
             # Expected: weight is fp8 K×N tensor (transpose-view is fine).
             q_kn = weight.to(device=x.device)
             scales = quant_scales.to(device=x.device, dtype=torch.float32).reshape(1)

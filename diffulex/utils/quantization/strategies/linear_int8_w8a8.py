@@ -75,6 +75,11 @@ class LinearInt8W8A8Strategy(LinearQuantizationStrategy):
         scale_b = scales.unsqueeze(0).contiguous()  # [1,N]
         return q_kn, {"scales": scale_b}
 
+    def quantize_weight(self, weight: torch.Tensor, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        """Alias for quantize_weight_for_kernel for WeightContainerFactory compatibility."""
+        device = kwargs.get('device', None)
+        return self.quantize_weight_for_kernel(weight, device=device)
+
     def quantize_weight_for_kernel(
         self,
         weight: torch.Tensor,
@@ -113,7 +118,12 @@ class LinearInt8W8A8Strategy(LinearQuantizationStrategy):
             raise RuntimeError("vLLM custom ops are required for W8A8 (scaled_int8_quant / cutlass_scaled_mm).")
 
         # Weight/scales: prefer load-time quantized buffers.
-        if weight is not None and weight.dtype == torch.int8 and quant_scales is not None:
+        # Handle W8A8Weight container (from load-time quantization)
+        if hasattr(weight, 'qweight') and hasattr(weight, 'scales'):
+            # weight is a W8A8Weight container
+            qweight = weight.qweight
+            w_scales = weight.scales
+        elif weight is not None and getattr(weight, 'dtype', None) == torch.int8 and quant_scales is not None:
             qweight = weight
             w_scales = quant_scales
         else:
