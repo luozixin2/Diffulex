@@ -59,3 +59,4 @@ class KVCacheBF16Strategy(KVCacheQuantizationStrategy):
 def _build_kv_cache_bf16() -> KVCacheBF16Strategy:
     return KVCacheBF16Strategy()
 
+

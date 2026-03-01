@@ -250,3 +250,4 @@ def _build_kv_cache_fp8_e4m3() -> KVCacheFP8RunningMaxStrategy:
 def _build_kv_cache_fp8_e5m2() -> KVCacheFP8RunningMaxStrategy:
     return KVCacheFP8RunningMaxStrategy("fp8_e5m2")
 
+

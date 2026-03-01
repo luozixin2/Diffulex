@@ -75,3 +75,4 @@ class LinearInt4W4A8Strategy(LinearQuantizationStrategy):
         # Correctness-first: reuse W4A16 implementation.
         return self._w4a16.linear_forward(x, weight, bias, quant_kind="other", **kwargs)
 
+

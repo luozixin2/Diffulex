@@ -155,3 +155,4 @@ class LinearInt4W4A16Strategy(LinearQuantizationStrategy):
         w_deq = self.dequantize(packed, {"scales": scales}, original_in_features=original_k)
         return F.linear(x, w_deq, bias)
 
+
