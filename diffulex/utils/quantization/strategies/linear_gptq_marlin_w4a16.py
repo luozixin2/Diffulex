@@ -202,3 +202,4 @@ class LinearGPTQMarlinW4A16Strategy(LinearQuantizationStrategy):
         )
         return out.reshape(out_shape)
 
+

@@ -128,3 +128,4 @@ class D2FScheduler(SchedulerBase):
                 n_diff_steps[seq.seq_id] = seq.n_steps
             seq.post_process()
         return n_diff_steps
+

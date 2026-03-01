@@ -68,3 +68,4 @@ class LLaDASamplerForDiffusionLM(SamplerNoShiftLogits):
             sampled_tokens_map=sampled_tokens_map
         )
 
+

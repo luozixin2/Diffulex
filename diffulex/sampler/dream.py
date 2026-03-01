@@ -73,3 +73,4 @@ class DreamSamplerForDiffusionLM(SamplerShiftLogits):
             sampled_tokens_map=sampled_tokens_map
         )
 
+

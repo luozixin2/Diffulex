@@ -164,3 +164,4 @@ class LinearAWQMarlinW4A16Strategy(LinearQuantizationStrategy):
         out = out.reshape(out_shape)
         return out.to(dtype=x.dtype) if out.dtype != x.dtype else out
 
+
