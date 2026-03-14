@@ -108,6 +108,7 @@ class SchedulerMultiBlockMixin:
             for block_id, accepted_ids in accepted_ids_map.items():
                 if not accepted_ids:
                     continue
+
                 dllm_block = req.dllm_blocks[int(block_id)]
                 sampled_tokens = sampled_tokens_map.get(block_id, [])
                 true_local_ids = true_ids_map.get(block_id, [])
