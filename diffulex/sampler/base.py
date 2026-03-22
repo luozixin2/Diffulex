@@ -182,7 +182,9 @@ class DllmSamplerNoShiftBase(SamplerNoShiftLogits):
                 if attn_metadata.is_prefill[idx]:
                     mask_token_logits = req_logits[block.mask_token_global_ids, ...]
                 else:
-                    mask_token_logits = req_logits[block.mask_token_relative_ids, ...]
+                    buf_offset = block.start - req.dllm_block_buffer.first_running_block.start
+                    buf_ids = [buf_offset + i for i in block.mask_token_relative_ids]
+                    mask_token_logits = req_logits[buf_ids, ...]
 
                 confidence, sampled_tokens, initial_confidence = self.sample_tokens(
                     mask_token_logits,
@@ -268,7 +270,9 @@ class DllmSamplerShiftBase(SamplerShiftLogits):
                 if attn_metadata.is_prefill[idx]:
                     mask_token_logits = shifted_logits[block.mask_token_global_ids, ...]
                 else:
-                    mask_token_logits = shifted_logits[block.mask_token_relative_ids, ...]
+                    buf_offset = block.start - req.dllm_block_buffer.first_running_block.start
+                    buf_ids = [buf_offset + i for i in block.mask_token_relative_ids]
+                    mask_token_logits = shifted_logits[buf_ids, ...]
 
                 confidence, sampled_tokens, initial_confidence = self.sample_tokens(
                     mask_token_logits,
