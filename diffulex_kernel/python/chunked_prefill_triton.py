@@ -5,15 +5,14 @@ import triton.language as tl
 from diffulex.attention.metadata import AttnMetaDataBase
 from diffulex_kernel.python.auto_tuner import build_chunked_prefill_configs
 
-
 # NOTE: While doing test, comment auto-tuner to avoid slowing down the test.
-# @triton.autotune(
-#     configs=[
-#         triton.Config(c, num_warps=c.pop("num_warps"), num_stages=c.pop("num_stages"))
-#         for c in build_chunked_prefill_configs()
-#     ],
-#     key=["NUM_GROUPS", "HEAD_DIM", "IS_BLOCK_CAUSAL", "IS_PREFIX_FULL"],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config(c, num_warps=c.pop("num_warps"), num_stages=c.pop("num_stages"))
+        for c in build_chunked_prefill_configs()
+    ],
+    key=["NUM_GROUPS", "HEAD_DIM", "IS_BLOCK_CAUSAL", "IS_PREFIX_FULL"],
+)
 @triton.jit
 def _chunked_prefill_attn_unified_kernel(
     q_ptr,
