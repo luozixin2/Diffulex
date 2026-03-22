@@ -31,7 +31,7 @@ engine:
   buffer_size: 4
 
 eval:
-  dataset_name: "gsm8k"
+  dataset_name: "gsm8k_diffulex"
   dataset_split: "test"
   dataset_limit: null
   temperature: 0.0

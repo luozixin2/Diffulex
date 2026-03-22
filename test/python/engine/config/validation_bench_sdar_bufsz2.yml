@@ -1,5 +1,5 @@
 engine:
-  model_path: "/data1/ckpts/JetLM/SDAR-1.7B-Chat-b32"
+  model_path: "/root/data/ckpts/JetLM/SDAR-1.7B-Chat-b32"
   tokenizer_path: null
   model_name: "sdar"
   decoding_strategy: "multi_bd"

@@ -4,7 +4,10 @@ Benchmark Main Entry - Main entry point for benchmark using lm-evaluation-harnes
 
 import sys
 import logging
+import os
+import time
 from pathlib import Path
+from typing import Optional
 
 from diffulex_bench.config import BenchmarkConfig, EngineConfig, EvalConfig
 from diffulex.logger import setup_logger, get_logger
@@ -16,18 +19,20 @@ except ImportError:
     cli_evaluate = None
 
 
-def config_to_model_args(config: BenchmarkConfig) -> str:
+def config_to_model_args(config: BenchmarkConfig, *, result_output_dir: Optional[str] = None) -> str:
     """
     Convert BenchmarkConfig to lm_eval model_args string format
 
     Args:
         config: Benchmark configuration
+        result_output_dir: If set, used as model save_dir (trajectory/stats); else eval.output_dir
 
     Returns:
         Model arguments string in key=value format
     """
     engine = config.engine
     eval_config = config.eval
+    save_dir = result_output_dir if result_output_dir is not None else eval_config.output_dir
 
     args_dict = {
         "pretrained": engine.model_path,
@@ -65,32 +70,54 @@ def config_to_model_args(config: BenchmarkConfig) -> str:
     if engine.use_lora and engine.lora_path:
         args_dict["lora_path"] = engine.lora_path
 
-    if eval_config.save_results and eval_config.output_dir:
-        args_dict["save_dir"] = eval_config.output_dir
+    if save_dir and (eval_config.save_results or engine.save_kv_mapping_trace):
+        args_dict["save_dir"] = save_dir
 
     if eval_config.add_bos_token is not None:
         args_dict["add_bos_token"] = eval_config.add_bos_token
+
+    args_dict["save_kv_mapping_trace"] = bool(engine.save_kv_mapping_trace)
 
     # Convert to string format: key1=value1,key2=value2
     args_list = [f"{k}={v}" for k, v in args_dict.items()]
     return ",".join(args_list)
 
 
-def dataset_name_to_tasks(dataset_name: str) -> str:
+def _resolve_lm_eval_include_path(config: BenchmarkConfig) -> Optional[Path]:
     """
-    Convert dataset name to lm_eval task name
-
-    Args:
-        dataset_name: Dataset name (e.g., "gsm8k", "humaneval")
-
-    Returns:
-        lm_eval task name
+    lm-eval TaskManager include_path for bundled Lightning JSON tasks.
+    None → diffulex_bench/tasks (sibling of this file). Empty string → disabled.
     """
-    mapping = {
-        "gsm8k": "gsm8k",
-        "humaneval": "humaneval",
-    }
-    return mapping.get(dataset_name, dataset_name)
+    raw = config.eval.include_path
+    if raw is not None and str(raw).strip() == "":
+        return None
+    if raw:
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            p = Path(os.getcwd()) / p
+        return p.resolve()
+    return (Path(__file__).resolve().parent / "tasks").resolve()
+
+
+def _sanitize_for_dir(name: str, max_len: int = 96) -> str:
+    s = "".join(c if c.isalnum() or c in "._-" else "_" for c in name.strip())
+    return s[:max_len] if s else "run"
+
+
+def resolve_run_output_dir(config: BenchmarkConfig) -> str:
+    """
+    Root directory for this benchmark invocation: either output_dir or
+    output_dir/run_<timestamp>_<task>/ when use_run_subdirectory is True.
+    """
+    base = Path(config.eval.output_dir).expanduser()
+    if not config.eval.use_run_subdirectory:
+        base.mkdir(parents=True, exist_ok=True)
+        return str(base.resolve())
+    task_part = _sanitize_for_dir(config.eval.dataset_name.replace(",", "+"))
+    run_name = f"run_{time.strftime('%Y%m%d_%H%M%S')}_{task_part}"
+    run_path = (base / run_name).resolve()
+    run_path.mkdir(parents=True, exist_ok=True)
+    return str(run_path)
 
 
 def run_benchmark(config: BenchmarkConfig) -> None:
@@ -114,14 +141,16 @@ def run_benchmark(config: BenchmarkConfig) -> None:
         f"Model Name: {config.engine.model_name}",
         f"Decoding Strategy: {config.engine.decoding_strategy}",
         f"Tasks: {config.eval.dataset_name}",
-        f"Output Directory: {config.eval.output_dir}",
+        f"Output base directory: {config.eval.output_dir}",
         "=" * 80,
     ]
+    run_output_dir = resolve_run_output_dir(config)
+    benchmark_info.insert(-1, f"This run directory: {run_output_dir}")
     logger.info("\n".join(benchmark_info))
 
-    # Convert config to lm_eval arguments
-    model_args = config_to_model_args(config)
-    tasks = dataset_name_to_tasks(config.eval.dataset_name)
+    # Convert config to lm_eval arguments (stats + trajectory share run_output_dir with lm-eval)
+    model_args = config_to_model_args(config, result_output_dir=run_output_dir)
+    tasks = config.eval.dataset_name
 
     # Prepare sys.argv for lm_eval
     original_argv = sys.argv.copy()
@@ -138,8 +167,12 @@ def run_benchmark(config: BenchmarkConfig) -> None:
         "--batch_size",
         "1",
         "--output_path",
-        config.eval.output_dir,
+        run_output_dir,
     ]
+
+    inc = _resolve_lm_eval_include_path(config)
+    if inc is not None and inc.is_dir():
+        sys.argv.extend(["--include_path", str(inc)])
 
     if config.eval.dataset_limit:
         sys.argv.extend(["--limit", str(config.eval.dataset_limit)])
@@ -229,6 +262,10 @@ def load_config_from_args(args) -> BenchmarkConfig:
             config.eval.temperature = args.temperature
         if args.output_dir:
             config.eval.output_dir = args.output_dir
+        if getattr(args, "include_path", None) is not None:
+            config.eval.include_path = args.include_path
+        if getattr(args, "use_run_subdirectory", None) is not None:
+            config.eval.use_run_subdirectory = bool(args.use_run_subdirectory)
 
         # Engine overrides (make bench configs reusable for eager vs CUDA Graph comparisons)
         if getattr(args, "enforce_eager", None) is not None:
@@ -245,6 +282,8 @@ def load_config_from_args(args) -> BenchmarkConfig:
             config.engine.buffer_size = args.buffer_size
         if getattr(args, "block_size", None) is not None:
             config.engine.block_size = args.block_size
+        if getattr(args, "save_kv_mapping_trace", None) is not None:
+            config.engine.save_kv_mapping_trace = bool(args.save_kv_mapping_trace)
     else:
         if not args.model_path:
             logger.error("Either --config or --model-path must be provided")
@@ -275,6 +314,7 @@ def load_config_from_args(args) -> BenchmarkConfig:
             block_size=(args.block_size if getattr(args, "block_size", None) is not None else 32),
             buffer_size=getattr(args, "buffer_size", 4),
             enforce_eager=args.enforce_eager if hasattr(args, "enforce_eager") else False,
+            save_kv_mapping_trace=bool(getattr(args, "save_kv_mapping_trace", False)),
         )
 
         eval_config = EvalConfig(
@@ -285,7 +325,13 @@ def load_config_from_args(args) -> BenchmarkConfig:
             max_tokens=args.max_tokens,
             ignore_eos=getattr(args, "ignore_eos", False),
             output_dir=args.output_dir,
+            use_run_subdirectory=(
+                bool(args.use_run_subdirectory)
+                if getattr(args, "use_run_subdirectory", None) is not None
+                else True
+            ),
             save_results=args.save_results,
+            include_path=getattr(args, "include_path", None),
         )
 
         config = BenchmarkConfig(engine=engine, eval=eval_config)

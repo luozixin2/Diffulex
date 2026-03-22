@@ -3,6 +3,8 @@ LM Eval Model - Diffulex integration with lm-evaluation-harness
 """
 
 import logging
+import os
+import re
 import time
 import json
 from typing import List, Optional, Tuple, Type, TypeVar, Union
@@ -19,6 +21,46 @@ from diffulex.logger import get_logger
 
 T = TypeVar("T", bound="LM")
 eval_logger = logging.getLogger(__name__)
+
+
+def _compact_numeric_arrays_in_json(json_str: str) -> str:
+    """Collapse whitespace inside numeric JSON arrays (same idea as multi_bd/eval/main.py)."""
+    return re.sub(
+        r"\[\s*([\d\.\,\-\+eE\s]+?)\s*\]",
+        lambda m: "[" + m.group(1).replace("\n", "").replace(" ", "") + "]",
+        json_str,
+    )
+
+
+def _normalize_until_terms(until: object) -> list[str]:
+    if until is None:
+        return []
+    if isinstance(until, str):
+        return [until] if until else []
+    if isinstance(until, (list, tuple)):
+        return [str(x) for x in until if x is not None and str(x) != ""]
+    return []
+
+
+def _strip_at_until_terms(response: str, until_terms: list[str]) -> str:
+    """Align with multi_bd ``postprocess_generate_until`` when escape_until is False."""
+    out = response
+    for term in until_terms:
+        if term:
+            out = out.split(term)[0]
+    return out
+
+
+def _coerce_bool(v: Union[bool, str, int, None], default: bool = False) -> bool:
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
 
 
 @register_model("diffulex")
@@ -59,6 +101,7 @@ class DiffulexLM(LM):
         block_size: Optional[int] = 32,
         buffer_size: Optional[int] = 4,
         save_dir: Optional[str] = None,
+        save_kv_mapping_trace: Union[bool, str, int, None] = False,
         wait_ready: Optional[bool] = True,
         **kwargs,
     ) -> None:
@@ -80,6 +123,12 @@ class DiffulexLM(LM):
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.save_dir = save_dir
+        self.save_kv_mapping_trace = _coerce_bool(save_kv_mapping_trace, False)
+        self._trajectory_batches: List[dict] = []
+        # Cumulative per-eval-run, same layout as multi_bd/eval (rank-0 JSON lists).
+        self._responses_full: List[str] = []
+        self._responses_truncated: List[str] = []
+        self._responses_extracted: List[str] = []
 
         # Diffulex-specific parameters
         self.model_name = model_name
@@ -120,6 +169,7 @@ class DiffulexLM(LM):
             decoding_threshold=decoding_threshold,
             block_size=block_size,
             buffer_size=buffer_size,
+            save_kv_mapping_trace=self.save_kv_mapping_trace,
         )
 
         self.tokenizer = self.runner.tokenizer
@@ -222,10 +272,12 @@ class DiffulexLM(LM):
 
         # Run generation
         start_time = time.time()
+        traj_batches = self._trajectory_batches if self.save_kv_mapping_trace else None
         outputs = self.runner.generate(
             prompts,
             self.sampling_params,
             use_tqdm=not disable_tqdm,
+            trajectory_batches=traj_batches,
         )
         end_time = time.time()
 
@@ -236,9 +288,22 @@ class DiffulexLM(LM):
         num_tokens = 0
         num_nfe = 0
 
-        for output in outputs:
-            text = output.get("text", "")
-            results.append(text)
+        for i, output in enumerate(outputs):
+            gen_kw = gen_args[i] if i < len(gen_args) else {}
+            if isinstance(gen_kw, dict):
+                until_raw = gen_kw.get("until")
+            else:
+                until_raw = getattr(gen_kw, "until", None)
+            until = _normalize_until_terms(until_raw)
+
+            trunc = output.get("text", "") or ""
+            full = output.get("full_text") or trunc
+            extracted = _strip_at_until_terms(trunc, until)
+
+            self._responses_full.append(full)
+            self._responses_truncated.append(trunc)
+            self._responses_extracted.append(extracted)
+            results.append(extracted)
 
             token_ids = output.get("token_ids", [])
             n_diff_steps = output.get("n_diff_steps", 0)
@@ -279,8 +344,6 @@ class DiffulexLM(LM):
 
     def _save_statistics(self):
         """Save statistics to file"""
-        import os
-
         os.makedirs(self.save_dir, exist_ok=True)
 
         stats = {
@@ -303,6 +366,30 @@ class DiffulexLM(LM):
             json.dump(stats, f, indent=2, ensure_ascii=False)
 
         self.logger.info(f"Statistics saved to {stats_path}")
+
+        if self.save_dir and self._responses_truncated:
+            for fname, rows in (
+                ("0x0_full_responses.json", self._responses_full),
+                ("0x1_truncated_responses.json", self._responses_truncated),
+                ("0x2_extracted_responses.json", self._responses_extracted),
+            ):
+                resp_path = os.path.join(self.save_dir, fname)
+                with open(resp_path, "w", encoding="utf-8") as f:
+                    json.dump(rows, f, indent=2, ensure_ascii=False)
+                self.logger.info(f"Responses saved to {resp_path}")
+
+        if self.save_kv_mapping_trace and self._trajectory_batches:
+            traj_path = os.path.join(self.save_dir, "trajectory.json")
+            raw = json.dumps({"batches": self._trajectory_batches}, indent=2, ensure_ascii=False)
+            compact = _compact_numeric_arrays_in_json(raw)
+            with open(traj_path, "w", encoding="utf-8") as f:
+                f.write(compact)
+            self.logger.info(f"Trajectory (KV / block traces) saved to {traj_path}")
+        elif self.save_kv_mapping_trace and not self._trajectory_batches:
+            self.logger.warning(
+                "save_kv_mapping_trace is True but no trajectory batches were recorded "
+                "(e.g. DP mode or trace disabled in engine)."
+            )
 
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
         """

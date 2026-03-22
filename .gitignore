@@ -31,7 +31,6 @@ build/
 cache/
 uv.lock
 ckpt/
-data/
 tilelang
 autotuner.log
 Fast-dLLM

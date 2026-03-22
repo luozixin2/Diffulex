@@ -12,6 +12,7 @@ from diffulex.attention.metadata import (
     reset_warming_up,
 )
 from diffulex.engine.request import DllmReq
+from diffulex.engine.dllm_block import dllm_block_buffer_to_trace_dict, dllm_block_to_trace_dict
 
 if TYPE_CHECKING:
     from diffulex.engine.model_runner import ModelRunnerBase
@@ -96,9 +97,36 @@ class ModelRunnerMultiBlockMixin:
         prefix_lens_list: list[int] = []
         padded_prefix_lens_list: list[int] = []
 
+        trace_kv = self.kv_mapping_trace_active()
         for req in reqs:
             req.step()
             prepared = self._prepare_prefill_req(req) if req.is_prefilling else self._prepare_decode_req(req)
+            if trace_kv:
+                trace = {
+                    "req_id": req.req_id,
+                    "is_prefill": req.is_prefilling,
+                    "page_table": list(req.page_table),
+                    "token_positions": list(prepared["positions"]),
+                    "slot_mapping": list(prepared["slot_mapping"]),
+                    "forward_token_ids": list(prepared["input_ids"]),
+                    "page_size": self.page_size,
+                }
+                buf = getattr(req, "dllm_block_buffer", None)
+                blocks = getattr(req, "dllm_blocks", None)
+                if buf is not None and blocks:
+                    if req.is_prefilling:
+                        trace["dllm_blocks_trace"] = {
+                            "phase": "prefill",
+                            "all_blocks": [dllm_block_to_trace_dict(b) for b in blocks],
+                        }
+                    else:
+                        trace["dllm_blocks_trace"] = {
+                            "phase": "decode",
+                            "buffer": dllm_block_buffer_to_trace_dict(buf),
+                        }
+                req.last_kv_mapping_trace = trace
+            else:
+                req.last_kv_mapping_trace = None
             status_table.append(prepared["status"])
             prefix_lens_list.append(prepared["prefix_len"])
             padded_prefix_lens_list.append(prepared["padded_prefix_len"])

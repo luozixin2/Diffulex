@@ -9,8 +9,8 @@ class AttentionWithValidation(OriginalAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.validation_enabled = True
-        self.atol = 1e-2
-        self.rtol = 1e-2
+        self.atol = 1e-4
+        self.rtol = 1e-4
         self.error_log = []
 
     def forward(self, q, k, v, mask=None):

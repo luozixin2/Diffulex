@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from diffulex.engine.request import DllmReq
 from diffulex.logger import get_logger
@@ -35,8 +35,11 @@ class ReqStep:
     block_size: int
     buffer_bids: list[int]
 
+    # Populated when engine saves KV mapping trace (multi-block prepare); see Config.save_kv_mapping_trace.
+    kv_mapping_trace: dict | None = None
+
     def to_dict(self) -> dict:
-        return dict(
+        d = dict(
             step_id=self.step_id,
             step_time=self.step_time,
             is_prefill=self.is_prefill,
@@ -45,6 +48,9 @@ class ReqStep:
             block_size=self.block_size,
             buffer_bids=self.buffer_bids,
         )
+        if self.kv_mapping_trace is not None:
+            d["kv_mapping_trace"] = self.kv_mapping_trace
+        return d
 
 
 @dataclass
@@ -60,6 +66,9 @@ class ReqTrajectory:
     eos_token_generated: bool
 
     text: str = None
+    # Generation-only tokens including content after EOS (when applicable); see DllmReq.full_response.
+    full_token_ids: list[int] = field(default_factory=list)
+    full_text: str | None = None
 
     def to_dict(self) -> dict:
         return dict(
@@ -154,18 +163,26 @@ class GenerationOutputs:
             if prompt_idx >= len(self.trajectories):
                 continue
             cur_trajectory = self.trajectories[prompt_idx]
+            kv_trace = getattr(req, "last_kv_mapping_trace", None)
+            step_id = len(cur_trajectory.trajectory)
             cur_trajectory.trajectory.append(
                 ReqStep(
-                    step_id=len(cur_trajectory.trajectory) - 1,
+                    step_id=step_id,
                     step_time=step_time,
                     is_prefill=req.is_prefilling,
                     num_generated_tokens=req.new_tokens,
                     running_token_ids=req.running_sequence.copy() if req.running_sequence else None,
                     block_size=req.block_size,
                     buffer_bids=[block.block_id for block in req.dllm_block_buffer.dllm_blocks],
+                    kv_mapping_trace=kv_trace,
                 )
             )
             cur_trajectory.token_ids = req.truncated_response.copy() if req.truncated_response else []
+            if hasattr(req, "full_response"):
+                try:
+                    cur_trajectory.full_token_ids = list(req.full_response)
+                except Exception:
+                    pass
             cur_trajectory.is_truncated = req.is_truncated
             cur_trajectory.max_new_tokens_reached = req.max_new_tokens_reached
             cur_trajectory.max_model_len_reached = req.max_model_len_reached
@@ -197,14 +214,18 @@ class GenerationOutputs:
     def convert_to_text(self, tokenizer):
         eos = getattr(tokenizer, "eos_token", None) or ""
         for trajectory in self.trajectories:
-            raw = decode_token_ids_robust(tokenizer, trajectory.token_ids)
-            trajectory.text = raw.split(eos)[0] if eos else raw
+            gen_full = trajectory.full_token_ids if trajectory.full_token_ids else trajectory.token_ids
+            raw_full = decode_token_ids_robust(tokenizer, gen_full)
+            trajectory.full_text = raw_full
+            raw_trunc = decode_token_ids_robust(tokenizer, trajectory.token_ids)
+            trajectory.text = raw_trunc.split(eos)[0] if eos else raw_trunc
 
     def to_benchmark_format(self) -> list[dict]:
         """Convert to list of dicts expected by diffulex_bench: text, token_ids, n_diff_steps."""
         return [
             dict(
                 text=t.text or "",
+                full_text=(t.full_text if t.full_text is not None else t.text or ""),
                 token_ids=t.token_ids if t.token_ids is not None else [],
                 n_diff_steps=len(t.trajectory),
             )
