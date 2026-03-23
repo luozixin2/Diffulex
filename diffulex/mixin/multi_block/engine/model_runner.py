@@ -199,10 +199,21 @@ class ModelRunnerMultiBlockMixin:
 
         num_tokens = input_ids.size(0)
 
-        graph = self.graphs[next(x for x in self.graph_bs if x >= num_tokens)]
+        captured_num_tokens = next(x for x in self.graph_bs if x >= num_tokens)
+        captured_num_seqs = captured_num_tokens // (
+            self.config.block_size * self.config.buffer_size
+        )
+        graph = self.graphs[captured_num_tokens]
         graph_vars = self.graph_vars
+        # CUDA graph capture uses `slot_mapping=-1` / `page_tables=-1` for padding.
+        # `zero_()` would turn them into 0: store kernel treats 0 as a valid slot (corrupts
+        # KV at slot 0); attention Stage-1 treats page id 0 as a valid physical page.
         for key, value in graph_vars.items():
-            if key != "outputs":
+            if key == "outputs":
+                continue
+            if key in ("slot_mapping", "page_tables"):
+                value.fill_(-1)
+            else:
                 value.zero_()
 
         num_reqs = attn_metadata.num_reqs
@@ -216,7 +227,17 @@ class ModelRunnerMultiBlockMixin:
         graph_vars["status_table"][:num_reqs] = attn_metadata.status_table
         graph_vars["prefix_lens"][:num_reqs] = attn_metadata.prefix_lens
         graph_vars["padded_prefix_lens"][:num_reqs] = attn_metadata.padded_prefix_lens
-        graph_vars["page_tables"][:num_reqs, : attn_metadata.page_tables.size(1)] = attn_metadata.page_tables
+        pt_w = attn_metadata.page_tables.size(1)
+        graph_vars["page_tables"][:num_reqs, :pt_w] = attn_metadata.page_tables
+        # Trailing columns must stay -1 (not 0): kernel loads page id 0 as a real block.
+        if pt_w < graph_vars["page_tables"].size(1):
+            graph_vars["page_tables"][:, pt_w:].fill_(-1)
+
+        # Graph was captured for `captured_num_seqs` requests; tail cu_seqlens must be
+        # padded so phantom rows have q_len/k_len == 0 (otherwise cu[i+1]==0 gives negative len).
+        for i in range(num_reqs, captured_num_seqs):
+            graph_vars["cu_seqlens_q"][i + 1] = graph_vars["cu_seqlens_q"][i]
+            graph_vars["cu_seqlens_k"][i + 1] = graph_vars["cu_seqlens_k"][i]
 
         # Update attn_metadata to use graph_vars tensors
         attn_metadata.slot_mapping = graph_vars["slot_mapping"]

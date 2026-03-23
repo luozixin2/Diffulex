@@ -1,3 +1,4 @@
+import os
 import torch
 import triton
 import triton.language as tl
@@ -5,15 +6,25 @@ import triton.language as tl
 from diffulex.attention.metadata import AttnMetaDataBase
 from diffulex_kernel.python.auto_tuner import build_chunked_prefill_configs
 
-# NOTE: While doing test, comment auto-tuner to avoid slowing down the test.
-@triton.autotune(
-    configs=[
-        triton.Config(c, num_warps=c.pop("num_warps"), num_stages=c.pop("num_stages"))
-        for c in build_chunked_prefill_configs()
-    ],
-    key=["NUM_GROUPS", "HEAD_DIM", "IS_BLOCK_CAUSAL", "IS_PREFIX_FULL"],
-)
-@triton.jit
+DISABLE_CHUNKED_PREFILL_AUTOTUNE = os.environ.get("DIFFULEX_DISABLE_CHUNKED_PREFILL_AUTOTUNE", "0") == "1"
+
+
+def maybe_autotune(fn):
+    fn = triton.jit(fn)
+    # NOTE: Tests pass explicit BLOCK_M / BLOCK_N meta-parameters, which conflicts with
+    # Triton autotune. Disable autotune under test/debug via env instead of editing code.
+    if DISABLE_CHUNKED_PREFILL_AUTOTUNE:
+        return fn
+    return triton.autotune(
+        configs=[
+            triton.Config(c, num_warps=c.pop("num_warps"), num_stages=c.pop("num_stages"))
+            for c in build_chunked_prefill_configs()
+        ],
+        key=["NUM_GROUPS", "HEAD_DIM", "IS_BLOCK_CAUSAL", "IS_PREFIX_FULL"],
+    )(fn)
+
+
+@maybe_autotune
 def _chunked_prefill_attn_unified_kernel(
     q_ptr,
     k_ptr,
@@ -257,7 +268,20 @@ def chunked_prefill_attn_unified(
     page_size = k_cache.shape[1]
     num_reqs = attn_metadata.cu_seqlens_q.shape[0] - 1
 
-    grid = lambda meta: (num_reqs, num_heads, triton.cdiv(int(attn_metadata.max_seqlen_q), meta["BLOCK_M"]))
+    if DISABLE_CHUNKED_PREFILL_AUTOTUNE:
+        block_m = 64
+        block_n = 64
+        grid = (num_reqs, num_heads, triton.cdiv(int(attn_metadata.max_seqlen_q), block_m))
+    else:
+        block_m = None
+        block_n = None
+        grid = lambda meta: (num_reqs, num_heads, triton.cdiv(int(attn_metadata.max_seqlen_q), meta["BLOCK_M"]))
+
+    launch_kwargs = {}
+    if DISABLE_CHUNKED_PREFILL_AUTOTUNE:
+        launch_kwargs["BLOCK_M"] = block_m
+        launch_kwargs["BLOCK_N"] = block_n
+
     _chunked_prefill_attn_unified_kernel[grid](
         q,
         k,
@@ -286,5 +310,6 @@ def chunked_prefill_attn_unified(
         DLLM_BLOCK_SIZE=attn_metadata.block_size,
         IS_BLOCK_CAUSAL=attn_metadata.is_block_causal,
         IS_PREFIX_FULL=attn_metadata.is_prefix_full,
+        **launch_kwargs,
     )
     return o

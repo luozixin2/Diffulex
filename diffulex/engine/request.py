@@ -74,11 +74,6 @@ class DllmReq(DllmReqMultiBlockMixin):
         assert 0 <= index < self.num_pages
         return self.token_ids[index * self.page_size : (index + 1) * self.page_size]
 
-    def append_token(self, token_id: int) -> None:
-        self.token_ids.append(token_id)
-        self.last_token = token_id
-        self.num_tokens += 1
-
 
 ReqFactory = Callable[[list[int], SamplingParams, Config], DllmReq]
 

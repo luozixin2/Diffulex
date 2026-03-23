@@ -7,6 +7,7 @@ from einops import rearrange
 from diffulex_kernel.python.chunked_prefill_triton import (
     _chunked_prefill_attn_unified_kernel,
 )
+from diffulex_kernel.python.kv_cache_kernels import store_kv_cache_unified
 
 
 # ---------------------------------------------------------------------------
@@ -912,6 +913,115 @@ def test_prefix_full_extended_strategies(
         statuses=statuses,
         prefix_lens=prefix_lens,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_chunked_prefill_multiround_cache_growth():
+    """Multi-round decode coverage with cache growth across rounds."""
+    torch.manual_seed(123)
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    num_heads = 32
+    num_kv_heads = 8
+    head_dim = 128
+    page_size = 32
+    dllm_block_size = 32
+    q_len = 128
+    scale = 1.0 / head_dim**0.5
+
+    # Start with 2 pages of cache and grow by storing leftmost tokens from each round.
+    total_pages = 16
+    ctx_len = 64
+    next_free_page = ctx_len // page_size
+
+    k_cache = torch.randn(total_pages, page_size, num_kv_heads, head_dim, dtype=dtype, device=device)
+    v_cache = torch.randn_like(k_cache)
+    page_tables = torch.full((1, total_pages), -1, dtype=torch.int32, device=device)
+    for i in range(next_free_page):
+        page_tables[0, i] = i
+
+    status_table = torch.tensor([1], dtype=torch.int32, device=device)
+    prefix_lens = torch.tensor([0], dtype=torch.int32, device=device)
+    padded_prefix_lens = torch.tensor([0], dtype=torch.int32, device=device)
+    cu_seqlens_q = torch.tensor([0, q_len], dtype=torch.int32, device=device)
+
+    rounds = [
+        (128, 1),  # full valid chunk, store 1 block
+        (96, 1),   # partial valid chunk, store 1 block
+        (128, 2),  # full valid chunk, store 2 blocks
+        (64, 1),   # shorter valid chunk after deeper cache
+    ]
+
+    for round_id, (valid_q_len, blocks_to_store) in enumerate(rounds):
+        q = torch.randn(q_len, num_heads, head_dim, dtype=dtype, device=device)
+        k = torch.randn(q_len, num_kv_heads, head_dim, dtype=dtype, device=device)
+        v = torch.randn(q_len, num_kv_heads, head_dim, dtype=dtype, device=device)
+        valid_slices = torch.tensor([valid_q_len], dtype=torch.int32, device=device)
+        context_lens = torch.tensor([ctx_len], dtype=torch.int32, device=device)
+
+        active_pages = max(1, (ctx_len + page_size - 1) // page_size)
+        out = call_chunked_prefill_kernel(
+            q,
+            k,
+            v,
+            k_cache,
+            v_cache,
+            page_tables[:, :active_pages],
+            status_table,
+            context_lens,
+            cu_seqlens_q,
+            valid_slices,
+            prefix_lens,
+            padded_prefix_lens,
+            scale,
+            dllm_block_size,
+            is_block_causal=True,
+        )
+        ref = naive_chunked_prefill_ref(
+            q,
+            k,
+            v,
+            k_cache,
+            v_cache,
+            page_tables[:, :active_pages],
+            [1],
+            context_lens,
+            cu_seqlens_q,
+            valid_slices,
+            [0],
+            [0],
+            scale,
+            page_size,
+            dllm_block_size,
+            is_block_causal=True,
+        )
+        torch.testing.assert_close(
+            out,
+            ref,
+            atol=5e-3,
+            rtol=5e-3,
+            msg=f"round {round_id} failed before cache update",
+        )
+
+        store_tokens = blocks_to_store * dllm_block_size
+        assert store_tokens <= valid_q_len
+        slot_mapping = torch.full((q_len,), -1, dtype=torch.int32, device=device)
+        slot_start = next_free_page * page_size
+        slot_mapping[:store_tokens] = torch.arange(
+            slot_start,
+            slot_start + store_tokens,
+            dtype=torch.int32,
+            device=device,
+        )
+        store_kv_cache_unified(k, v, k_cache, v_cache, slot_mapping)
+
+        pages_added = store_tokens // page_size
+        current_pages = active_pages
+        for i in range(pages_added):
+            page_tables[0, current_pages + i] = next_free_page + i
+        next_free_page += pages_added
+        ctx_len += store_tokens
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

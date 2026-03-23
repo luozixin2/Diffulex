@@ -174,6 +174,15 @@ def analyze_step_kv(
                                     prompt_idx,
                                     step_id,
                                 )
+                        if b.get("status") == "DUMMY" and b.get("block_type") == "LAST_IN_CONTEXT":
+                            yield Issue(
+                                "dummy_last_in_context",
+                                "Decode buffer contains a DUMMY block marked LAST_IN_CONTEXT; context boundary may be drifting.",
+                                batch_idx,
+                                prompt_idx,
+                                step_id,
+                                {"block_id": b.get("block_id")},
+                            )
 
 
 def analyze_file(path: Path) -> list[Issue]:
@@ -184,6 +193,20 @@ def analyze_file(path: Path) -> list[Issue]:
 
     for batch_idx, prompt_idx, traj in iter_trajectories(data):
         steps = traj.get("trajectory") or []
+        if traj.get("max_new_tokens_reached") and not traj.get("eos_token_generated"):
+            issues.append(
+                Issue(
+                    "stop_by_max_tokens_only",
+                    "Trajectory stopped by max_new_tokens without EOS.",
+                    batch_idx,
+                    prompt_idx,
+                    None,
+                    {
+                        "num_steps": len(steps) if isinstance(steps, list) else None,
+                        "token_len": len(traj.get("token_ids") or []),
+                    },
+                )
+            )
         if not isinstance(steps, list):
             issues.append(
                 Issue("bad_trajectory", "trajectory is not a list", batch_idx, prompt_idx, None)
@@ -212,6 +235,21 @@ def analyze_file(path: Path) -> list[Issue]:
                 None,
             ),
         )
+
+    if isinstance(data, dict) and "batches" in data:
+        for batch_idx, batch in enumerate(data["batches"]):
+            trs = batch.get("trajectories") or []
+            if trs and all(tr.get("max_new_tokens_reached") and not tr.get("eos_token_generated") for tr in trs):
+                issues.append(
+                    Issue(
+                        "batch_all_stop_by_max_tokens",
+                        "All trajectories in this batch stopped by max_new_tokens without EOS.",
+                        batch_idx,
+                        -1,
+                        None,
+                        {"num_trajectories": len(trs)},
+                    )
+                )
 
     return issues
 
