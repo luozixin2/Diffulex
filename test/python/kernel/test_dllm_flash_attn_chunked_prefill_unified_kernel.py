@@ -7,6 +7,69 @@ from einops import rearrange
 from diffulex_kernel.python.chunked_prefill_triton import (
     _chunked_prefill_attn_unified_kernel,
 )
+from diffulex_kernel.python.kv_cache_kernels import store_kv_cache_unified
+
+
+# ---------------------------------------------------------------------------
+# Mask visualization helper
+# ---------------------------------------------------------------------------
+
+
+def _visualize_mask(mask, seq_id, ctx_len, valid_q_len, block_size, label):
+    """Visualize attention mask with clear structure."""
+    print(f"\n{'='*80}")
+    print(f"Seq {seq_id} | {label} | ctx_len={ctx_len}, valid_q_len={valid_q_len}, block_size={block_size}")
+    print(f"{'='*80}")
+
+    mask_np = mask.cpu().numpy()
+    total_kv = mask_np.shape[1]
+
+    # Print header
+    print(f"Mask shape: Q={mask_np.shape[0]} x KV={total_kv} (cache={ctx_len}, new={valid_q_len})")
+
+    # Compact visualization for large masks
+    if valid_q_len > 64 or total_kv > 64:
+        print("\n[Compact view - showing block boundaries]")
+        step = max(1, block_size // 4)
+        sample_q = list(range(0, valid_q_len, step))
+        sample_kv = list(range(0, total_kv, step))
+
+        print(f"\n    KV→", end="")
+        for kv_idx in sample_kv:
+            if kv_idx < ctx_len:
+                print(f" C{kv_idx:3d}", end="")
+            else:
+                print(f" N{kv_idx-ctx_len:3d}", end="")
+        print()
+
+        for q_idx in sample_q:
+            block_id = q_idx // block_size
+            print(f"Q{q_idx:3d}(B{block_id})", end="")
+            for kv_idx in sample_kv:
+                print(f"  {'█' if mask_np[q_idx, kv_idx] else '·'}  ", end="")
+            print()
+    else:
+        # Full visualization for small masks
+        print(f"\n    KV→", end="")
+        for kv_idx in range(total_kv):
+            if kv_idx < ctx_len:
+                print(f"C{kv_idx%10}", end="")
+            else:
+                print(f"N{(kv_idx-ctx_len)%10}", end="")
+        print()
+
+        for q_idx in range(valid_q_len):
+            block_id = q_idx // block_size
+            print(f"Q{q_idx:2d}(B{block_id})", end="")
+            for kv_idx in range(total_kv):
+                print("█" if mask_np[q_idx, kv_idx] else "·", end="")
+            print()
+
+    # Statistics
+    visible_per_q = mask_np.sum(axis=1)
+    print(f"\nStats: min_visible={visible_per_q.min():.0f}, max_visible={visible_per_q.max():.0f}, "
+          f"avg_visible={visible_per_q.mean():.1f}")
+    print(f"{'='*80}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -31,7 +94,7 @@ def call_chunked_prefill_kernel(
     dllm_block_size,
     is_block_causal,
     is_prefix_full=False,
-    BLOCK_M=128,
+    BLOCK_M=64,
     BLOCK_N=64,
 ):
     o = torch.zeros_like(q)
@@ -118,15 +181,8 @@ def naive_chunked_prefill_ref(
     dllm_block_size,
     is_block_causal,
     is_prefix_full=False,
+    visualize_mask=False,
 ):
-    """
-    Per-request reference:
-      1. Reconstruct cache KV from paged storage
-      2. Take new KV from packed tensor (only valid_q_len tokens)
-      3. Concatenate cache + new as full KV
-      4. Build mask: cache always visible; new KV optionally block-causal / prefix-full
-      5. Compute attention for valid Q positions only
-    """
     num_seqs = len(cu_seqlens_q) - 1
     output = torch.zeros_like(q)
 
@@ -164,21 +220,31 @@ def naive_chunked_prefill_ref(
             v_full = v_new
 
         mask = None
-        if is_prefix_full and is_block_causal:
-            status = statuses[seq_id]
-            P = prefix_lens_list[seq_id]
-            P_prime = padded_prefix_lens_list[seq_id]
+        if is_block_causal:
             qi = torch.arange(valid_q_len, device=q.device)
             kj = torch.arange(valid_q_len, device=q.device)
-            if status == 0:
-                pure_prefix = (qi[:, None] < P) & (kj[None, :] < P)
-                padded_causal = ((qi[:, None] >= P) & (qi[:, None] < P_prime)) & (kj[None, :] < P_prime)
-                block_ends = ((qi // dllm_block_size) + 1) * dllm_block_size
-                block_mask_extend = (kj[None, :] < block_ends[:, None]) & (qi[:, None] >= P_prime)
-                new_kv_mask = pure_prefix | padded_causal | block_mask_extend
+            abs_q = ctx_len + qi
+            abs_k = ctx_len + kj
+
+            if is_prefix_full:
+                status = statuses[seq_id]
+                P = prefix_lens_list[seq_id]
+                P_prime = padded_prefix_lens_list[seq_id]
+
+                if status == 0:
+                    pure_prefix = (qi[:, None] < P) & (kj[None, :] < P)
+                    padded_causal = ((qi[:, None] >= P) & (qi[:, None] < P_prime)) & (kj[None, :] < P_prime)
+                    block_ends = ((abs_q // dllm_block_size) + 1) * dllm_block_size
+                    block_mask_extend = (abs_k[None, :] < block_ends[:, None]) & (qi[:, None] >= P_prime)
+
+                    new_kv_mask = pure_prefix | padded_causal | block_mask_extend
+                else:
+                    block_ends = ((abs_q // dllm_block_size) + 1) * dllm_block_size
+                    new_kv_mask = abs_k[None, :] < block_ends[:, None]
             else:
-                block_ends = ((qi // dllm_block_size) + 1) * dllm_block_size
-                new_kv_mask = kj[None, :] < block_ends[:, None]
+                block_ends = ((abs_q // dllm_block_size) + 1) * dllm_block_size
+                new_kv_mask = abs_k[None, :] < block_ends[:, None]
+
             cache_mask = torch.ones(
                 valid_q_len,
                 ctx_len,
@@ -187,19 +253,10 @@ def naive_chunked_prefill_ref(
             )
             mask = torch.cat([cache_mask, new_kv_mask], dim=1)
             mask = mask.unsqueeze(0).unsqueeze(0)
-        elif is_block_causal:
-            qi = torch.arange(valid_q_len, device=q.device)
-            kj = torch.arange(valid_q_len, device=q.device)
-            block_ends = ((qi // dllm_block_size) + 1) * dllm_block_size
-            new_kv_mask = kj[None, :] < block_ends[:, None]
-            cache_mask = torch.ones(
-                valid_q_len,
-                ctx_len,
-                dtype=torch.bool,
-                device=q.device,
-            )
-            mask = torch.cat([cache_mask, new_kv_mask], dim=1)
-            mask = mask.unsqueeze(0).unsqueeze(0)
+
+            if visualize_mask:
+                _visualize_mask(mask[0, 0], seq_id, ctx_len, valid_q_len, dllm_block_size,
+                                f"block_causal{'_prefix' if is_prefix_full else ''}")
 
         q_sdpa = rearrange(q_seq, "s h d -> 1 h s d")
         k_sdpa = rearrange(k_full, "s h d -> 1 h s d")
@@ -211,9 +268,9 @@ def naive_chunked_prefill_ref(
             v_sdpa,
             attn_mask=mask,
             dropout_p=0.0,
-            is_causal=False,
+            is_causal=False, # Mask 自己处理了因果逻辑
             scale=scale,
-            enable_gqa=True,
+            enable_gqa=True, # PyTorch 2.2+ 原生支持 GQA
         )
         output[q_start : q_start + valid_q_len] = rearrange(attn_out, "1 h s d -> s h d").to(output.dtype)
 
@@ -328,8 +385,9 @@ def _run_test(
     statuses=None,
     prefix_lens=None,
     seed=42,
-    atol=1e-2,
-    rtol=1e-2,
+    atol=5e-3,
+    rtol=5e-3,
+    visualize_mask=False,
 ):
     torch.manual_seed(seed)
     num_seqs = len(q_lens)
@@ -390,17 +448,18 @@ def _run_test(
         dllm_block_size,
         is_block_causal=is_block_causal,
         is_prefix_full=is_prefix_full,
+        visualize_mask=visualize_mask,
     )
 
-    for i, vql in enumerate(valid_q_lens):
+    for i in range(num_seqs):
         q_start = int(cu[i].item())
-        if vql > 0:
-            torch.testing.assert_close(
-                out[q_start : q_start + vql],
-                ref[q_start : q_start + vql],
-                atol=atol,
-                rtol=rtol,
-            )
+        q_end = int(cu[i + 1].item())
+        torch.testing.assert_close(
+            out[q_start:q_end],
+            ref[q_start:q_end],
+            atol=atol,
+            rtol=rtol,
+        )
 
 
 # ========================= Case 1: Pure Prefill ==========================
@@ -853,6 +912,132 @@ def test_prefix_full_extended_strategies(
         is_prefix_full=True,
         statuses=statuses,
         prefix_lens=prefix_lens,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_chunked_prefill_multiround_cache_growth():
+    """Multi-round decode coverage with cache growth across rounds."""
+    torch.manual_seed(123)
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    num_heads = 32
+    num_kv_heads = 8
+    head_dim = 128
+    page_size = 32
+    dllm_block_size = 32
+    q_len = 128
+    scale = 1.0 / head_dim**0.5
+
+    # Start with 2 pages of cache and grow by storing leftmost tokens from each round.
+    total_pages = 16
+    ctx_len = 64
+    next_free_page = ctx_len // page_size
+
+    k_cache = torch.randn(total_pages, page_size, num_kv_heads, head_dim, dtype=dtype, device=device)
+    v_cache = torch.randn_like(k_cache)
+    page_tables = torch.full((1, total_pages), -1, dtype=torch.int32, device=device)
+    for i in range(next_free_page):
+        page_tables[0, i] = i
+
+    status_table = torch.tensor([1], dtype=torch.int32, device=device)
+    prefix_lens = torch.tensor([0], dtype=torch.int32, device=device)
+    padded_prefix_lens = torch.tensor([0], dtype=torch.int32, device=device)
+    cu_seqlens_q = torch.tensor([0, q_len], dtype=torch.int32, device=device)
+
+    rounds = [
+        (128, 1),  # full valid chunk, store 1 block
+        (96, 1),   # partial valid chunk, store 1 block
+        (128, 2),  # full valid chunk, store 2 blocks
+        (64, 1),   # shorter valid chunk after deeper cache
+    ]
+
+    for round_id, (valid_q_len, blocks_to_store) in enumerate(rounds):
+        q = torch.randn(q_len, num_heads, head_dim, dtype=dtype, device=device)
+        k = torch.randn(q_len, num_kv_heads, head_dim, dtype=dtype, device=device)
+        v = torch.randn(q_len, num_kv_heads, head_dim, dtype=dtype, device=device)
+        valid_slices = torch.tensor([valid_q_len], dtype=torch.int32, device=device)
+        context_lens = torch.tensor([ctx_len], dtype=torch.int32, device=device)
+
+        active_pages = max(1, (ctx_len + page_size - 1) // page_size)
+        out = call_chunked_prefill_kernel(
+            q,
+            k,
+            v,
+            k_cache,
+            v_cache,
+            page_tables[:, :active_pages],
+            status_table,
+            context_lens,
+            cu_seqlens_q,
+            valid_slices,
+            prefix_lens,
+            padded_prefix_lens,
+            scale,
+            dllm_block_size,
+            is_block_causal=True,
+        )
+        ref = naive_chunked_prefill_ref(
+            q,
+            k,
+            v,
+            k_cache,
+            v_cache,
+            page_tables[:, :active_pages],
+            [1],
+            context_lens,
+            cu_seqlens_q,
+            valid_slices,
+            [0],
+            [0],
+            scale,
+            page_size,
+            dllm_block_size,
+            is_block_causal=True,
+        )
+        torch.testing.assert_close(
+            out,
+            ref,
+            atol=5e-3,
+            rtol=5e-3,
+            msg=f"round {round_id} failed before cache update",
+        )
+
+        store_tokens = blocks_to_store * dllm_block_size
+        assert store_tokens <= valid_q_len
+        slot_mapping = torch.full((q_len,), -1, dtype=torch.int32, device=device)
+        slot_start = next_free_page * page_size
+        slot_mapping[:store_tokens] = torch.arange(
+            slot_start,
+            slot_start + store_tokens,
+            dtype=torch.int32,
+            device=device,
+        )
+        store_kv_cache_unified(k, v, k_cache, v_cache, slot_mapping)
+
+        pages_added = store_tokens // page_size
+        current_pages = active_pages
+        for i in range(pages_added):
+            page_tables[0, current_pages + i] = next_free_page + i
+        next_free_page += pages_added
+        ctx_len += store_tokens
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_visualize_mask_example():
+    """Example: visualize mask for debugging."""
+    _run_test(
+        q_lens=[128, 96],
+        valid_q_lens=[64, 32],
+        ctx_lens=[64, 128],
+        num_heads=32,
+        num_kv_heads=8,
+        head_dim=128,
+        page_size=32,
+        dllm_block_size=32,
+        is_block_causal=True,
+        visualize_mask=True,
     )
 
 

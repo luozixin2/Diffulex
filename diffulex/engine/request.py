@@ -34,6 +34,8 @@ class DllmReq(DllmReqMultiBlockMixin):
         self.new_tokens = 0
         self.meet_eos = False
         self.is_multi_block = False
+        # Filled by multi-block prepare when Config.save_kv_mapping_trace (or runner override) is on.
+        self.last_kv_mapping_trace: dict | None = None
 
     def __len__(self) -> int:
         return self.num_tokens
@@ -56,7 +58,8 @@ class DllmReq(DllmReqMultiBlockMixin):
     @property
     def num_pages(self) -> int:
         if self.is_multi_block:
-            return (self.running_len + self.page_size - 1) // self.page_size
+            # return (self.running_len + self.page_size - 1) // self.page_size
+            return (self.to_cache_len + self.page_size - 1) // self.page_size
         else:
             return (self.num_tokens + self.page_size - 1) // self.page_size
 
@@ -70,11 +73,6 @@ class DllmReq(DllmReqMultiBlockMixin):
     def page(self, index: int) -> list[int]:
         assert 0 <= index < self.num_pages
         return self.token_ids[index * self.page_size : (index + 1) * self.page_size]
-
-    def append_token(self, token_id: int) -> None:
-        self.token_ids.append(token_id)
-        self.last_token = token_id
-        self.num_tokens += 1
 
 
 ReqFactory = Callable[[list[int], SamplingParams, Config], DllmReq]

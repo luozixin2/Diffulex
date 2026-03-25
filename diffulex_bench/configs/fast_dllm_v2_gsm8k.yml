@@ -30,7 +30,7 @@ engine:
   buffer_size: 1  # Fast_dLLM V2 uses buffer_size=1
 
 eval:
-  dataset_name: "gsm8k"
+  dataset_name: "gsm8k_diffulex"
   dataset_split: "test"
   dataset_limit: null
   temperature: 0.0

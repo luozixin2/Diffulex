@@ -46,6 +46,7 @@ class EngineConfig:
     )
     block_size: int = 32  # Aligned with diffulex.config.Config.block_size
     buffer_size: int = 4
+    save_kv_mapping_trace: bool = False  # Passes through to diffulex.config.Config
 
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> "EngineConfig":
@@ -85,6 +86,7 @@ class EngineConfig:
             "kv_cache_layout": self.kv_cache_layout,
             "block_size": self.block_size,
             "buffer_size": self.buffer_size,
+            "save_kv_mapping_trace": self.save_kv_mapping_trace,
         }
         dt = self.decoding_thresholds or {
             "add_block_threshold": 0.1,
@@ -102,10 +104,12 @@ class EvalConfig:
     Evaluation configuration - Parameters for benchmark evaluation
     """
 
-    # Task/Dataset configuration
-    dataset_name: str = "gsm8k"  # Task name (e.g., gsm8k, humaneval)
+    # Task/Dataset configuration (lm-eval task name; use bundled * _diffulex tasks for offline JSON)
+    dataset_name: str = "gsm8k_diffulex"
     dataset_split: str = "test"
     dataset_limit: Optional[int] = None
+    # Directory of custom task YAMLs for lm-eval (--include_path). None → diffulex_bench/tasks next to main.
+    include_path: Optional[str] = None
 
     # Sampling configuration
     temperature: float = 0.0
@@ -115,6 +119,8 @@ class EvalConfig:
 
     # Output configuration
     output_dir: str = "benchmark_results"
+    # If True, lm-eval outputs + diffulex stats/trajectory go under output_dir/run_<time>_<task>/
+    use_run_subdirectory: bool = True
     save_results: bool = True
     use_tqdm: bool = True
 
@@ -183,6 +189,7 @@ class BenchmarkConfig:
                 "decoding_thresholds",
                 "block_size",
                 "buffer_size",
+                "save_kv_mapping_trace",
             }
 
             engine_dict = {k: v for k, v in config_dict.items() if k in engine_fields}

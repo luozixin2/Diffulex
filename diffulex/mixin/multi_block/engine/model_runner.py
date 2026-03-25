@@ -12,6 +12,7 @@ from diffulex.attention.metadata import (
     reset_warming_up,
 )
 from diffulex.engine.request import DllmReq
+from diffulex.engine.dllm_block import dllm_block_buffer_to_trace_dict, dllm_block_to_trace_dict
 
 if TYPE_CHECKING:
     from diffulex.engine.model_runner import ModelRunnerBase
@@ -19,31 +20,23 @@ if TYPE_CHECKING:
 
 class ModelRunnerMultiBlockMixin:
     def _prepare_prefill_req(self: ModelRunnerBase, req: DllmReq):
-        running_sequence = req.running_sequence
-        total_seqlen = len(running_sequence)
+        input_ids = req.running_sequence
+        total_seqlen = len(input_ids)
         in_cache_len = req.in_cache_len
 
-        input_ids = list(running_sequence)
         positions = list(range(in_cache_len, total_seqlen))
         context_len = 0
 
         seqlen_q = total_seqlen - in_cache_len
         seqlen_k = total_seqlen
 
-        slot_mapping: list[int] = []
-        if req.page_table:
-            has_padding_mask = req.padded_prefix_len > 0
-            for rel_page_id in range(0, req.num_pages_with_seq_len(len(running_sequence))):
-                if req.page_cache_missed[rel_page_id]:
-                    if has_padding_mask and rel_page_id >= req.num_prefix_pages - 1:
-                        slot_mapping.extend([-1] * self.page_size)
-                    else:
-                        # NOTE: only support block_size % page_size == 0
-                        start = req.page_table[rel_page_id] * self.page_size
-                        end = start + self.page_size
-                        slot_mapping.extend(range(start, end))
-                else:
-                    slot_mapping.extend([-1] * self.page_size)
+        slot_mapping= []
+        for abs_page_id in req.page_table:
+            start = abs_page_id * self.page_size
+            end = start + self.page_size
+            slot_mapping.extend(range(start, end))
+        remain_num_tokens = len(input_ids) - len(slot_mapping)
+        slot_mapping.extend([-1] * remain_num_tokens)
 
         return dict(
             input_ids=input_ids,
@@ -67,18 +60,14 @@ class ModelRunnerMultiBlockMixin:
         seqlen_k = req.chunk_size
         valid_slice = req.valid_len
 
-        slot_mapping: list[int] = []
-        num_pages_per_block = req.block_size // self.page_size
-        for block in req.dllm_block_buffer.dllm_blocks:
-            if block.is_to_cache:
-                cur_prefix_num_pages = (block.start + self.page_size - 1) // self.page_size
-                for in_blk_page_id in range(num_pages_per_block):
-                    rel_page_id = cur_prefix_num_pages + in_blk_page_id
-                    start = req.page_table[rel_page_id] * self.page_size
-                    end = start + self.page_size
-                    slot_mapping.extend(range(start, end))
-            else:
-                slot_mapping.extend([-1] * block.block_size)
+        slot_mapping = []
+        for rel_page_id, abs_page_id in enumerate(req.page_table):
+            if rel_page_id >= req.num_pages_with_seq_len(req.in_cache_len):
+                start = abs_page_id * self.page_size
+                end = start + self.page_size
+                slot_mapping.extend(range(start, end))
+        remain_num_tokens = len(input_ids) - len(slot_mapping)
+        slot_mapping.extend([-1] * remain_num_tokens)
 
         return dict(
             input_ids=input_ids,
@@ -108,9 +97,36 @@ class ModelRunnerMultiBlockMixin:
         prefix_lens_list: list[int] = []
         padded_prefix_lens_list: list[int] = []
 
+        trace_kv = self.kv_mapping_trace_active()
         for req in reqs:
             req.step()
             prepared = self._prepare_prefill_req(req) if req.is_prefilling else self._prepare_decode_req(req)
+            if trace_kv:
+                trace = {
+                    "req_id": req.req_id,
+                    "is_prefill": req.is_prefilling,
+                    "page_table": list(req.page_table),
+                    "token_positions": list(prepared["positions"]),
+                    "slot_mapping": list(prepared["slot_mapping"]),
+                    "forward_token_ids": list(prepared["input_ids"]),
+                    "page_size": self.page_size,
+                }
+                buf = getattr(req, "dllm_block_buffer", None)
+                blocks = getattr(req, "dllm_blocks", None)
+                if buf is not None and blocks:
+                    if req.is_prefilling:
+                        trace["dllm_blocks_trace"] = {
+                            "phase": "prefill",
+                            "all_blocks": [dllm_block_to_trace_dict(b) for b in blocks],
+                        }
+                    else:
+                        trace["dllm_blocks_trace"] = {
+                            "phase": "decode",
+                            "buffer": dllm_block_buffer_to_trace_dict(buf),
+                        }
+                req.last_kv_mapping_trace = trace
+            else:
+                req.last_kv_mapping_trace = None
             status_table.append(prepared["status"])
             prefix_lens_list.append(prepared["prefix_len"])
             padded_prefix_lens_list.append(prepared["padded_prefix_len"])
@@ -183,10 +199,21 @@ class ModelRunnerMultiBlockMixin:
 
         num_tokens = input_ids.size(0)
 
-        graph = self.graphs[next(x for x in self.graph_bs if x >= num_tokens)]
+        captured_num_tokens = next(x for x in self.graph_bs if x >= num_tokens)
+        captured_num_seqs = captured_num_tokens // (
+            self.config.block_size * self.config.buffer_size
+        )
+        graph = self.graphs[captured_num_tokens]
         graph_vars = self.graph_vars
+        # CUDA graph capture uses `slot_mapping=-1` / `page_tables=-1` for padding.
+        # `zero_()` would turn them into 0: store kernel treats 0 as a valid slot (corrupts
+        # KV at slot 0); attention Stage-1 treats page id 0 as a valid physical page.
         for key, value in graph_vars.items():
-            if key != "outputs":
+            if key == "outputs":
+                continue
+            if key in ("slot_mapping", "page_tables"):
+                value.fill_(-1)
+            else:
                 value.zero_()
 
         num_reqs = attn_metadata.num_reqs
@@ -200,7 +227,17 @@ class ModelRunnerMultiBlockMixin:
         graph_vars["status_table"][:num_reqs] = attn_metadata.status_table
         graph_vars["prefix_lens"][:num_reqs] = attn_metadata.prefix_lens
         graph_vars["padded_prefix_lens"][:num_reqs] = attn_metadata.padded_prefix_lens
-        graph_vars["page_tables"][:num_reqs, : attn_metadata.page_tables.size(1)] = attn_metadata.page_tables
+        pt_w = attn_metadata.page_tables.size(1)
+        graph_vars["page_tables"][:num_reqs, :pt_w] = attn_metadata.page_tables
+        # Trailing columns must stay -1 (not 0): kernel loads page id 0 as a real block.
+        if pt_w < graph_vars["page_tables"].size(1):
+            graph_vars["page_tables"][:, pt_w:].fill_(-1)
+
+        # Graph was captured for `captured_num_seqs` requests; tail cu_seqlens must be
+        # padded so phantom rows have q_len/k_len == 0 (otherwise cu[i+1]==0 gives negative len).
+        for i in range(num_reqs, captured_num_seqs):
+            graph_vars["cu_seqlens_q"][i + 1] = graph_vars["cu_seqlens_q"][i]
+            graph_vars["cu_seqlens_k"][i + 1] = graph_vars["cu_seqlens_k"][i]
 
         # Update attn_metadata to use graph_vars tensors
         attn_metadata.slot_mapping = graph_vars["slot_mapping"]

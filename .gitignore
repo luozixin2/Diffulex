@@ -31,7 +31,6 @@ build/
 cache/
 uv.lock
 ckpt/
-data/
 tilelang
 autotuner.log
 Fast-dLLM
@@ -60,3 +59,5 @@ benchmark_results_tmp/
 # Cursor IDE files
 .cursor/
 drewjin-diffulex
+cutlass
+output/

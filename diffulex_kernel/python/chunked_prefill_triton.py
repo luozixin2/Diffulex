@@ -1,3 +1,4 @@
+import os
 import torch
 import triton
 import triton.language as tl
@@ -5,15 +6,25 @@ import triton.language as tl
 from diffulex.attention.metadata import AttnMetaDataBase
 from diffulex_kernel.python.auto_tuner import build_chunked_prefill_configs
 
+DISABLE_CHUNKED_PREFILL_AUTOTUNE = os.environ.get("DIFFULEX_DISABLE_CHUNKED_PREFILL_AUTOTUNE", "0") == "1"
 
-@triton.autotune(
-    configs=[
-        triton.Config(c, num_warps=c.pop("num_warps"), num_stages=c.pop("num_stages"))
-        for c in build_chunked_prefill_configs()
-    ],
-    key=["NUM_GROUPS", "HEAD_DIM", "IS_BLOCK_CAUSAL", "IS_PREFIX_FULL"],
-)
-@triton.jit
+
+def maybe_autotune(fn):
+    fn = triton.jit(fn)
+    # NOTE: Tests pass explicit BLOCK_M / BLOCK_N meta-parameters, which conflicts with
+    # Triton autotune. Disable autotune under test/debug via env instead of editing code.
+    if DISABLE_CHUNKED_PREFILL_AUTOTUNE:
+        return fn
+    return triton.autotune(
+        configs=[
+            triton.Config(c, num_warps=c.pop("num_warps"), num_stages=c.pop("num_stages"))
+            for c in build_chunked_prefill_configs()
+        ],
+        key=["NUM_GROUPS", "HEAD_DIM", "IS_BLOCK_CAUSAL", "IS_PREFIX_FULL"],
+    )(fn)
+
+
+@maybe_autotune
 def _chunked_prefill_attn_unified_kernel(
     q_ptr,
     k_ptr,
@@ -144,10 +155,19 @@ def _chunked_prefill_attn_unified_kernel(
     # Stage 2: Attention against new KV
     kv_start = q_start
     full_range = tl.cdiv(valid_kv_len, BLOCK_N)
+
+    abs_q_block = context_len + offs_q_block
+
+    max_q_idx_in_chunk = tl.minimum(valid_q_len - 1, (q_block_id + 1) * BLOCK_M - 1)
+    max_abs_q_idx = context_len + max_q_idx_in_chunk
+    max_abs_kv_idx = ((max_abs_q_idx // DLLM_BLOCK_SIZE) + 1) * DLLM_BLOCK_SIZE
+    max_rel_kv_len = max_abs_kv_idx - context_len
+
     block_causal_range = tl.minimum(
-        tl.cdiv(valid_q_len + (q_block_id + 1) * BLOCK_M, BLOCK_N),
-        tl.cdiv(valid_kv_len, BLOCK_N),
+        tl.maximum(0, tl.cdiv(max_rel_kv_len, BLOCK_N)),
+        full_range,
     )
+
     if IS_BLOCK_CAUSAL and not IS_PREFIX_FULL:
         loop_range = block_causal_range
     elif IS_BLOCK_CAUSAL and IS_PREFIX_FULL:
@@ -162,6 +182,7 @@ def _chunked_prefill_attn_unified_kernel(
     for kv_block_id in range(0, loop_range):
         kv_block_start = kv_block_id * BLOCK_N
         offs_kv_block = kv_block_start + tl.arange(0, BLOCK_N)
+        abs_kv_block = context_len + offs_kv_block
         kv_token_valid_map = (offs_kv_block < new_len) & (offs_kv_block < valid_q_len)
 
         k_offs = (
@@ -176,7 +197,7 @@ def _chunked_prefill_attn_unified_kernel(
         scores = tl.dot(q, k).to(tl.float32) * softmax_scale
         score_valid_mask = mask_q_block[:, None] & kv_token_valid_map[None, :]
         if IS_BLOCK_CAUSAL and not IS_PREFIX_FULL:
-            score_block_mask = ((offs_q_block // DLLM_BLOCK_SIZE + 1) * DLLM_BLOCK_SIZE)[:, None] > offs_kv_block[
+            score_block_mask = ((abs_q_block // DLLM_BLOCK_SIZE + 1) * DLLM_BLOCK_SIZE)[:, None] > abs_kv_block[
                 None, :
             ]
             score_mask = score_valid_mask & score_block_mask
@@ -186,13 +207,13 @@ def _chunked_prefill_attn_unified_kernel(
                 score_padded_causal_mask = ((offs_q_block >= prefix_len) & (offs_q_block < padded_prefix_len))[
                     :, None
                 ] & (offs_kv_block < padded_prefix_len)[None, :]
-                score_block_mask = ((offs_q_block // DLLM_BLOCK_SIZE + 1) * DLLM_BLOCK_SIZE)[:, None] > offs_kv_block[
+                score_block_mask = ((abs_q_block // DLLM_BLOCK_SIZE + 1) * DLLM_BLOCK_SIZE)[:, None] > abs_kv_block[
                     None, :
                 ]
                 score_block_mask_extend_only = score_block_mask & (offs_q_block >= padded_prefix_len)[:, None]
-                score_mask = score_pure_prefix_mask | score_padded_causal_mask | score_block_mask_extend_only
+                score_mask = score_valid_mask & (score_pure_prefix_mask | score_padded_causal_mask | score_block_mask_extend_only)
             else:
-                score_block_mask = ((offs_q_block // DLLM_BLOCK_SIZE + 1) * DLLM_BLOCK_SIZE)[:, None] > offs_kv_block[
+                score_block_mask = ((abs_q_block // DLLM_BLOCK_SIZE + 1) * DLLM_BLOCK_SIZE)[:, None] > abs_kv_block[
                     None, :
                 ]
                 score_mask = score_valid_mask & score_block_mask
@@ -247,7 +268,20 @@ def chunked_prefill_attn_unified(
     page_size = k_cache.shape[1]
     num_reqs = attn_metadata.cu_seqlens_q.shape[0] - 1
 
-    grid = lambda meta: (num_reqs, num_heads, triton.cdiv(int(attn_metadata.max_seqlen_q), meta["BLOCK_M"]))
+    if DISABLE_CHUNKED_PREFILL_AUTOTUNE:
+        block_m = 64
+        block_n = 64
+        grid = (num_reqs, num_heads, triton.cdiv(int(attn_metadata.max_seqlen_q), block_m))
+    else:
+        block_m = None
+        block_n = None
+        grid = lambda meta: (num_reqs, num_heads, triton.cdiv(int(attn_metadata.max_seqlen_q), meta["BLOCK_M"]))
+
+    launch_kwargs = {}
+    if DISABLE_CHUNKED_PREFILL_AUTOTUNE:
+        launch_kwargs["BLOCK_M"] = block_m
+        launch_kwargs["BLOCK_N"] = block_n
+
     _chunked_prefill_attn_unified_kernel[grid](
         q,
         k,
@@ -276,5 +310,6 @@ def chunked_prefill_attn_unified(
         DLLM_BLOCK_SIZE=attn_metadata.block_size,
         IS_BLOCK_CAUSAL=attn_metadata.is_block_causal,
         IS_PREFIX_FULL=attn_metadata.is_prefix_full,
+        **launch_kwargs,
     )
     return o

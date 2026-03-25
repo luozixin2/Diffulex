@@ -161,8 +161,14 @@ Examples:
     parser.add_argument(
         "--dataset",
         type=str,
-        default="gsm8k",
-        help="Dataset/task name (e.g., gsm8k, humaneval)",
+        default="gsm8k_diffulex",
+        help="lm-eval task name (bundled offline: gsm8k_diffulex, math500_diffulex, humaneval_diffulex, ...)",
+    )
+    parser.add_argument(
+        "--include-path",
+        type=str,
+        default=None,
+        help="lm-eval --include_path for external tasks (default: packaged diffulex_bench/tasks). Set to empty to disable.",
     )
     parser.add_argument(
         "--dataset-split",
@@ -182,7 +188,13 @@ Examples:
         "--output-dir",
         type=str,
         default="benchmark_results",
-        help="Output directory",
+        help="Output base directory (each run may create a run_* subfolder; see --use-run-subdirectory)",
+    )
+    parser.add_argument(
+        "--use-run-subdirectory",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Write this run under output_dir/run_<timestamp>_<task>/ (default: true; override YAML when set)",
     )
     parser.add_argument(
         "--save-results",
@@ -268,6 +280,12 @@ Examples:
         type=int,
         default=None,
         help="Number of active diffusion blocks in buffer",
+    )
+    parser.add_argument(
+        "--save-kv-mapping-trace",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Record KV / DLLM block traces into per-step trajectory; with --output-dir writes trajectory.json (multi-block only)",
     )
     return parser
 
