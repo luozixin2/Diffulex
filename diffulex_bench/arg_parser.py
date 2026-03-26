@@ -281,12 +281,6 @@ Examples:
         default=None,
         help="Number of active diffusion blocks in buffer",
     )
-    parser.add_argument(
-        "--save-kv-mapping-trace",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Record KV / DLLM block traces into per-step trajectory; with --output-dir writes trajectory.json (multi-block only)",
-    )
     return parser
 
 

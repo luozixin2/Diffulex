@@ -34,10 +34,6 @@ class DllmReq(DllmReqMultiBlockMixin):
         self.new_tokens = 0
         self.meet_eos = False
         self.is_multi_block = False
-        # Filled by multi-block prepare when Config.save_kv_mapping_trace (or runner override) is on.
-        self.last_kv_mapping_trace: dict | None = None
-        # Filled during scheduler postprocess from sampler output, for step-by-step diffing.
-        self.last_sampler_trace: dict | None = None
 
     def __len__(self) -> int:
         return self.num_tokens

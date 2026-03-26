@@ -54,10 +54,6 @@ class Config:
     k_cache_hdim_split_factor_x: int = 8
     kv_cache_layout: str = "unified"  # "unified" or "distinct"
 
-    # When True, each multi-block forward records page_table / slot_mapping / positions and
-    # dllm block snapshots (prefill: all blocks; decode: buffer) on the request; see GenerationOutputs.
-    save_kv_mapping_trace: bool = False
-
     def __post_init__(self):
         assert os.path.isdir(self.model)
         assert self.page_size % 16 == 0

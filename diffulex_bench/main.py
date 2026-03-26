@@ -70,13 +70,11 @@ def config_to_model_args(config: BenchmarkConfig, *, result_output_dir: Optional
     if engine.use_lora and engine.lora_path:
         args_dict["lora_path"] = engine.lora_path
 
-    if save_dir and (eval_config.save_results or engine.save_kv_mapping_trace):
+    if save_dir and eval_config.save_results:
         args_dict["save_dir"] = save_dir
 
     if eval_config.add_bos_token is not None:
         args_dict["add_bos_token"] = eval_config.add_bos_token
-
-    args_dict["save_kv_mapping_trace"] = bool(engine.save_kv_mapping_trace)
 
     # Convert to string format: key1=value1,key2=value2
     args_list = [f"{k}={v}" for k, v in args_dict.items()]
@@ -282,8 +280,6 @@ def load_config_from_args(args) -> BenchmarkConfig:
             config.engine.buffer_size = args.buffer_size
         if getattr(args, "block_size", None) is not None:
             config.engine.block_size = args.block_size
-        if getattr(args, "save_kv_mapping_trace", None) is not None:
-            config.engine.save_kv_mapping_trace = bool(args.save_kv_mapping_trace)
     else:
         if not args.model_path:
             logger.error("Either --config or --model-path must be provided")
@@ -314,7 +310,6 @@ def load_config_from_args(args) -> BenchmarkConfig:
             block_size=(args.block_size if getattr(args, "block_size", None) is not None else 32),
             buffer_size=getattr(args, "buffer_size", 4),
             enforce_eager=args.enforce_eager if hasattr(args, "enforce_eager") else False,
-            save_kv_mapping_trace=bool(getattr(args, "save_kv_mapping_trace", False)),
         )
 
         eval_config = EvalConfig(

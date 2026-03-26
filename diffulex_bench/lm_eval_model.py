@@ -101,7 +101,6 @@ class DiffulexLM(LM):
         block_size: Optional[int] = 32,
         buffer_size: Optional[int] = 4,
         save_dir: Optional[str] = None,
-        save_kv_mapping_trace: Union[bool, str, int, None] = False,
         wait_ready: Optional[bool] = True,
         **kwargs,
     ) -> None:
@@ -123,8 +122,6 @@ class DiffulexLM(LM):
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.save_dir = save_dir
-        self.save_kv_mapping_trace = _coerce_bool(save_kv_mapping_trace, False)
-        self._trajectory_batches: List[dict] = []
         # Cumulative per-eval-run, same layout as multi_bd/eval (rank-0 JSON lists).
         self._responses_full: List[str] = []
         self._responses_truncated: List[str] = []
@@ -169,7 +166,6 @@ class DiffulexLM(LM):
             decoding_threshold=decoding_threshold,
             block_size=block_size,
             buffer_size=buffer_size,
-            save_kv_mapping_trace=self.save_kv_mapping_trace,
         )
 
         self.tokenizer = self.runner.tokenizer
@@ -272,12 +268,10 @@ class DiffulexLM(LM):
 
         # Run generation
         start_time = time.time()
-        traj_batches = self._trajectory_batches if self.save_kv_mapping_trace else None
         outputs = self.runner.generate(
             prompts,
             self.sampling_params,
             use_tqdm=not disable_tqdm,
-            trajectory_batches=traj_batches,
         )
         end_time = time.time()
 
@@ -377,19 +371,6 @@ class DiffulexLM(LM):
                 with open(resp_path, "w", encoding="utf-8") as f:
                     json.dump(rows, f, indent=2, ensure_ascii=False)
                 self.logger.info(f"Responses saved to {resp_path}")
-
-        if self.save_kv_mapping_trace and self._trajectory_batches:
-            traj_path = os.path.join(self.save_dir, "trajectory.json")
-            raw = json.dumps({"batches": self._trajectory_batches}, indent=2, ensure_ascii=False)
-            compact = _compact_numeric_arrays_in_json(raw)
-            with open(traj_path, "w", encoding="utf-8") as f:
-                f.write(compact)
-            self.logger.info(f"Trajectory (KV / block traces) saved to {traj_path}")
-        elif self.save_kv_mapping_trace and not self._trajectory_batches:
-            self.logger.warning(
-                "save_kv_mapping_trace is True but no trajectory batches were recorded "
-                "(e.g. DP mode or trace disabled in engine)."
-            )
 
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
         """

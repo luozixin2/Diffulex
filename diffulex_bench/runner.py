@@ -4,7 +4,7 @@ Provides a unified interface for benchmarking
 """
 
 import time
-from typing import List, Dict, Any, Optional, MutableSequence
+from typing import List, Dict, Any, Optional
 
 from diffulex import Diffulex, SamplingParams
 from transformers import AutoTokenizer
@@ -127,7 +127,6 @@ class BenchmarkRunner:
         prompts: List[str],
         sampling_params: SamplingParams,
         use_tqdm: bool = True,
-        trajectory_batches: Optional[MutableSequence[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Generate text
@@ -136,26 +135,13 @@ class BenchmarkRunner:
             prompts: List of input prompts
             sampling_params: Sampling parameters
             use_tqdm: Whether to show progress bar
-            trajectory_batches: If set, each successful generate appends one entry:
-                ``{"trajectories": [ReqTrajectory.to_dict(), ...]}`` (TP-only; ignored for DP).
-
         Returns:
             List of generation results, each containing text, token_ids, n_diff_steps
         """
         start_time = time.time()
-        if trajectory_batches is not None and hasattr(self.llm, "_ask"):
-            self.logger.warning(
-                "trajectory_batches is ignored when data_parallel_size > 1 (DP merges outputs without full trajectories)."
-            )
-            trajectory_batches = None
 
         raw_outputs = self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
         end_time = time.time()
-
-        if trajectory_batches is not None and hasattr(raw_outputs, "trajectories"):
-            trajectory_batches.append(
-                {"trajectories": [t.to_dict() for t in raw_outputs.trajectories]}
-            )
 
         # Convert GenerationOutputs to list of dicts if needed (tp_worker returns GenerationOutputs)
         if hasattr(raw_outputs, "to_benchmark_format"):

@@ -46,7 +46,6 @@ class EngineConfig:
     )
     block_size: int = 32  # Aligned with diffulex.config.Config.block_size
     buffer_size: int = 4
-    save_kv_mapping_trace: bool = False  # Passes through to diffulex.config.Config
 
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> "EngineConfig":
@@ -86,7 +85,6 @@ class EngineConfig:
             "kv_cache_layout": self.kv_cache_layout,
             "block_size": self.block_size,
             "buffer_size": self.buffer_size,
-            "save_kv_mapping_trace": self.save_kv_mapping_trace,
         }
         dt = self.decoding_thresholds or {
             "add_block_threshold": 0.1,
@@ -189,7 +187,6 @@ class BenchmarkConfig:
                 "decoding_thresholds",
                 "block_size",
                 "buffer_size",
-                "save_kv_mapping_trace",
             }
 
             engine_dict = {k: v for k, v in config_dict.items() if k in engine_fields}
