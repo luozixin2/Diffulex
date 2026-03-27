@@ -36,23 +36,40 @@ class DllmBlock:
         assert self.end - self.start == self.block_size
 
         if req is not None:
-            self._req = weakref_fn(req)
+            self.bind_req(req)
 
         if dllm_block_buffer is not None:
-            self._dllm_block_buffer = weakref_fn(dllm_block_buffer)
+            self.bind_buffer(dllm_block_buffer)
 
         if self.status is None:
             self.status = DllmBlockStatus.TO_CACHE if self.is_complete else DllmBlockStatus.ACTIVE
 
         self.make_in_context()
 
+    def bind_req(self, req: "DllmReq" | None):
+        self._req = weakref_fn(req)
+
+    def bind_buffer(self, dllm_block_buffer: "DllmBlockBuffer" | None):
+        self._dllm_block_buffer = weakref_fn(dllm_block_buffer)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("_req", None)
+        state.pop("_dllm_block_buffer", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
     @property
     def req(self) -> "DllmReq":
-        return self._req() if self._req else None
+        ref = getattr(self, "_req", None)
+        return ref() if ref else None
 
     @property
     def dllm_block_buffer(self) -> "DllmBlockBuffer":
-        return self._dllm_block_buffer() if self._dllm_block_buffer else None
+        ref = getattr(self, "_dllm_block_buffer", None)
+        return ref() if ref else None
 
     @property
     def token_ids(self) -> list[int]:
@@ -162,15 +179,27 @@ class DllmBlockBuffer:
         assert len(self.dllm_blocks) == self.buffer_size
 
         if req is not None:
-            self._req = weakref_fn(req)
+            self.bind_req(req)
 
         if len(self.dllm_blocks) > 0:
             for block in self.dllm_blocks:
                 block.post_init_dllm_block(None, self)
 
+    def bind_req(self, req: "DllmReq" | None):
+        self._req = weakref_fn(req)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("_req", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
     @property
     def req(self) -> "DllmReq":
-        return self._req() if self._req else None
+        ref = getattr(self, "_req", None)
+        return ref() if ref else None
 
     @property
     def buffer_sequence(self) -> list[int]:

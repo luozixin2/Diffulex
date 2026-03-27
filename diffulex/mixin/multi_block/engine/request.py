@@ -12,6 +12,22 @@ if TYPE_CHECKING:
 
 
 class DllmReqMultiBlockMixin:
+    def _restore_req_runtime_state(self):
+        super()._restore_req_runtime_state()
+
+        if not getattr(self, "is_multi_block", False):
+            return
+
+        dllm_blocks = getattr(self, "dllm_blocks", None) or []
+        dllm_block_buffer = getattr(self, "dllm_block_buffer", None)
+        if dllm_block_buffer is not None:
+            dllm_block_buffer.bind_req(self)
+
+        buffer_block_ids = {id(block) for block in getattr(dllm_block_buffer, "dllm_blocks", [])}
+        for block in dllm_blocks:
+            block.bind_req(self)
+            block.bind_buffer(dllm_block_buffer if id(block) in buffer_block_ids else None)
+
     def init_multi_block(self: DllmReq, config: Config):
         self.is_multi_block = True
         self.status_history = [self.status]
