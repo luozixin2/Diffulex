@@ -100,6 +100,7 @@ class DiffulexLM(LM):
         decoding_threshold: Optional[float] = None,
         block_size: Optional[int] = 32,
         buffer_size: Optional[int] = 4,
+        multi_block_prefix_full: Optional[bool] = False,
         save_dir: Optional[str] = None,
         wait_ready: Optional[bool] = True,
         **kwargs,
@@ -166,6 +167,7 @@ class DiffulexLM(LM):
             decoding_threshold=decoding_threshold,
             block_size=block_size,
             buffer_size=buffer_size,
+            multi_block_prefix_full=multi_block_prefix_full,
         )
 
         self.tokenizer = self.runner.tokenizer

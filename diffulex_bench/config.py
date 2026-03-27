@@ -46,6 +46,7 @@ class EngineConfig:
     )
     block_size: int = 32  # Aligned with diffulex.config.Config.block_size
     buffer_size: int = 4
+    multi_block_prefix_full: bool = True
 
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> "EngineConfig":
@@ -85,6 +86,7 @@ class EngineConfig:
             "kv_cache_layout": self.kv_cache_layout,
             "block_size": self.block_size,
             "buffer_size": self.buffer_size,
+            "multi_block_prefix_full": self.multi_block_prefix_full,
         }
         dt = self.decoding_thresholds or {
             "add_block_threshold": 0.1,
@@ -187,6 +189,7 @@ class BenchmarkConfig:
                 "decoding_thresholds",
                 "block_size",
                 "buffer_size",
+                "multi_block_prefix_full",
             }
 
             engine_dict = {k: v for k, v in config_dict.items() if k in engine_fields}

@@ -53,6 +53,7 @@ def config_to_model_args(config: BenchmarkConfig, *, result_output_dir: Optional
         "kv_cache_layout": engine.kv_cache_layout,
         "block_size": engine.block_size,
         "buffer_size": engine.buffer_size,
+        "multi_block_prefix_full": engine.multi_block_prefix_full,
         "wait_ready": True,
     }
     dt = engine.decoding_thresholds or {
@@ -280,6 +281,8 @@ def load_config_from_args(args) -> BenchmarkConfig:
             config.engine.buffer_size = args.buffer_size
         if getattr(args, "block_size", None) is not None:
             config.engine.block_size = args.block_size
+        if getattr(args, "multi_block_prefix_full", None) is not None:
+            config.engine.multi_block_prefix_full = bool(args.multi_block_prefix_full)
     else:
         if not args.model_path:
             logger.error("Either --config or --model-path must be provided")
@@ -309,6 +312,11 @@ def load_config_from_args(args) -> BenchmarkConfig:
             },
             block_size=(args.block_size if getattr(args, "block_size", None) is not None else 32),
             buffer_size=getattr(args, "buffer_size", 4),
+            multi_block_prefix_full=(
+                bool(args.multi_block_prefix_full)
+                if getattr(args, "multi_block_prefix_full", None) is not None
+                else False
+            ),
             enforce_eager=args.enforce_eager if hasattr(args, "enforce_eager") else False,
         )
 

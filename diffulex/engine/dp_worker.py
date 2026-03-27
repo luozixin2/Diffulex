@@ -35,6 +35,8 @@ def _dp_child_entry(config: Config, dp_idx: int, local_devices: list[int], conn)
             decoding_strategy=config.decoding_strategy,
             mask_token_id=config.mask_token_id,
             block_size=config.block_size,
+            buffer_size=config.buffer_size,
+            multi_block_prefix_full=config.multi_block_prefix_full,
             decoding_thresholds=config.decoding_thresholds,
             use_lora=config.use_lora,
             max_num_batched_tokens=config.max_num_batched_tokens,

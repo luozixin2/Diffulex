@@ -281,6 +281,12 @@ Examples:
         default=None,
         help="Number of active diffusion blocks in buffer",
     )
+    parser.add_argument(
+        "--multi-block-prefix-full",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Whether multi_bd should treat the prefix region as fully visible",
+    )
     return parser
 
 

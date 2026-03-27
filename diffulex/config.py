@@ -24,6 +24,7 @@ class Config:
     mask_token_id: int = 151666
     block_size: int = 32
     buffer_size: int = 4
+    multi_block_prefix_full: bool = True
 
     decoding_thresholds: DecodingThresholds | dict | None = None
     # TODO: Should be deprecated in the future
