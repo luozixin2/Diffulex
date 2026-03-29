@@ -77,6 +77,8 @@ class DiffulexLM(LM):
         device: Optional[str] = "cuda",
         dtype: Optional[Union[str, type]] = "auto",
         max_new_tokens: Optional[int] = 256,
+        max_nfe: Optional[int] = None,
+        max_repetition_run: Optional[int] = None,
         max_length: Optional[int] = 2048,
         add_bos_token: Optional[bool] = False,
         trust_remote_code: Optional[bool] = True,
@@ -122,6 +124,8 @@ class DiffulexLM(LM):
         self.max_length = max_length
         self.add_bos_token = add_bos_token
         self.max_new_tokens = max_new_tokens
+        self.max_nfe = max_nfe
+        self.max_repetition_run = max_repetition_run
         self.temperature = temperature
         self.save_dir = save_dir
         # Cumulative per-eval-run, same layout as multi_bd/eval (rank-0 JSON lists).
@@ -162,6 +166,8 @@ class DiffulexLM(LM):
         self.sampling_params = SamplingParams(
             temperature=temperature,
             max_tokens=max_new_tokens,
+            max_nfe=max_nfe,
+            max_repetition_run=max_repetition_run,
         )
 
         self.logger.success("Diffulex engine initialized successfully")
@@ -310,13 +316,13 @@ class DiffulexLM(LM):
             results.append(extracted)
 
             token_ids = output.get("token_ids", [])
-            n_diff_steps = output.get("n_diff_steps", 0)
+            nfe = output.get("nfe", output.get("num_nfes", output.get("n_diff_steps", 0)))
 
             num_tokens += len(token_ids)
-            num_nfe += n_diff_steps
+            num_nfe += nfe
 
             self.all_generation_times.append(total_time / len(outputs) if outputs else 0)
-            self.all_nfe.append(n_diff_steps)
+            self.all_nfe.append(nfe)
             self.all_tokens.append(len(token_ids))
 
         # Update statistics

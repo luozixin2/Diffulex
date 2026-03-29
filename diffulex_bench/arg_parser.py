@@ -152,6 +152,18 @@ Examples:
         help="Maximum tokens to generate",
     )
     parser.add_argument(
+        "--max-nfe",
+        type=int,
+        default=None,
+        help="Maximum number of forward evaluations (NFE) allowed per request",
+    )
+    parser.add_argument(
+        "--max-repetition-run",
+        type=int,
+        default=None,
+        help="Kill a request when its generated suffix ends with this many identical consecutive tokens",
+    )
+    parser.add_argument(
         "--ignore-eos",
         action="store_true",
         help="Ignore EOS token",

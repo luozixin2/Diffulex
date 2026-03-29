@@ -108,7 +108,7 @@ try:
     out = llm.generate([prompt], sp, use_tqdm=False).to_benchmark_format()[0]
     payload = {{
         "num_tokens": len(out["token_ids"]),
-        "n_diff_steps": out["n_diff_steps"],
+        "nfe": out["nfe"],
         "text_sha256": hashlib.sha256((out.get("text") or "").encode("utf-8")).hexdigest(),
         "token_sha256": hashlib.sha256(json.dumps(out["token_ids"]).encode("utf-8")).hexdigest(),
     }}
@@ -157,9 +157,9 @@ def _run_matrix(*, disable_autotune: bool, tmp_path: Path, label: str) -> None:
             page_size: {
                 "same_text_as_baseline": payload["text_sha256"] == baseline["text_sha256"],
                 "same_tokens_as_baseline": payload["token_sha256"] == baseline["token_sha256"],
-                "same_steps_as_baseline": payload["n_diff_steps"] == baseline["n_diff_steps"],
+                "same_steps_as_baseline": payload["nfe"] == baseline["nfe"],
                 "num_tokens": payload["num_tokens"],
-                "n_diff_steps": payload["n_diff_steps"],
+                "nfe": payload["nfe"],
             }
             for page_size, payload in group.items()
         }

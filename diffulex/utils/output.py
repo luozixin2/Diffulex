@@ -52,6 +52,8 @@ class ReqTrajectory:
     is_truncated: bool
     max_new_tokens_reached: bool
     max_model_len_reached: bool
+    max_nfe_reached: bool
+    max_repetition_run_reached: bool
     eos_token_generated: bool
 
     text: str = None
@@ -67,6 +69,8 @@ class ReqTrajectory:
             is_truncated=self.is_truncated,
             max_new_tokens_reached=self.max_new_tokens_reached,
             max_model_len_reached=self.max_model_len_reached,
+            max_nfe_reached=self.max_nfe_reached,
+            max_repetition_run_reached=self.max_repetition_run_reached,
             eos_token_generated=self.eos_token_generated,
             text=self.text,
         )
@@ -84,6 +88,8 @@ class GenerationOutputs:
                 is_truncated=False,
                 max_new_tokens_reached=False,
                 max_model_len_reached=False,
+                max_nfe_reached=False,
+                max_repetition_run_reached=False,
                 eos_token_generated=False,
             )
             for req_id in range(num_prompts)
@@ -193,6 +199,8 @@ class GenerationOutputs:
             cur_trajectory.is_truncated = req.is_truncated
             cur_trajectory.max_new_tokens_reached = req.max_new_tokens_reached
             cur_trajectory.max_model_len_reached = req.max_model_len_reached
+            cur_trajectory.max_nfe_reached = getattr(req, "max_nfe_reached", False)
+            cur_trajectory.max_repetition_run_reached = getattr(req, "max_repetition_run_reached", False)
             cur_trajectory.eos_token_generated = req.eos_token_generated
 
     def postfix(self) -> dict:
@@ -228,13 +236,13 @@ class GenerationOutputs:
             trajectory.text = raw_trunc.split(eos)[0] if eos else raw_trunc
 
     def to_benchmark_format(self) -> list[dict]:
-        """Convert to list of dicts expected by diffulex_bench: text, token_ids, n_diff_steps."""
+        """Convert to list of dicts expected by diffulex_bench: text, token_ids, nfe."""
         return [
             dict(
                 text=t.text or "",
                 full_text=(t.full_text if t.full_text is not None else t.text or ""),
                 token_ids=t.token_ids if t.token_ids is not None else [],
-                n_diff_steps=len(t.trajectory),
+                nfe=len(t.trajectory),
             )
             for t in self.trajectories
         ]

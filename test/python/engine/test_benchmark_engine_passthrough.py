@@ -73,6 +73,8 @@ def test_model_args_round_trip_extra_engine_fields(monkeypatch) -> None:
             "eval": {
                 "dataset_name": "gsm8k",
                 "max_tokens": 123,
+                "max_nfe": 17,
+                "max_repetition_run": 9,
                 "temperature": 0.0,
             },
         }
@@ -91,6 +93,10 @@ def test_model_args_round_trip_extra_engine_fields(monkeypatch) -> None:
     assert forwarded["block_size"] == 4
     assert forwarded["decoding_thresholds"]["decoding_threshold"] == 0.95
     assert lm.max_new_tokens == 123
+    assert lm.max_nfe == 17
+    assert lm.max_repetition_run == 9
+    assert lm.sampling_params.max_nfe == 17
+    assert lm.sampling_params.max_repetition_run == 9
 
 
 def test_model_arg_obj_round_trip_extra_engine_fields(monkeypatch) -> None:

@@ -110,6 +110,8 @@ def config_to_model_args(config: BenchmarkConfig, *, result_output_dir: Optional
         **args_dict,
         "temperature": eval_config.temperature,
         "max_new_tokens": eval_config.max_tokens,
+        "max_nfe": eval_config.max_nfe,
+        "max_repetition_run": eval_config.max_repetition_run,
         "wait_ready": True,
     }
 
@@ -321,6 +323,10 @@ def load_config_from_args(args) -> BenchmarkConfig:
             config.eval.dataset_limit = args.dataset_limit
         if getattr(args, "max_tokens", None) is not None:
             config.eval.max_tokens = args.max_tokens
+        if getattr(args, "max_nfe", None) is not None:
+            config.eval.max_nfe = args.max_nfe
+        if getattr(args, "max_repetition_run", None) is not None:
+            config.eval.max_repetition_run = args.max_repetition_run
         if getattr(args, "temperature", None) is not None:
             config.eval.temperature = args.temperature
         if args.output_dir:
@@ -391,6 +397,8 @@ def load_config_from_args(args) -> BenchmarkConfig:
             dataset_limit=args.dataset_limit,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
+            max_nfe=getattr(args, "max_nfe", None),
+            max_repetition_run=getattr(args, "max_repetition_run", None),
             ignore_eos=getattr(args, "ignore_eos", False),
             output_dir=args.output_dir,
             use_run_subdirectory=(

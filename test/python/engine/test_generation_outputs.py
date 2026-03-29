@@ -17,6 +17,8 @@ def test_generation_outputs_handles_empty_prefill_suffix() -> None:
         is_truncated=False,
         max_new_tokens_reached=False,
         max_model_len_reached=False,
+        max_nfe_reached=False,
+        max_repetition_run_reached=False,
         eos_token_generated=False,
     )
 
@@ -42,6 +44,8 @@ def test_generation_outputs_decode_throughput_uses_batch_time() -> None:
             is_truncated=False,
             max_new_tokens_reached=False,
             max_model_len_reached=False,
+            max_nfe_reached=False,
+            max_repetition_run_reached=False,
             eos_token_generated=False,
         ),
         SimpleNamespace(
@@ -56,6 +60,8 @@ def test_generation_outputs_decode_throughput_uses_batch_time() -> None:
             is_truncated=False,
             max_new_tokens_reached=False,
             max_model_len_reached=False,
+            max_nfe_reached=False,
+            max_repetition_run_reached=False,
             eos_token_generated=False,
         ),
     ]
@@ -84,6 +90,8 @@ def test_generation_outputs_prefill_throughput_uses_batch_time() -> None:
             is_truncated=False,
             max_new_tokens_reached=False,
             max_model_len_reached=False,
+            max_nfe_reached=False,
+            max_repetition_run_reached=False,
             eos_token_generated=False,
         ),
         SimpleNamespace(
@@ -98,6 +106,8 @@ def test_generation_outputs_prefill_throughput_uses_batch_time() -> None:
             is_truncated=False,
             max_new_tokens_reached=False,
             max_model_len_reached=False,
+            max_nfe_reached=False,
+            max_repetition_run_reached=False,
             eos_token_generated=False,
         ),
     ]
@@ -107,3 +117,36 @@ def test_generation_outputs_prefill_throughput_uses_batch_time() -> None:
     assert outputs.prefill_throughput == 4.0
     assert outputs.total_time == 2.0
     assert outputs.postfix()["ptps"] == "4tok/sec"
+
+
+def test_generation_outputs_benchmark_format_uses_nfe() -> None:
+    outputs = GenerationOutputs(1)
+    shared_buffer = SimpleNamespace(dllm_blocks=[])
+    req = SimpleNamespace(
+        req_id=0,
+        is_prefilling=False,
+        new_tokens=1,
+        running_sequence=[1, 2, 3, 4],
+        block_size=4,
+        dllm_block_buffer=shared_buffer,
+        truncated_response=[42],
+        full_response=[42],
+        is_truncated=True,
+        max_new_tokens_reached=False,
+        max_model_len_reached=False,
+        max_nfe_reached=True,
+        max_repetition_run_reached=False,
+        eos_token_generated=False,
+    )
+
+    outputs.record_step([req], step_time=1.0)
+    formatted = outputs.to_benchmark_format()
+
+    assert formatted == [
+        {
+            "text": "",
+            "full_text": "",
+            "token_ids": [42],
+            "nfe": 1,
+        }
+    ]

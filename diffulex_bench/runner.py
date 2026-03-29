@@ -136,7 +136,7 @@ class BenchmarkRunner:
             sampling_params: Sampling parameters
             use_tqdm: Whether to show progress bar
         Returns:
-            List of generation results, each containing text, token_ids, n_diff_steps
+            List of generation results, each containing text, token_ids, nfe
         """
         start_time = time.time()
 
@@ -178,7 +178,7 @@ class BenchmarkRunner:
         # Calculate statistics
         total_tokens = sum(len(o["token_ids"]) for o in outputs)
         total_time = sum(o.get("generation_time", 0) for o in outputs)
-        avg_diff_steps = sum(o.get("n_diff_steps", 0) for o in outputs) / len(outputs) if outputs else 0
+        avg_nfe = sum(o.get("nfe", o.get("num_nfes", o.get("n_diff_steps", 0))) for o in outputs) / len(outputs) if outputs else 0
 
         return {
             "outputs": outputs,
@@ -186,6 +186,6 @@ class BenchmarkRunner:
             "total_tokens": total_tokens,
             "total_time": total_time,
             "avg_tokens_per_sample": total_tokens / len(outputs) if outputs else 0,
-            "avg_diff_steps": avg_diff_steps,
+            "avg_nfe": avg_nfe,
             "throughput_tok_s": total_tokens / total_time if total_time > 0 else 0,
         }

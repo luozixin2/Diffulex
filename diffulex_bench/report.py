@@ -43,7 +43,7 @@ def generate_report(results_file: str, output_file: Optional[str] = None) -> str
     append_line(f"  Number of Samples: {metrics.get('num_samples', 'N/A')}")
     append_line(f"  Total Tokens: {metrics.get('total_tokens', 'N/A')}")
     append_line(f"  Average Tokens per Sample: {metrics.get('avg_tokens_per_sample', 0):.2f}")
-    append_line(f"  Average Diffusion Steps: {metrics.get('avg_diff_steps', 0):.2f}")
+    append_line(f"  Average NFE: {metrics.get('avg_nfe', 0):.2f}")
     append_line(f"  Total Time: {metrics.get('total_time', 0):.2f} seconds")
     append_line(f"  Throughput: {metrics.get('throughput_tok_s', 0):.2f} tokens/s")
 
@@ -95,7 +95,7 @@ def compare_results(result_files: List[str], output_file: Optional[str] = None) 
             "num_samples": metrics.get("num_samples", 0),
             "total_tokens": metrics.get("total_tokens", 0),
             "avg_tokens_per_sample": metrics.get("avg_tokens_per_sample", 0),
-            "avg_diff_steps": metrics.get("avg_diff_steps", 0),
+            "avg_nfe": metrics.get("avg_nfe", 0),
             "throughput_tok_s": metrics.get("throughput_tok_s", 0),
             "accuracy": metrics.get("accuracy", None),
             "timestamp": results.get("timestamp", "N/A"),

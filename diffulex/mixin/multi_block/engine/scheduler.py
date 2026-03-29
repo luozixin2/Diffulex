@@ -123,6 +123,9 @@ class SchedulerMultiBlockMixin:
                 req.new_tokens += len(accepted_ids)
 
             req.postprocess()
+            req.nfe += 1
+            if req.max_nfe_reached or req.max_repetition_run_reached:
+                req.force_deactivate()
             if req.is_completed:
                 req.status = DllmReqStatus.FINISHED
                 self.kv_cache_manager.free(req)

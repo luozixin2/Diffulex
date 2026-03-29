@@ -31,8 +31,11 @@ class DllmReq(DllmReqMultiBlockMixin, ReqStateMixin):
         self.page_cache_missed: list[bool] = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
+        self.max_nfe = sampling_params.max_nfe
+        self.max_repetition_run = sampling_params.max_repetition_run
         self.ignore_eos = sampling_params.ignore_eos
         self.new_tokens = 0
+        self.nfe = 0
         self.meet_eos = False
         self.is_multi_block = False
 

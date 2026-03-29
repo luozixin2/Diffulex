@@ -203,6 +203,8 @@ class EvalConfig:
     # Sampling configuration
     temperature: float = 0.0
     max_tokens: int = 256
+    max_nfe: Optional[int] = None
+    max_repetition_run: Optional[int] = None
     ignore_eos: bool = False
     add_bos_token: Optional[bool] = None  # Base model: False; Instruct/chat: True
 
@@ -231,6 +233,8 @@ class EvalConfig:
         return SamplingParams(
             temperature=self.temperature,
             max_tokens=self.max_tokens,
+            max_nfe=self.max_nfe,
+            max_repetition_run=self.max_repetition_run,
             ignore_eos=self.ignore_eos,
         )
 
