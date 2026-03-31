@@ -148,6 +148,18 @@ class DllmSamplerNoShiftBase(SamplerNoShiftLogits):
     output_cls = SampleOutputBase
 
     @staticmethod
+    def _split_logits_per_req(attn_metadata, reqs: list[DllmReq], logits: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        cu = getattr(attn_metadata, "cu_seqlens_q", None)
+        if cu is not None and len(cu) == len(reqs) + 1:
+            split_sizes = [(int(cu[i + 1]) - int(cu[i])) for i in range(len(reqs))]
+        else:
+            split_sizes = [
+                len(req.running_sequence) if attn_metadata.is_prefill[idx] else req.chunk_size
+                for idx, req in enumerate(reqs)
+            ]
+        return torch.split(logits, split_sizes, dim=0)
+
+    @staticmethod
     def _prefill_mask_token_local_ids(req: DllmReq, block, req_logits: torch.Tensor) -> list[int]:
         prefix_offset = int(getattr(req, "in_cache_len", 0))
         local_ids = [idx - prefix_offset for idx in block.mask_token_global_ids]
@@ -179,14 +191,7 @@ class DllmSamplerNoShiftBase(SamplerNoShiftLogits):
     ):
         attn_metadata = self.fetch_attn_metadata()
 
-        split_logits = torch.split(
-            logits,
-            [
-                len(req.running_sequence) if attn_metadata.is_prefill[idx] else req.chunk_size
-                for idx, req in enumerate(reqs)
-            ],
-            dim=0,
-        )
+        split_logits = self._split_logits_per_req(attn_metadata, reqs, logits)
 
         accepted_ids_map = {}
         sampled_tokens_map = {}
@@ -211,6 +216,10 @@ class DllmSamplerNoShiftBase(SamplerNoShiftLogits):
                     continue
 
                 if attn_metadata.is_prefill[idx]:
+                    # Prefix-cache prefill can produce q_len=0 for some requests in mixed batches.
+                    # In that case there are no logits to sample for this req in this step.
+                    if req_logits.shape[0] == 0:
+                        continue
                     local_ids = self._prefill_mask_token_local_ids(req, block, req_logits)
                     mask_token_logits = req_logits[local_ids, ...]
                 else:
@@ -282,14 +291,7 @@ class DllmSamplerShiftBase(SamplerShiftLogits):
     ):
         attn_metadata = self.fetch_attn_metadata()
 
-        split_logits = torch.split(
-            logits,
-            [
-                len(req.running_sequence) if attn_metadata.is_prefill[idx] else req.chunk_size
-                for idx, req in enumerate(reqs)
-            ],
-            dim=0,
-        )
+        split_logits = DllmSamplerNoShiftBase._split_logits_per_req(attn_metadata, reqs, logits)
 
         accepted_ids_map = {}
         sampled_tokens_map = {}
@@ -305,6 +307,15 @@ class DllmSamplerShiftBase(SamplerShiftLogits):
             mask_token_rel_ids_sub_map = {}
             confidence_sub_map = {}
             initial_confidence_sub_map = {}
+            if req_logits.shape[0] == 0:
+                req_id_str = str(req.req_id)
+                true_local_ids_map[req_id_str] = true_local_ids_sub_map
+                accepted_ids_map[req_id_str] = accepted_ids_sub_map
+                sampled_tokens_map[req_id_str] = sampled_tokens_sub_map
+                mask_token_rel_ids_map[req_id_str] = mask_token_rel_ids_sub_map
+                confidence_map[req_id_str] = confidence_sub_map
+                initial_confidence_map[req_id_str] = initial_confidence_sub_map
+                continue
             last_logits = self._fetch_last_logits(req_logits, req)
             shifted_logits = self._shift_logits(req_logits, last_logits)
 
@@ -316,6 +327,8 @@ class DllmSamplerShiftBase(SamplerShiftLogits):
                     continue
 
                 if attn_metadata.is_prefill[idx]:
+                    if shifted_logits.shape[0] == 0:
+                        continue
                     local_ids = DllmSamplerNoShiftBase._prefill_mask_token_local_ids(req, block, shifted_logits)
                     mask_token_logits = shifted_logits[local_ids, ...]
                 else:

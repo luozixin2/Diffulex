@@ -4,7 +4,7 @@ task: gsm8k_lightning_json_sdar_lightning
 dataset_path: json
 dataset_name: null
 dataset_kwargs:
-  data_files: /home/jyj/workspace/denglab-diffulex/MultiBD/multi_bd/eval/data/lightning/GSM8K.json
+  data_files: diffulex_bench/data/GSM8K.json
 test_split: train
 output_type: generate_until
 doc_to_text: !function sdar_utils.doc_to_text_math

@@ -194,6 +194,12 @@ Examples:
         default=None,
         help="Limit number of samples",
     )
+    parser.add_argument(
+        "--dataset-data-files",
+        type=str,
+        default=None,
+        help="Override task YAML `dataset_kwargs.data_files` with this JSON path",
+    )
 
     # Output arguments
     parser.add_argument(

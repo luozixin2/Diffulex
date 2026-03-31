@@ -6,6 +6,10 @@ import sys
 import logging
 import os
 import time
+import re
+import json
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -149,6 +153,72 @@ def _resolve_lm_eval_include_path(config: BenchmarkConfig) -> Optional[Path]:
     return (Path(__file__).resolve().parent / "tasks").resolve()
 
 
+def _task_name_to_yaml_map(include_root: Path) -> dict[str, Path]:
+    mapping: dict[str, Path] = {}
+    for yml in include_root.rglob("*.yaml"):
+        try:
+            text = yml.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        m = re.search(r"(?m)^\s*task:\s*([^\s#]+)\s*$", text)
+        if m:
+            mapping.setdefault(m.group(1).strip(), yml)
+    return mapping
+
+
+def _rewrite_task_data_files(task_yaml: Path, data_files: str) -> bool:
+    text = task_yaml.read_text(encoding="utf-8")
+    data_files_value = str(Path(data_files).expanduser())
+    if Path(data_files_value).exists():
+        data_files_value = str(Path(data_files_value).resolve())
+    replacement_value = json.dumps(data_files_value)
+    replaced, n = re.subn(r"(?m)^(\s*data_files:\s*).*$", rf"\1{replacement_value}", text, count=1)
+    if n == 0:
+        return False
+    task_yaml.write_text(replaced, encoding="utf-8")
+    return True
+
+
+def _resolve_include_path_with_data_files_override(
+    config: BenchmarkConfig, logger
+) -> tuple[Optional[Path], Optional[Path]]:
+    include_path = _resolve_lm_eval_include_path(config)
+    data_files = config.eval.dataset_data_files
+    if not data_files:
+        return include_path, None
+    if include_path is None or not include_path.is_dir():
+        logger.warning(
+            "dataset_data_files is set but include_path is unavailable; "
+            "cannot rewrite task YAML data_files."
+        )
+        return include_path, None
+
+    tmp_root = Path(tempfile.mkdtemp(prefix="diffulex_tasks_override_")).resolve()
+    tmp_tasks = tmp_root / "tasks"
+    shutil.copytree(include_path, tmp_tasks, dirs_exist_ok=True)
+    task_map = _task_name_to_yaml_map(tmp_tasks)
+    requested = [name.strip() for name in str(config.eval.dataset_name).split(",") if name.strip()]
+
+    rewritten = 0
+    for task_name in requested:
+        task_yaml = task_map.get(task_name)
+        if task_yaml is None:
+            logger.warning(f"Task '{task_name}' not found under include_path={include_path}")
+            continue
+        if _rewrite_task_data_files(task_yaml, data_files):
+            rewritten += 1
+        else:
+            logger.warning(f"Task '{task_name}' has no data_files field to override: {task_yaml}")
+
+    if rewritten == 0:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        logger.warning("No task YAML was rewritten by dataset_data_files; using original include_path.")
+        return include_path, None
+
+    logger.info(f"Overrode dataset data_files for {rewritten} task(s) -> {data_files}")
+    return tmp_tasks, tmp_root
+
+
 def _sanitize_for_dir(name: str, max_len: int = 96) -> str:
     s = "".join(c if c.isalnum() or c in "._-" else "_" for c in name.strip())
     return s[:max_len] if s else "run"
@@ -222,7 +292,7 @@ def run_benchmark(config: BenchmarkConfig) -> None:
         run_output_dir,
     ]
 
-    inc = _resolve_lm_eval_include_path(config)
+    inc, tmp_include_root = _resolve_include_path_with_data_files_override(config, logger)
     if inc is not None and inc.is_dir():
         sys.argv.extend(["--include_path", str(inc)])
 
@@ -245,10 +315,13 @@ def run_benchmark(config: BenchmarkConfig) -> None:
     ]
     logger.info("\n".join(lm_eval_info))
 
-    # Run lm_eval
-    cli_evaluate()
-
-    logger.success("Evaluation completed successfully")
+    try:
+        cli_evaluate()
+        logger.success("Evaluation completed successfully")
+    finally:
+        sys.argv = original_argv
+        if tmp_include_root is not None:
+            shutil.rmtree(tmp_include_root, ignore_errors=True)
 
     # except Exception as e:
     #     logger.error(f"Evaluation failed: {e}", exc_info=True)
@@ -333,6 +406,8 @@ def load_config_from_args(args) -> BenchmarkConfig:
             config.eval.output_dir = args.output_dir
         if getattr(args, "include_path", None) is not None:
             config.eval.include_path = args.include_path
+        if getattr(args, "dataset_data_files", None) is not None:
+            config.eval.dataset_data_files = args.dataset_data_files
         if getattr(args, "use_run_subdirectory", None) is not None:
             config.eval.use_run_subdirectory = bool(args.use_run_subdirectory)
 
@@ -395,6 +470,7 @@ def load_config_from_args(args) -> BenchmarkConfig:
             dataset_name=args.dataset,
             dataset_split=getattr(args, "dataset_split", "test"),
             dataset_limit=args.dataset_limit,
+            dataset_data_files=getattr(args, "dataset_data_files", None),
             temperature=args.temperature,
             max_tokens=args.max_tokens,
             max_nfe=getattr(args, "max_nfe", None),

@@ -199,6 +199,8 @@ class EvalConfig:
     dataset_limit: Optional[int] = None
     # Directory of custom task YAMLs for lm-eval (--include_path). None → diffulex_bench/tasks next to main.
     include_path: Optional[str] = None
+    # Optional JSON data file override for tasks that declare `dataset_kwargs.data_files`.
+    dataset_data_files: Optional[str] = None
 
     # Sampling configuration
     temperature: float = 0.0
