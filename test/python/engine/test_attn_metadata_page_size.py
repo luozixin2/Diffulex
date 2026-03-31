@@ -8,7 +8,7 @@ from diffulex.mixin.multi_block.engine.model_runner import ModelRunnerMultiBlock
 class _Runner(ModelRunnerMultiBlockMixin):
     def __init__(self):
         self.page_size = 32
-        self.block_size = 4
+        self.block_size = 32
         self.rank = 0
         self.is_prefix_full = True
         self.config = SimpleNamespace(buffer_size=4, kv_cache_layout="unified")
@@ -28,24 +28,23 @@ class _Req:
     def __init__(self):
         self.status = SimpleNamespace(PENDING="PENDING")
         self.is_prefilling = True
-        self.block_size = 4
+        self.block_size = 32
         self.buffer_size = 4
-        self.running_sequence = [1, 2, 3, 4]
-        self.running_position_ids = [8, 9, 10, 11]
-        self.in_cache_len = 8
-        self.running_len = 12
-        self.valid_len = 4
-        self.cache_len = 12
-        self.to_cache_len = 4
-        self.prefix_len = 12
-        self.padded_prefix_len = 12
+        self.running_sequence = list(range(32, 64))
+        self.running_position_ids = list(range(32, 64))
+        self.in_cache_len = 32
+        self.running_len = 64
+        self.valid_len = 32
+        self.cache_len = 64
+        self.to_cache_len = 32
+        self.prefix_len = 64
+        self.padded_prefix_len = 64
         self.page_table = [0]
         self.page_cache_missed = [True]
-        self.num_cached_tokens = 8
+        self.num_cached_tokens = 32
         self.dllm_blocks = [
-            SimpleNamespace(start=0, end=4, rel_page_id=0, is_to_cache=False),
-            SimpleNamespace(start=4, end=8, rel_page_id=0, is_to_cache=False),
-            SimpleNamespace(start=8, end=12, rel_page_id=0, is_to_cache=True),
+            SimpleNamespace(start=0, end=32, rel_page_id=0, is_to_cache=False),
+            SimpleNamespace(start=32, end=64, rel_page_id=0, is_to_cache=True),
         ]
 
     def step(self):
@@ -61,4 +60,4 @@ def test_prepare_chunked_prefill_passes_runtime_page_size_to_attn_metadata() -> 
 
     assert runner.captured_kwargs is not None
     assert runner.captured_kwargs["page_size"] == 32
-    assert runner.captured_kwargs["block_size"] == 4
+    assert runner.captured_kwargs["block_size"] == 32

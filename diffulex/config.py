@@ -65,8 +65,11 @@ class Config:
         if self.block_size % 4 != 0:
             raise ValueError(f"block_size must be divisible by 4, got: {self.block_size}")
         
-        if self.page_size < self.block_size:
-            raise ValueError(f"page_size must be >= block_size, got: page_size={self.page_size}, block_size={self.block_size}")
+        if self.page_size != self.block_size:
+            raise ValueError(
+                "page_size must equal block_size, "
+                f"got: page_size={self.page_size}, block_size={self.block_size}"
+            )
 
         if not 1 <= self.tensor_parallel_size <= 8:
             raise ValueError(
