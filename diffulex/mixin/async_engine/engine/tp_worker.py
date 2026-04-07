@@ -26,11 +26,12 @@ class DiffulexTPWorkerAsyncMixin:
         def _step():
             reqs, is_prefill = self.scheduler.schedule()
             sample_output = self.model_runner.call("run", reqs)
-            n_diff_steps = self.scheduler.postprocess(reqs, sample_output)
+            self.scheduler.postprocess(reqs, sample_output)
             outputs = [(req.req_id, req.completion_token_ids) for req in reqs if req.is_finished]
+            completed_nfes = {req.req_id: req.nfe for req in reqs if req.is_finished}
             num_tokens = sum(req.num_tokens for req in reqs) if is_prefill else sum(req.new_tokens for req in reqs)
             deltas = []
-            return outputs, num_tokens, is_prefill, n_diff_steps, deltas
+            return outputs, num_tokens, is_prefill, completed_nfes, deltas
 
         return await loop.run_in_executor(executor, _step)
 
@@ -60,7 +61,7 @@ class DiffulexTPWorkerAsyncMixin:
         outputs = [None] * len(prompts)
         prefill_throughput = decode_throughput = 0.0
         n_steps = 0
-        n_diff_steps = [-1] * len(prompts)
+        nfes = [-1] * len(prompts)
         while not await self.is_finished_async():
             t = perf_counter()
             n_steps += 1
@@ -68,7 +69,7 @@ class DiffulexTPWorkerAsyncMixin:
                 output,
                 num_tokens,
                 is_prefill,
-                cur_n_diff_steps,
+                cur_nfes,
                 _,
             ) = await self.step_async()
             if use_tqdm:
@@ -82,10 +83,10 @@ class DiffulexTPWorkerAsyncMixin:
                         "Decode": f"{int(decode_throughput)}tok/s",
                     }
                 )
-            if cur_n_diff_steps:
-                for req_id, n_step in cur_n_diff_steps.items():
-                    if req_id in reqid_to_idx and n_step >= 0:
-                        n_diff_steps[reqid_to_idx[req_id]] = n_step
+            if cur_nfes:
+                for req_id, nfe_count in cur_nfes.items():
+                    if req_id in reqid_to_idx and nfe_count >= 0:
+                        nfes[reqid_to_idx[req_id]] = nfe_count
             for req_id, token_ids in output:
                 if req_id in reqid_to_idx:
                     outputs[reqid_to_idx[req_id]] = token_ids
@@ -99,7 +100,7 @@ class DiffulexTPWorkerAsyncMixin:
         assert all(toks is not None for toks in outputs), "Some reqs did not produce outputs"
         eos = getattr(self.tokenizer, "eos_token", None) or ""
         formatted = []
-        for token_ids, n_diff_step in zip(outputs, n_diff_steps):
+        for token_ids, nfe_count in zip(outputs, nfes):
             raw = decode_token_ids_robust(self.tokenizer, token_ids)
             text = raw.split(eos)[0] if eos else raw
             formatted.append(
@@ -108,7 +109,7 @@ class DiffulexTPWorkerAsyncMixin:
                     "token_ids": token_ids[: token_ids.index(self.config.eos)]
                     if self.config.eos in token_ids
                     else token_ids,
-                    "n_diff_steps": n_diff_step,
+                    "nfe": nfe_count,
                 }
             )
         outputs = formatted

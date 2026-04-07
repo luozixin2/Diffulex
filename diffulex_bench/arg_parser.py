@@ -152,6 +152,18 @@ Examples:
         help="Maximum tokens to generate",
     )
     parser.add_argument(
+        "--max-nfe",
+        type=int,
+        default=None,
+        help="Maximum number of forward evaluations (NFE) allowed per request",
+    )
+    parser.add_argument(
+        "--max-repetition-run",
+        type=int,
+        default=None,
+        help="Kill a request when its generated suffix ends with this many identical consecutive tokens",
+    )
+    parser.add_argument(
         "--ignore-eos",
         action="store_true",
         help="Ignore EOS token",
@@ -181,6 +193,12 @@ Examples:
         type=int,
         default=None,
         help="Limit number of samples",
+    )
+    parser.add_argument(
+        "--dataset-data-files",
+        type=str,
+        default=None,
+        help="Override task YAML `dataset_kwargs.data_files` with this JSON path",
     )
 
     # Output arguments
@@ -282,10 +300,18 @@ Examples:
         help="Number of active diffusion blocks in buffer",
     )
     parser.add_argument(
-        "--save-kv-mapping-trace",
+        "--multi-block-prefix-full",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Record KV / DLLM block traces into per-step trajectory; with --output-dir writes trajectory.json (multi-block only)",
+        help="Whether multi_bd should treat the prefix region as fully visible",
+    )
+    parser.add_argument(
+        "--engine-arg",
+        dest="engine_args",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Extra Diffulex engine override. May be repeated; values are parsed with YAML semantics.",
     )
     return parser
 

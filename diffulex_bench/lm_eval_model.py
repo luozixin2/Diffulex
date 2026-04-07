@@ -17,6 +17,7 @@ from lm_eval.api.registry import register_model
 from diffulex import SamplingParams
 from diffulex.utils.output import decode_token_ids_robust
 from diffulex_bench.runner import BenchmarkRunner
+from diffulex_bench.config import decode_model_arg_value, extract_diffulex_engine_kwargs
 from diffulex.logger import get_logger
 
 T = TypeVar("T", bound="LM")
@@ -76,6 +77,8 @@ class DiffulexLM(LM):
         device: Optional[str] = "cuda",
         dtype: Optional[Union[str, type]] = "auto",
         max_new_tokens: Optional[int] = 256,
+        max_nfe: Optional[int] = None,
+        max_repetition_run: Optional[int] = None,
         max_length: Optional[int] = 2048,
         add_bos_token: Optional[bool] = False,
         trust_remote_code: Optional[bool] = True,
@@ -100,8 +103,8 @@ class DiffulexLM(LM):
         decoding_threshold: Optional[float] = None,
         block_size: Optional[int] = 32,
         buffer_size: Optional[int] = 4,
+        multi_block_prefix_full: Optional[bool] = False,
         save_dir: Optional[str] = None,
-        save_kv_mapping_trace: Union[bool, str, int, None] = False,
         wait_ready: Optional[bool] = True,
         **kwargs,
     ) -> None:
@@ -121,10 +124,10 @@ class DiffulexLM(LM):
         self.max_length = max_length
         self.add_bos_token = add_bos_token
         self.max_new_tokens = max_new_tokens
+        self.max_nfe = max_nfe
+        self.max_repetition_run = max_repetition_run
         self.temperature = temperature
         self.save_dir = save_dir
-        self.save_kv_mapping_trace = _coerce_bool(save_kv_mapping_trace, False)
-        self._trajectory_batches: List[dict] = []
         # Cumulative per-eval-run, same layout as multi_bd/eval (rank-0 JSON lists).
         self._responses_full: List[str] = []
         self._responses_truncated: List[str] = []
@@ -144,32 +147,17 @@ class DiffulexLM(LM):
         self.all_nfe = []
         self.all_tokens = []
 
+        engine_sources = locals().copy()
+        extra_engine_kwargs = engine_sources.pop("kwargs")
+        engine_sources.pop("self", None)
+        engine_sources.update(extra_engine_kwargs)
+
         # Initialize Diffulex runner
         self.runner = BenchmarkRunner(
             model_path=pretrained,
             tokenizer_path=pretrained,
             wait_ready=wait_ready,
-            model_name=model_name,
-            decoding_strategy=decoding_strategy,
-            mask_token_id=mask_token_id,
-            tensor_parallel_size=tensor_parallel_size,
-            data_parallel_size=data_parallel_size,
-            gpu_memory_utilization=gpu_memory_utilization,
-            max_model_len=max_model_len,
-            max_num_batched_tokens=max_num_batched_tokens,
-            max_num_reqs=max_num_reqs,
-            use_lora=use_lora,
-            lora_path=lora_path if use_lora else "",
-            pre_merge_lora=pre_merge_lora,
-            enforce_eager=enforce_eager,
-            kv_cache_layout=kv_cache_layout,
-            decoding_thresholds=decoding_thresholds,
-            add_block_threshold=add_block_threshold,
-            semi_complete_threshold=semi_complete_threshold,
-            decoding_threshold=decoding_threshold,
-            block_size=block_size,
-            buffer_size=buffer_size,
-            save_kv_mapping_trace=self.save_kv_mapping_trace,
+            **extract_diffulex_engine_kwargs(engine_sources),
         )
 
         self.tokenizer = self.runner.tokenizer
@@ -178,6 +166,8 @@ class DiffulexLM(LM):
         self.sampling_params = SamplingParams(
             temperature=temperature,
             max_tokens=max_new_tokens,
+            max_nfe=max_nfe,
+            max_repetition_run=max_repetition_run,
         )
 
         self.logger.success("Diffulex engine initialized successfully")
@@ -226,8 +216,30 @@ class DiffulexLM(LM):
             Instance of the LM class
         """
         additional_config = {} if additional_config is None else additional_config
-        args = utils.simple_parse_args_string(arg_string)
-        args2 = {k: v for k, v in additional_config.items() if v is not None}
+        args = {
+            k: decode_model_arg_value(v)
+            for k, v in utils.simple_parse_args_string(arg_string).items()
+        }
+        args2 = {
+            k: decode_model_arg_value(v)
+            for k, v in additional_config.items()
+            if v is not None
+        }
+        return cls(**args, **args2)
+
+    @classmethod
+    def create_from_arg_obj(cls: Type[T], arg_dict: dict, additional_config: Optional[dict] = None) -> T:
+        """Mirror lm-eval's dict-based init path while decoding encoded complex values."""
+        additional_config = {} if additional_config is None else additional_config
+        args = {
+            k: decode_model_arg_value(v)
+            for k, v in arg_dict.items()
+        }
+        args2 = {
+            k: decode_model_arg_value(v)
+            for k, v in additional_config.items()
+            if v is not None
+        }
         return cls(**args, **args2)
 
     def apply_chat_template(self, chat_history, add_generation_prompt: bool = True) -> str:
@@ -272,12 +284,10 @@ class DiffulexLM(LM):
 
         # Run generation
         start_time = time.time()
-        traj_batches = self._trajectory_batches if self.save_kv_mapping_trace else None
         outputs = self.runner.generate(
             prompts,
             self.sampling_params,
             use_tqdm=not disable_tqdm,
-            trajectory_batches=traj_batches,
         )
         end_time = time.time()
 
@@ -306,13 +316,13 @@ class DiffulexLM(LM):
             results.append(extracted)
 
             token_ids = output.get("token_ids", [])
-            n_diff_steps = output.get("n_diff_steps", 0)
+            nfe = output.get("nfe", output.get("num_nfes", output.get("n_diff_steps", 0)))
 
             num_tokens += len(token_ids)
-            num_nfe += n_diff_steps
+            num_nfe += nfe
 
             self.all_generation_times.append(total_time / len(outputs) if outputs else 0)
-            self.all_nfe.append(n_diff_steps)
+            self.all_nfe.append(nfe)
             self.all_tokens.append(len(token_ids))
 
         # Update statistics
@@ -377,19 +387,6 @@ class DiffulexLM(LM):
                 with open(resp_path, "w", encoding="utf-8") as f:
                     json.dump(rows, f, indent=2, ensure_ascii=False)
                 self.logger.info(f"Responses saved to {resp_path}")
-
-        if self.save_kv_mapping_trace and self._trajectory_batches:
-            traj_path = os.path.join(self.save_dir, "trajectory.json")
-            raw = json.dumps({"batches": self._trajectory_batches}, indent=2, ensure_ascii=False)
-            compact = _compact_numeric_arrays_in_json(raw)
-            with open(traj_path, "w", encoding="utf-8") as f:
-                f.write(compact)
-            self.logger.info(f"Trajectory (KV / block traces) saved to {traj_path}")
-        elif self.save_kv_mapping_trace and not self._trajectory_batches:
-            self.logger.warning(
-                "save_kv_mapping_trace is True but no trajectory batches were recorded "
-                "(e.g. DP mode or trace disabled in engine)."
-            )
 
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
         """

@@ -7,11 +7,6 @@ logger = get_logger(__name__)
 
 
 def decode_token_ids_robust(tokenizer, token_ids: list[int] | None, *, skip_special_tokens: bool = False) -> str:
-    """Decode token ids to text.
-
-    Some checkpoints emit ids that ``convert_ids_to_tokens`` maps to ``None`` (tokenizer/model vocab skew).
-    Qwen2/GPT2 ``convert_tokens_to_string`` then does ``"".join(tokens)`` and crashes with ``TypeError``.
-    """
     if not token_ids:
         return ""
     try:
@@ -35,11 +30,8 @@ class ReqStep:
     block_size: int
     buffer_bids: list[int]
 
-    # Populated when engine saves KV mapping trace (multi-block prepare); see Config.save_kv_mapping_trace.
-    kv_mapping_trace: dict | None = None
-
     def to_dict(self) -> dict:
-        d = dict(
+        return dict(
             step_id=self.step_id,
             step_time=self.step_time,
             is_prefill=self.is_prefill,
@@ -48,9 +40,6 @@ class ReqStep:
             block_size=self.block_size,
             buffer_bids=self.buffer_bids,
         )
-        if self.kv_mapping_trace is not None:
-            d["kv_mapping_trace"] = self.kv_mapping_trace
-        return d
 
 
 @dataclass
@@ -63,6 +52,8 @@ class ReqTrajectory:
     is_truncated: bool
     max_new_tokens_reached: bool
     max_model_len_reached: bool
+    max_nfe_reached: bool
+    max_repetition_run_reached: bool
     eos_token_generated: bool
 
     text: str = None
@@ -78,6 +69,8 @@ class ReqTrajectory:
             is_truncated=self.is_truncated,
             max_new_tokens_reached=self.max_new_tokens_reached,
             max_model_len_reached=self.max_model_len_reached,
+            max_nfe_reached=self.max_nfe_reached,
+            max_repetition_run_reached=self.max_repetition_run_reached,
             eos_token_generated=self.eos_token_generated,
             text=self.text,
         )
@@ -95,20 +88,27 @@ class GenerationOutputs:
                 is_truncated=False,
                 max_new_tokens_reached=False,
                 max_model_len_reached=False,
+                max_nfe_reached=False,
+                max_repetition_run_reached=False,
                 eos_token_generated=False,
             )
             for req_id in range(num_prompts)
         ]
+        self._batch_step_count = 0
+        self._batch_total_time = 0.0
+        self._batch_generated_tokens = 0
+        self._prefill_batch_time = 0.0
+        self._prefill_batch_tokens = 0
+        self._decode_batch_time = 0.0
+        self._decode_batch_tokens = 0
 
     @property
+    def batch_step_count(self) -> int:
+        return self._batch_step_count
+    
+    @property
     def tpf(self) -> float:
-        num_generated_tokens = 0
-        num_steps = 0
-        for trajectory in self.trajectories:
-            for step in trajectory.trajectory:
-                num_generated_tokens += step.num_generated_tokens
-                num_steps += 1
-        return num_generated_tokens / num_steps if num_steps > 0 else 0
+        return self._batch_generated_tokens / self._batch_step_count if self._batch_step_count > 0 else 0
 
     @property
     def ttft(self) -> float:
@@ -132,38 +132,50 @@ class GenerationOutputs:
 
     @property
     def prefill_throughput(self) -> float:
-        num_prefill_tokens = 0
-        total_time = 0.0
-        for trajectory in self.trajectories:
-            if len(trajectory.trajectory) == 0:
-                continue
-
-            prefill_step = trajectory.trajectory[0]
-            if not prefill_step.is_prefill:
-                continue
-
-            num_prefill_tokens += len(prefill_step.running_token_ids)
-            total_time += prefill_step.step_time
-        return num_prefill_tokens / total_time
+        return self._prefill_batch_tokens / self._prefill_batch_time if self._prefill_batch_time > 0 else 0
 
     @property
     def decode_throughput(self) -> float:
-        num_generated_tokens = 0
-        total_time = 0.0
-        for trajectory in self.trajectories:
-            for step in trajectory.trajectory:
-                if not step.is_prefill:
-                    num_generated_tokens += step.num_generated_tokens
-                    total_time += step.step_time
-        return num_generated_tokens / total_time if total_time > 0 else 0
+        return self._decode_batch_tokens / self._decode_batch_time if self._decode_batch_time > 0 else 0
+
+    @property
+    def total_time(self) -> float:
+        return self._batch_total_time
 
     def record_step(self, reqs: list[DllmReq], step_time: float, req_id_to_prompt_id: dict[int, int] | None = None):
+        if reqs:
+            self._batch_step_count += 1
+            self._batch_total_time += step_time
+
+            has_prefill = False
+            has_decode = False
+            prefill_tokens_this_step = 0
+            decode_tokens_this_step = 0
+            generated_tokens_this_step = 0
+
+            for req in reqs:
+                generated_tokens_this_step += req.new_tokens
+                running_sequence = req.running_sequence
+                if req.is_prefilling:
+                    has_prefill = True
+                    prefill_tokens_this_step += len(running_sequence or [])
+                else:
+                    has_decode = True
+                    decode_tokens_this_step += req.new_tokens
+
+            self._batch_generated_tokens += generated_tokens_this_step
+            self._prefill_batch_tokens += prefill_tokens_this_step
+            self._decode_batch_tokens += decode_tokens_this_step
+            if has_prefill:
+                self._prefill_batch_time += step_time
+            if has_decode:
+                self._decode_batch_time += step_time
+
         for req in reqs:
             prompt_idx = (req_id_to_prompt_id or {}).get(req.req_id, req.req_id)
             if prompt_idx >= len(self.trajectories):
                 continue
             cur_trajectory = self.trajectories[prompt_idx]
-            kv_trace = getattr(req, "last_kv_mapping_trace", None)
             step_id = len(cur_trajectory.trajectory)
             cur_trajectory.trajectory.append(
                 ReqStep(
@@ -171,10 +183,11 @@ class GenerationOutputs:
                     step_time=step_time,
                     is_prefill=req.is_prefilling,
                     num_generated_tokens=req.new_tokens,
-                    running_token_ids=req.running_sequence.copy() if req.running_sequence else None,
+                    running_token_ids=(
+                        req.running_sequence.copy() if req.running_sequence is not None else []
+                    ),
                     block_size=req.block_size,
                     buffer_bids=[block.block_id for block in req.dllm_block_buffer.dllm_blocks],
-                    kv_mapping_trace=kv_trace,
                 )
             )
             cur_trajectory.token_ids = req.truncated_response.copy() if req.truncated_response else []
@@ -186,6 +199,8 @@ class GenerationOutputs:
             cur_trajectory.is_truncated = req.is_truncated
             cur_trajectory.max_new_tokens_reached = req.max_new_tokens_reached
             cur_trajectory.max_model_len_reached = req.max_model_len_reached
+            cur_trajectory.max_nfe_reached = getattr(req, "max_nfe_reached", False)
+            cur_trajectory.max_repetition_run_reached = getattr(req, "max_repetition_run_reached", False)
             cur_trajectory.eos_token_generated = req.eos_token_generated
 
     def postfix(self) -> dict:
@@ -202,8 +217,8 @@ class GenerationOutputs:
         logger.info("Generation Outputs Summary:")
         logger.info("--------------------------------")
         logger.info(f"Total Tokens: {sum(len(trajectory.token_ids) for trajectory in self.trajectories)} toks")
-        logger.info(f"Total NFEs: {sum(len(trajectory.trajectory) for trajectory in self.trajectories)} nfes (steps)")
-        logger.info(f"Total Time: {sum(trajectory.trajectory[-1].step_time for trajectory in self.trajectories)} sec")
+        logger.info(f"Total NFEs: {self.batch_step_count} nfes (steps)")
+        logger.info(f"Total Time: {self.total_time} sec")
         logger.info(f"TPF: {self.tpf:.2f} tok/step")
         logger.info(f"TTFT: {self.ttft:.2f} tok/sec")
         logger.info(f"TPOT: {self.tpot:.2f} tok/sec")
@@ -221,13 +236,13 @@ class GenerationOutputs:
             trajectory.text = raw_trunc.split(eos)[0] if eos else raw_trunc
 
     def to_benchmark_format(self) -> list[dict]:
-        """Convert to list of dicts expected by diffulex_bench: text, token_ids, n_diff_steps."""
+        """Convert to list of dicts expected by diffulex_bench: text, token_ids, nfe."""
         return [
             dict(
                 text=t.text or "",
                 full_text=(t.full_text if t.full_text is not None else t.text or ""),
                 token_ids=t.token_ids if t.token_ids is not None else [],
-                n_diff_steps=len(t.trajectory),
+                nfe=len(t.trajectory),
             )
             for t in self.trajectories
         ]

@@ -12,6 +12,22 @@ if TYPE_CHECKING:
 
 
 class DllmReqMultiBlockMixin:
+    def _restore_req_runtime_state(self):
+        super()._restore_req_runtime_state()
+
+        if not getattr(self, "is_multi_block", False):
+            return
+
+        dllm_blocks = getattr(self, "dllm_blocks", None) or []
+        dllm_block_buffer = getattr(self, "dllm_block_buffer", None)
+        if dllm_block_buffer is not None:
+            dllm_block_buffer.bind_req(self)
+
+        buffer_block_ids = {id(block) for block in getattr(dllm_block_buffer, "dllm_blocks", [])}
+        for block in dllm_blocks:
+            block.bind_req(self)
+            block.bind_buffer(dllm_block_buffer if id(block) in buffer_block_ids else None)
+
     def init_multi_block(self: DllmReq, config: Config):
         self.is_multi_block = True
         self.status_history = [self.status]
@@ -114,17 +130,38 @@ class DllmReqMultiBlockMixin:
         return len(self.token_ids) >= self.max_model_len
 
     @property
+    def max_nfe_reached(self) -> bool:
+        return self.max_nfe is not None and self.nfe >= self.max_nfe
+
+    @property
+    def repetition_run_length(self) -> int:
+        generated = self.truncated_response
+        if not generated:
+            return 0
+
+        last_token = generated[-1]
+        run_length = 1
+        for token in reversed(generated[:-1]):
+            if token != last_token:
+                break
+            run_length += 1
+        return run_length
+
+    @property
+    def max_repetition_run_reached(self) -> bool:
+        return self.max_repetition_run is not None and self.repetition_run_length >= self.max_repetition_run
+
+    @property
     def running_sequence(self) -> list[int]:
         if self.is_prefilling:
-            prefilling_len = self.running_len
-            return self.token_ids[:prefilling_len]
+            return self.token_ids[self.in_cache_len:self.running_len]
         elif self.is_decoding or self.is_completed:
             return self.dllm_block_buffer.buffer_sequence
 
     @property
     def running_position_ids(self) -> list[int]:
         if self.is_prefilling:
-            return range(self.in_cache_len, len(self))
+            return range(self.in_cache_len, self.running_len)
         elif self.is_decoding or self.is_completed:
             return self.dllm_block_buffer.buffer_position_ids
 
@@ -147,7 +184,13 @@ class DllmReqMultiBlockMixin:
 
     @property
     def is_truncated(self) -> bool:
-        return self.eos_token_generated or self.max_model_len_reached or self.max_new_tokens_reached
+        return (
+            self.eos_token_generated
+            or self.max_model_len_reached
+            or self.max_new_tokens_reached
+            or self.max_nfe_reached
+            or self.max_repetition_run_reached
+        )
 
     @property
     def full_response(self) -> list[int]:
@@ -382,6 +425,26 @@ class DllmReqMultiBlockMixin:
         for block_id in range(self.num_prefix_blocks):
             self.dllm_blocks[block_id].in_cache()
 
+    def apply_cached_prefix_pages(self):
+        if not getattr(self, "is_multi_block", False):
+            return
+        if not self.page_cache_missed:
+            return
+
+        cached_pages = 0
+        for missed in self.page_cache_missed:
+            if missed:
+                break
+            cached_pages += 1
+
+        if cached_pages == 0:
+            return
+
+        blocks_per_page = self.page_size // self.block_size
+        cached_blocks = min(cached_pages * blocks_per_page, len(self.dllm_blocks))
+        for block_id in range(cached_blocks):
+            self.dllm_blocks[block_id].in_cache()
+
     def postprocess(self):
         self.maybe_postprocess_prefix_blocks()
         block_id = 0
@@ -403,7 +466,11 @@ class DllmReqMultiBlockMixin:
             self.dllm_block_buffer.maybe_fix_context_management()
 
         if (
-            self.eos_token_generated or self.max_new_tokens_reached or self.max_model_len_reached
+            self.eos_token_generated
+            or self.max_new_tokens_reached
+            or self.max_model_len_reached
+            or self.max_nfe_reached
+            or self.max_repetition_run_reached
         ) and self.last_block_finished:
             completed_blocks = [block.is_complete for block in self.dllm_block_buffer.valid_blocks]
             if all(completed_blocks):

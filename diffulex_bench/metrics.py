@@ -102,13 +102,13 @@ def compute_metrics(
 
     # Basic statistics
     total_tokens = sum(len(o.get("token_ids", [])) for o in outputs)
-    avg_diff_steps = sum(o.get("n_diff_steps", 0) for o in outputs) / len(outputs) if outputs else 0
+    avg_nfe = sum(o.get("nfe", o.get("num_nfes", o.get("n_diff_steps", 0))) for o in outputs) / len(outputs) if outputs else 0
     total_time = sum(o.get("generation_time", 0) for o in outputs)
 
     metrics["num_samples"] = len(outputs)
     metrics["total_tokens"] = total_tokens
     metrics["avg_tokens_per_sample"] = total_tokens / len(outputs) if outputs else 0
-    metrics["avg_diff_steps"] = avg_diff_steps
+    metrics["avg_nfe"] = avg_nfe
     metrics["total_time"] = total_time
     metrics["throughput_tok_s"] = total_tokens / total_time if total_time > 0 else 0
 

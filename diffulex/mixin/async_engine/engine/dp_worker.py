@@ -27,7 +27,7 @@ class DiffulexDPWorkerAsyncMixin:
         all_outputs = []
         total_tokens = 0
         any_prefill = False
-        merged_diff_steps = {}
+        merged_nfes = {}
         merged_deltas = []
 
         # Check all replicas in parallel
@@ -42,7 +42,7 @@ class DiffulexDPWorkerAsyncMixin:
 
         if step_tasks:
             step_results = await asyncio.gather(*[task for _, task in step_tasks])
-            for (i, _), (outputs, num_tokens, is_prefill, n_diff_steps, deltas) in zip(step_tasks, step_results):
+            for (i, _), (outputs, num_tokens, is_prefill, nfes, deltas) in zip(step_tasks, step_results):
                 if outputs:
                     # remap local seq_ids to global ids
                     for sid, toks in outputs:
@@ -51,15 +51,15 @@ class DiffulexDPWorkerAsyncMixin:
                             all_outputs.append((gid, toks))
                 total_tokens += num_tokens
                 any_prefill = any_prefill or is_prefill
-                if n_diff_steps:
-                    merged_diff_steps.update(n_diff_steps)
+                if nfes:
+                    merged_nfes.update(nfes)
                 if deltas:
                     for sid, toks, fin in deltas:
                         gid = self._gid_map.get((i, sid), None)
                         if gid is not None:
                             merged_deltas.append((gid, toks, fin))
 
-        return all_outputs, total_tokens, any_prefill, merged_diff_steps, merged_deltas
+        return all_outputs, total_tokens, any_prefill, merged_nfes, merged_deltas
 
     async def is_finished_async(self):
         """Async version of is_finished that checks all replicas in parallel."""

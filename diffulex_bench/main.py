@@ -6,10 +6,21 @@ import sys
 import logging
 import os
 import time
+import re
+import json
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Optional
 
-from diffulex_bench.config import BenchmarkConfig, EngineConfig, EvalConfig
+from diffulex_bench.config import (
+    BenchmarkConfig,
+    EngineConfig,
+    EvalConfig,
+    decode_model_arg_value,
+    encode_model_arg_value,
+    parse_engine_arg_override,
+)
 from diffulex.logger import setup_logger, get_logger
 from diffulex_bench.arg_parser import create_argument_parser, get_default_config_path
 
@@ -17,6 +28,69 @@ try:
     from lm_eval.__main__ import cli_evaluate
 except ImportError:
     cli_evaluate = None
+
+
+def _decode_lm_eval_model_arg_dict(args_dict: dict) -> dict:
+    return {k: decode_model_arg_value(v) for k, v in args_dict.items()}
+
+
+def _install_lm_eval_model_arg_decoder():
+    """Patch lm-eval CLI parsing so encoded complex model_args are decoded before logging/init."""
+    import lm_eval._cli.utils as lm_eval_cli_utils
+    import lm_eval.config.evaluate_config as lm_eval_config
+    import lm_eval.evaluator as lm_eval_evaluator
+    import lm_eval.utils as lm_eval_utils
+
+    original = getattr(lm_eval_utils, "_diffulex_orig_simple_parse_args_string", None)
+    if original is None:
+        original = lm_eval_utils.simple_parse_args_string
+        lm_eval_utils._diffulex_orig_simple_parse_args_string = original
+
+    def decoded_parse(args_string: str | None) -> dict:
+        return _decode_lm_eval_model_arg_dict(original(args_string))
+
+    lm_eval_utils.simple_parse_args_string = decoded_parse
+    lm_eval_evaluator.simple_parse_args_string = decoded_parse
+    lm_eval_config.simple_parse_args_string = decoded_parse
+
+    original_key_val_to_dict = getattr(lm_eval_cli_utils, "_diffulex_orig_key_val_to_dict", None)
+    if original_key_val_to_dict is None:
+        original_key_val_to_dict = lm_eval_cli_utils.key_val_to_dict
+        lm_eval_cli_utils._diffulex_orig_key_val_to_dict = original_key_val_to_dict
+
+    def decoded_key_val_to_dict(args: str) -> dict:
+        return _decode_lm_eval_model_arg_dict(original_key_val_to_dict(args))
+
+    original_try_parse_json = getattr(lm_eval_cli_utils, "_diffulex_orig_try_parse_json", None)
+    if original_try_parse_json is None:
+        original_try_parse_json = lm_eval_cli_utils.try_parse_json
+        lm_eval_cli_utils._diffulex_orig_try_parse_json = original_try_parse_json
+
+    def decoded_try_parse_json(value):
+        result = original_try_parse_json(value)
+        if isinstance(result, dict):
+            return _decode_lm_eval_model_arg_dict(result)
+        return result
+
+    lm_eval_cli_utils.key_val_to_dict = decoded_key_val_to_dict
+    lm_eval_cli_utils.try_parse_json = decoded_try_parse_json
+
+    evaluator_config_cls = lm_eval_config.EvaluatorConfig
+    original_parse_dict_args = getattr(evaluator_config_cls, "_diffulex_orig_parse_dict_args", None)
+    if original_parse_dict_args is None:
+        original_parse_dict_args = evaluator_config_cls._parse_dict_args
+        evaluator_config_cls._diffulex_orig_parse_dict_args = original_parse_dict_args
+
+    def decoded_parse_dict_args(self):
+        parsed = original_parse_dict_args(self)
+        if getattr(parsed, "model_args", None) is not None:
+            parsed.model_args = _decode_lm_eval_model_arg_dict(parsed.model_args)
+        if getattr(parsed, "metadata", None) is not None:
+            parsed.metadata = _decode_lm_eval_model_arg_dict(parsed.metadata)
+        return parsed
+
+    evaluator_config_cls._parse_dict_args = decoded_parse_dict_args
+    return decoded_parse
 
 
 def config_to_model_args(config: BenchmarkConfig, *, result_output_dir: Optional[str] = None) -> str:
@@ -34,52 +108,32 @@ def config_to_model_args(config: BenchmarkConfig, *, result_output_dir: Optional
     eval_config = config.eval
     save_dir = result_output_dir if result_output_dir is not None else eval_config.output_dir
 
+    args_dict = {"pretrained": engine.model_path}
+    args_dict.update(engine.get_diffulex_kwargs())
     args_dict = {
-        "pretrained": engine.model_path,
-        "model_name": engine.model_name,
-        "decoding_strategy": engine.decoding_strategy,
-        "mask_token_id": engine.mask_token_id,
-        "tensor_parallel_size": engine.tensor_parallel_size,
-        "data_parallel_size": engine.data_parallel_size,
-        "gpu_memory_utilization": engine.gpu_memory_utilization,
-        "max_model_len": engine.max_model_len,
-        "max_num_batched_tokens": engine.max_num_batched_tokens,
-        "max_num_reqs": engine.max_num_reqs,
+        **args_dict,
         "temperature": eval_config.temperature,
         "max_new_tokens": eval_config.max_tokens,
-        "use_lora": engine.use_lora,
-        "pre_merge_lora": engine.pre_merge_lora,
-        "enforce_eager": engine.enforce_eager,
-        "kv_cache_layout": engine.kv_cache_layout,
-        "block_size": engine.block_size,
-        "buffer_size": engine.buffer_size,
+        "max_nfe": eval_config.max_nfe,
+        "max_repetition_run": eval_config.max_repetition_run,
         "wait_ready": True,
     }
-    dt = engine.decoding_thresholds or {
-        "add_block_threshold": 0.1,
-        "semi_complete_threshold": 0.9,
-        "decoding_threshold": 0.9,
-    }
-    args_dict["add_block_threshold"] = dt["add_block_threshold"]
-    args_dict["semi_complete_threshold"] = dt["semi_complete_threshold"]
-    args_dict["decoding_threshold"] = dt["decoding_threshold"]
 
     if engine.tokenizer_path:
         args_dict["tokenizer_path"] = engine.tokenizer_path
 
-    if engine.use_lora and engine.lora_path:
-        args_dict["lora_path"] = engine.lora_path
-
-    if save_dir and (eval_config.save_results or engine.save_kv_mapping_trace):
+    if save_dir and eval_config.save_results:
         args_dict["save_dir"] = save_dir
 
     if eval_config.add_bos_token is not None:
         args_dict["add_bos_token"] = eval_config.add_bos_token
 
-    args_dict["save_kv_mapping_trace"] = bool(engine.save_kv_mapping_trace)
-
     # Convert to string format: key1=value1,key2=value2
-    args_list = [f"{k}={v}" for k, v in args_dict.items()]
+    args_list = []
+    for k, v in args_dict.items():
+        if v is None:
+            continue
+        args_list.append(f"{k}={encode_model_arg_value(v)}")
     return ",".join(args_list)
 
 
@@ -97,6 +151,72 @@ def _resolve_lm_eval_include_path(config: BenchmarkConfig) -> Optional[Path]:
             p = Path(os.getcwd()) / p
         return p.resolve()
     return (Path(__file__).resolve().parent / "tasks").resolve()
+
+
+def _task_name_to_yaml_map(include_root: Path) -> dict[str, Path]:
+    mapping: dict[str, Path] = {}
+    for yml in include_root.rglob("*.yaml"):
+        try:
+            text = yml.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        m = re.search(r"(?m)^\s*task:\s*([^\s#]+)\s*$", text)
+        if m:
+            mapping.setdefault(m.group(1).strip(), yml)
+    return mapping
+
+
+def _rewrite_task_data_files(task_yaml: Path, data_files: str) -> bool:
+    text = task_yaml.read_text(encoding="utf-8")
+    data_files_value = str(Path(data_files).expanduser())
+    if Path(data_files_value).exists():
+        data_files_value = str(Path(data_files_value).resolve())
+    replacement_value = json.dumps(data_files_value)
+    replaced, n = re.subn(r"(?m)^(\s*data_files:\s*).*$", rf"\1{replacement_value}", text, count=1)
+    if n == 0:
+        return False
+    task_yaml.write_text(replaced, encoding="utf-8")
+    return True
+
+
+def _resolve_include_path_with_data_files_override(
+    config: BenchmarkConfig, logger
+) -> tuple[Optional[Path], Optional[Path]]:
+    include_path = _resolve_lm_eval_include_path(config)
+    data_files = config.eval.dataset_data_files
+    if not data_files:
+        return include_path, None
+    if include_path is None or not include_path.is_dir():
+        logger.warning(
+            "dataset_data_files is set but include_path is unavailable; "
+            "cannot rewrite task YAML data_files."
+        )
+        return include_path, None
+
+    tmp_root = Path(tempfile.mkdtemp(prefix="diffulex_tasks_override_")).resolve()
+    tmp_tasks = tmp_root / "tasks"
+    shutil.copytree(include_path, tmp_tasks, dirs_exist_ok=True)
+    task_map = _task_name_to_yaml_map(tmp_tasks)
+    requested = [name.strip() for name in str(config.eval.dataset_name).split(",") if name.strip()]
+
+    rewritten = 0
+    for task_name in requested:
+        task_yaml = task_map.get(task_name)
+        if task_yaml is None:
+            logger.warning(f"Task '{task_name}' not found under include_path={include_path}")
+            continue
+        if _rewrite_task_data_files(task_yaml, data_files):
+            rewritten += 1
+        else:
+            logger.warning(f"Task '{task_name}' has no data_files field to override: {task_yaml}")
+
+    if rewritten == 0:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        logger.warning("No task YAML was rewritten by dataset_data_files; using original include_path.")
+        return include_path, None
+
+    logger.info(f"Overrode dataset data_files for {rewritten} task(s) -> {data_files}")
+    return tmp_tasks, tmp_root
 
 
 def _sanitize_for_dir(name: str, max_len: int = 96) -> str:
@@ -132,6 +252,7 @@ def run_benchmark(config: BenchmarkConfig) -> None:
     if cli_evaluate is None:
         logger.error("lm-evaluation-harness is not installed. Please install it with: pip install lm-eval")
         sys.exit(1)
+    decoded_model_arg_parser = _install_lm_eval_model_arg_decoder()
 
     benchmark_info = [
         "=" * 80,
@@ -150,6 +271,7 @@ def run_benchmark(config: BenchmarkConfig) -> None:
 
     # Convert config to lm_eval arguments (stats + trajectory share run_output_dir with lm-eval)
     model_args = config_to_model_args(config, result_output_dir=run_output_dir)
+    decoded_model_args = decoded_model_arg_parser(model_args)
     tasks = config.eval.dataset_name
 
     # Prepare sys.argv for lm_eval
@@ -170,7 +292,7 @@ def run_benchmark(config: BenchmarkConfig) -> None:
         run_output_dir,
     ]
 
-    inc = _resolve_lm_eval_include_path(config)
+    inc, tmp_include_root = _resolve_include_path_with_data_files_override(config, logger)
     if inc is not None and inc.is_dir():
         sys.argv.extend(["--include_path", str(inc)])
 
@@ -187,16 +309,19 @@ def run_benchmark(config: BenchmarkConfig) -> None:
         "=" * 80,
         "Starting lm-evaluation-harness evaluation...",
         "=" * 80,
-        f"Model args: {model_args}",
+        f"Model args: {decoded_model_args}",
         f"Tasks: {tasks}",
         "=" * 80,
     ]
     logger.info("\n".join(lm_eval_info))
 
-    # Run lm_eval
-    cli_evaluate()
-
-    logger.success("Evaluation completed successfully")
+    try:
+        cli_evaluate()
+        logger.success("Evaluation completed successfully")
+    finally:
+        sys.argv = original_argv
+        if tmp_include_root is not None:
+            shutil.rmtree(tmp_include_root, ignore_errors=True)
 
     # except Exception as e:
     #     logger.error(f"Evaluation failed: {e}", exc_info=True)
@@ -224,6 +349,19 @@ def load_config_from_args(args) -> BenchmarkConfig:
     max_num_reqs = (
         args.max_num_reqs if getattr(args, "max_num_reqs", None) is not None else getattr(args, "max_num_seqs", None)
     )
+    engine_override_args = getattr(args, "engine_args", None) or []
+
+    def apply_engine_arg_overrides(engine: EngineConfig) -> None:
+        for raw in engine_override_args:
+            if "=" not in raw:
+                logger.error(f"Invalid --engine-arg '{raw}'. Expected KEY=VALUE.")
+                sys.exit(1)
+            key, raw_value = raw.split("=", 1)
+            key = key.strip()
+            if not key:
+                logger.error(f"Invalid --engine-arg '{raw}'. Empty key.")
+                sys.exit(1)
+            engine.apply_updates({key: parse_engine_arg_override(raw_value)})
 
     # Try to load from config file
     if args.config:
@@ -258,12 +396,18 @@ def load_config_from_args(args) -> BenchmarkConfig:
             config.eval.dataset_limit = args.dataset_limit
         if getattr(args, "max_tokens", None) is not None:
             config.eval.max_tokens = args.max_tokens
+        if getattr(args, "max_nfe", None) is not None:
+            config.eval.max_nfe = args.max_nfe
+        if getattr(args, "max_repetition_run", None) is not None:
+            config.eval.max_repetition_run = args.max_repetition_run
         if getattr(args, "temperature", None) is not None:
             config.eval.temperature = args.temperature
         if args.output_dir:
             config.eval.output_dir = args.output_dir
         if getattr(args, "include_path", None) is not None:
             config.eval.include_path = args.include_path
+        if getattr(args, "dataset_data_files", None) is not None:
+            config.eval.dataset_data_files = args.dataset_data_files
         if getattr(args, "use_run_subdirectory", None) is not None:
             config.eval.use_run_subdirectory = bool(args.use_run_subdirectory)
 
@@ -282,8 +426,9 @@ def load_config_from_args(args) -> BenchmarkConfig:
             config.engine.buffer_size = args.buffer_size
         if getattr(args, "block_size", None) is not None:
             config.engine.block_size = args.block_size
-        if getattr(args, "save_kv_mapping_trace", None) is not None:
-            config.engine.save_kv_mapping_trace = bool(args.save_kv_mapping_trace)
+        if getattr(args, "multi_block_prefix_full", None) is not None:
+            config.engine.multi_block_prefix_full = bool(args.multi_block_prefix_full)
+        apply_engine_arg_overrides(config.engine)
     else:
         if not args.model_path:
             logger.error("Either --config or --model-path must be provided")
@@ -313,16 +458,23 @@ def load_config_from_args(args) -> BenchmarkConfig:
             },
             block_size=(args.block_size if getattr(args, "block_size", None) is not None else 32),
             buffer_size=getattr(args, "buffer_size", 4),
+            multi_block_prefix_full=(
+                bool(args.multi_block_prefix_full)
+                if getattr(args, "multi_block_prefix_full", None) is not None
+                else False
+            ),
             enforce_eager=args.enforce_eager if hasattr(args, "enforce_eager") else False,
-            save_kv_mapping_trace=bool(getattr(args, "save_kv_mapping_trace", False)),
         )
 
         eval_config = EvalConfig(
             dataset_name=args.dataset,
             dataset_split=getattr(args, "dataset_split", "test"),
             dataset_limit=args.dataset_limit,
+            dataset_data_files=getattr(args, "dataset_data_files", None),
             temperature=args.temperature,
             max_tokens=args.max_tokens,
+            max_nfe=getattr(args, "max_nfe", None),
+            max_repetition_run=getattr(args, "max_repetition_run", None),
             ignore_eos=getattr(args, "ignore_eos", False),
             output_dir=args.output_dir,
             use_run_subdirectory=(
@@ -334,6 +486,7 @@ def load_config_from_args(args) -> BenchmarkConfig:
             include_path=getattr(args, "include_path", None),
         )
 
+        apply_engine_arg_overrides(engine)
         config = BenchmarkConfig(engine=engine, eval=eval_config)
 
     return config

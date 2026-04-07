@@ -32,7 +32,12 @@ class SchedulerMultiBlockMixin:
 
             num_reqs += 1
             self.kv_cache_manager.allocate(req)
+            req.apply_cached_prefix_pages()
             if req.is_preempted:
+                if not self.kv_cache_manager.can_append(req):
+                    self.kv_cache_manager.free(req)
+                    num_reqs -= 1
+                    break
                 self.kv_cache_manager.may_append(req)
 
             num_batched_tokens += projected - req.num_cached_tokens
@@ -118,6 +123,9 @@ class SchedulerMultiBlockMixin:
                 req.new_tokens += len(accepted_ids)
 
             req.postprocess()
+            req.nfe += 1
+            if req.max_nfe_reached or req.max_repetition_run_reached:
+                req.force_deactivate()
             if req.is_completed:
                 req.status = DllmReqStatus.FINISHED
                 self.kv_cache_manager.free(req)

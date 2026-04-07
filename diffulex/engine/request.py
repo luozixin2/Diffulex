@@ -11,12 +11,13 @@ from diffulex.sampling_params import SamplingParams
 from diffulex.engine.strategy_registry import DiffulexStrategyRegistry
 from diffulex.engine.status import DllmReqStatus
 from diffulex.mixin.multi_block.engine.request import DllmReqMultiBlockMixin
+from diffulex.mixin.request_state import ReqStateMixin
 
 
-class DllmReq(DllmReqMultiBlockMixin):
+class DllmReq(DllmReqMultiBlockMixin, ReqStateMixin):
     """Minimal base class that tracks prompt tokens and cache bookkeeping."""
 
-    page_size = 256
+    page_size = 32
     counter = count()
 
     def __init__(self, token_ids: list[int], sampling_params: SamplingParams = SamplingParams()):
@@ -30,12 +31,13 @@ class DllmReq(DllmReqMultiBlockMixin):
         self.page_cache_missed: list[bool] = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
+        self.max_nfe = sampling_params.max_nfe
+        self.max_repetition_run = sampling_params.max_repetition_run
         self.ignore_eos = sampling_params.ignore_eos
         self.new_tokens = 0
+        self.nfe = 0
         self.meet_eos = False
         self.is_multi_block = False
-        # Filled by multi-block prepare when Config.save_kv_mapping_trace (or runner override) is on.
-        self.last_kv_mapping_trace: dict | None = None
 
     def __len__(self) -> int:
         return self.num_tokens

@@ -39,8 +39,6 @@ class ModelRunnerBase(
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
-        # None: follow config.save_kv_mapping_trace; True/False: force on/off without editing Config.
-        self.kv_mapping_trace_enabled_override: bool | None = None
 
         # Initialize model, sampler, and kv cache
         init_method = f"tcp://{config.master_addr}:{config.master_port}"
@@ -151,18 +149,6 @@ class ModelRunnerBase(
             self.write_shm(method_name, *args)
         method = getattr(self, method_name, None)
         return method(*args)
-
-    def kv_mapping_trace_active(self) -> bool:
-        if self.kv_mapping_trace_enabled_override is not None:
-            return self.kv_mapping_trace_enabled_override
-        return bool(getattr(self.config, "save_kv_mapping_trace", False))
-
-    def set_kv_mapping_trace_enabled(self, enabled: bool | None) -> None:
-        """Enable/disable KV mapping traces for multi-block prepare.
-
-        ``None`` resumes following ``Config.save_kv_mapping_trace``.
-        """
-        self.kv_mapping_trace_enabled_override = enabled
 
     def load_model(self, config: Config):
         """Instantiate the underlying model; override to customize."""
