@@ -35,7 +35,7 @@ def _visualize_mask(mask, seq_id, ctx_len, valid_q_len, block_size, label):
         sample_q = list(range(0, valid_q_len, step))
         sample_kv = list(range(0, total_kv, step))
 
-        print(f"\n    KV→", end="")
+        print("\n    KV→", end="")
         for kv_idx in sample_kv:
             if kv_idx < ctx_len:
                 print(f" C{kv_idx:3d}", end="")
@@ -51,7 +51,7 @@ def _visualize_mask(mask, seq_id, ctx_len, valid_q_len, block_size, label):
             print()
     else:
         # Full visualization for small masks
-        print(f"\n    KV→", end="")
+        print("\n    KV→", end="")
         for kv_idx in range(total_kv):
             if kv_idx < ctx_len:
                 print(f"C{kv_idx%10}", end="")
@@ -95,6 +95,7 @@ def call_chunked_prefill_kernel(
     dllm_block_size,
     is_block_causal,
     is_prefix_full=False,
+    use_legacy_page_block_cache_fastpath=False,
     BLOCK_M=64,
     BLOCK_N=64,
 ):
@@ -158,6 +159,7 @@ def call_chunked_prefill_kernel(
         DLLM_BLOCK_SIZE=dllm_block_size,
         IS_BLOCK_CAUSAL=is_block_causal,
         IS_PREFIX_FULL=is_prefix_full,
+        USE_LEGACY_PAGE_BLOCK_CACHE_FASTPATH=use_legacy_page_block_cache_fastpath,
         **launch_kwargs,
     )
     return o
@@ -566,6 +568,37 @@ def test_prefix_prefill_unaligned_context():
         page_size=32,
         dllm_block_size=32,
         is_block_causal=False,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    "page_size,dllm_block_size",
+    [
+        (4, 4),
+        (8, 4),
+        (16, 4),
+        (16, 8),
+        (32, 4),
+        (32, 8),
+        (32, 16),
+        (32, 32),
+    ],
+)
+def test_prefix_prefill_supported_page_block_matrix(page_size, dllm_block_size):
+    """Generic cache path supports multiple DLLM blocks per KV page."""
+    _run_test(
+        q_lens=[64, 64],
+        valid_q_lens=[64, 48],
+        ctx_lens=[page_size * 2, page_size * 3],
+        num_heads=4,
+        num_kv_heads=2,
+        head_dim=64,
+        page_size=page_size,
+        dllm_block_size=dllm_block_size,
+        is_block_causal=True,
+        atol=8e-3,
+        rtol=8e-3,
     )
 
 

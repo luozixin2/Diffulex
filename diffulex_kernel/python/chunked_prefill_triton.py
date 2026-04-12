@@ -7,6 +7,9 @@ from diffulex.attention.metadata import AttnMetaDataBase
 from diffulex_kernel.python.auto_tuner import build_chunked_prefill_configs
 
 DISABLE_CHUNKED_PREFILL_AUTOTUNE = os.environ.get("DIFFULEX_DISABLE_CHUNKED_PREFILL_AUTOTUNE", "0") == "1"
+USE_LEGACY_PAGE_BLOCK_CACHE_FASTPATH = (
+    os.environ.get("DIFFULEX_USE_LEGACY_PAGE_BLOCK_CACHE_FASTPATH", "0") == "1"
+)
 
 
 def _prune_chunked_prefill_configs(configs, _nargs, **kwargs):
@@ -50,6 +53,7 @@ def maybe_autotune(fn):
             "DLLM_BLOCK_SIZE",
             "IS_BLOCK_CAUSAL",
             "IS_PREFIX_FULL",
+            "USE_LEGACY_PAGE_BLOCK_CACHE_FASTPATH",
         ],
         prune_configs_by={"early_config_prune": _prune_chunked_prefill_configs},
     )(fn)
@@ -102,6 +106,7 @@ def _chunked_prefill_attn_unified_kernel(
     DLLM_BLOCK_SIZE: tl.constexpr,
     IS_BLOCK_CAUSAL: tl.constexpr,
     IS_PREFIX_FULL: tl.constexpr,
+    USE_LEGACY_PAGE_BLOCK_CACHE_FASTPATH: tl.constexpr,
 ):
     req_id = tl.program_id(0)
     head_id = tl.program_id(1)
@@ -134,9 +139,11 @@ def _chunked_prefill_attn_unified_kernel(
     l = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_DIM_PADDED], dtype=tl.float32)
 
-    # Stage 1: Attention against KV Cache
-    if PAGE_SIZE == DLLM_BLOCK_SIZE:
-        # Keep the old page-wise reduction order for equal page/block layouts.
+    # Stage 1: Attention against KV Cache.
+    # Default path keeps token-wise gather/reduction across all page/block layouts.
+    # Optional legacy path restores the old PAGE_SIZE == DLLM_BLOCK_SIZE reduction
+    # order for A/B debugging against historical behavior.
+    if USE_LEGACY_PAGE_BLOCK_CACHE_FASTPATH and PAGE_SIZE == DLLM_BLOCK_SIZE:
         offs_kv_cache_block = tl.arange(0, BLOCK_N)
         mask_kv_cache_block = offs_kv_cache_block < PAGE_SIZE
         num_pages = (context_len + PAGE_SIZE - 1) // PAGE_SIZE
@@ -392,6 +399,7 @@ def _run_chunked_prefill_attn_unified_kernel(
         DLLM_BLOCK_SIZE=attn_metadata.block_size,
         IS_BLOCK_CAUSAL=attn_metadata.is_block_causal,
         IS_PREFIX_FULL=attn_metadata.is_prefix_full,
+        USE_LEGACY_PAGE_BLOCK_CACHE_FASTPATH=USE_LEGACY_PAGE_BLOCK_CACHE_FASTPATH,
         **launch_kwargs,
     )
     return o
